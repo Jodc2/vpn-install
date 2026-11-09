@@ -29,6 +29,7 @@
 #                       warp    — всё через Cloudflare WARP: IP сервера не виден сайтам,
 #                                 но бывают капчи Google и потолок около 100 Мбит/с;
 #                       warp-ru — российские сайты через WARP, остальное напрямую
+#                     выбор запоминается; переключить потом — vpn-warp off|on|ru
 #   --ssh-key-only    выключить вход по паролю (только если у root уже есть SSH-ключ)
 #   --no-fail2ban     не ставить fail2ban
 #   --no-ufw          не трогать фаервол
@@ -36,7 +37,9 @@
 #   --skip-dns-check  не сверять A-запись домена с IP сервера
 #   --skip-ip-check   не проверять до установки, доступен ли IP из России
 #   --check           только проверить: службы, туннель, доступность портов из России и Европы
-# Повторный запуск безопасен: ключи, пароли и клиенты сохраняются (/etc/vpn-install.env).
+#   --warp off|on|ru  быстро переключить выход без переустановки (то же — команда vpn-warp):
+#                     off — напрямую, on — всё через WARP, ru — российские сайты через WARP
+# Повторный запуск безопасен: ключи, пароли, клиенты и выбранный выход сохраняются (/etc/vpn-install.env).
 set -euo pipefail
 umask 022
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive
@@ -64,7 +67,7 @@ DOMAIN=
 NO_DOMAIN=0
 SNI_ARG=
 CLIENTS=5
-EXIT_MODE=direct
+EXIT_MODE=
 SSH_KEY_ONLY=0
 DO_F2B=1
 DO_UFW=1
@@ -72,6 +75,7 @@ TZ_NAME=Europe/Moscow
 SKIP_DNS=0
 SKIP_IP_CHECK=0
 CHECK_ONLY=0
+WARP_CMD=
 TEST_SELFSIGNED=0   # только для проверки самого скрипта: самоподписанный сертификат вместо Let's Encrypt
 ACME_STAGING=0      # только для проверки: тестовый сервер Let's Encrypt
 while [ $# -gt 0 ]; do
@@ -88,6 +92,7 @@ while [ $# -gt 0 ]; do
 		--skip-dns-check) SKIP_DNS=1; shift ;;
 		--skip-ip-check) SKIP_IP_CHECK=1; shift ;;
 		--check) CHECK_ONLY=1; shift ;;
+		--warp) WARP_CMD=${2:-status}; if [ $# -ge 2 ]; then shift 2; else shift; fi ;;
 		--test-selfsigned) TEST_SELFSIGNED=1; SKIP_DNS=1; shift ;;
 		--acme-staging) ACME_STAGING=1; shift ;;
 		-h | --help) awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0"; exit 0 ;;
@@ -119,7 +124,8 @@ MODE=
 S_MODE=$(state_val S_MODE || true)
 S_DOMAIN_OLD=$(state_val S_DOMAIN || true)
 if [ -z "$S_MODE" ] && [ -n "$S_DOMAIN_OLD" ]; then S_MODE=domain; fi   # установка прежней версией скрипта
-if [ "$CHECK_ONLY" = 1 ]; then
+S_EXIT=$(state_val S_EXIT || true)
+if [ "$CHECK_ONLY" = 1 ] || [ -n "$WARP_CMD" ]; then
 	[ -n "$S_MODE" ] || die "VPN этим скриптом здесь ещё не ставился (нет $STATE) — сначала bash $0"
 	MODE=$S_MODE
 	DOMAIN=$S_DOMAIN_OLD
@@ -173,7 +179,16 @@ else
 	REALITY_PORT=443
 fi
 [[ $CLIENTS =~ ^[0-9]+$ ]] && [ "$CLIENTS" -ge 1 ] && [ "$CLIENTS" -le 100 ] || die "--clients: число от 1 до 100"
+EXIT_MODE=${EXIT_MODE:-${S_EXIT:-direct}}   # не указан — как в прошлый раз
 case $EXIT_MODE in direct | warp | warp-ru) ;; *) die "--exit: direct, warp или warp-ru" ;; esac
+case $WARP_CMD in
+	"") ;;
+	off | direct) TARGET_EXIT=direct ;;
+	on | warp | all) TARGET_EXIT=warp ;;
+	ru | warp-ru) TARGET_EXIT=warp-ru ;;
+	status | show) TARGET_EXIT=status ;;
+	*) die "--warp: off (напрямую), on (всё через WARP), ru (российские сайты через WARP) или status" ;;
+esac
 
 # --- Общие проверки и мелочи ---
 in_container() {
@@ -544,6 +559,7 @@ local_checks() {
 	for p in $([ "$MODE" = domain ] && echo "$LISTEN_IP:443 127.0.0.1:8443") "127.0.0.1:$WEB_PORT" "127.0.0.1:$SUB_PORT" ":$REALITY_PORT"; do
 		if wait_port "$p" 15; then ok "слушает $p"; else bad "никто не слушает $p"; fi
 	done
+	ok "выход клиентов: $(exit_label "$(exit_mode_now)") (переключить: vpn-warp off|on|ru)"
 	if [ -f "$F2B_JAIL" ]; then
 		if s=$(fail2ban-client status sshd 2>/dev/null); then
 			ok "fail2ban охраняет SSH: сейчас в бане $(sed -n 's/.*Currently banned:[[:space:]]*//p' <<<"$s" | head -1), всего забанено $(sed -n 's/.*Total banned:[[:space:]]*//p' <<<"$s" | head -1)"
@@ -594,6 +610,181 @@ local_checks() {
 	fi
 }
 
+xui_set() {  # xui_set КЛЮЧ=ЗНАЧЕНИЕ… — строки таблицы settings (x-ui должен быть остановлен)
+	python3 - "$DB" "$@" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+for kv in sys.argv[2:]:
+    k, v = kv.split("=", 1)
+    if db.execute("update settings set value=? where key=?", (v, k)).rowcount == 0:
+        db.execute("insert into settings(key, value) values(?, ?)", (k, v))
+db.commit()
+PY
+}
+template_json() {  # template_json РЕЖИМ ФАЙЛ_WARP|- → шаблон Xray (проверенная схема)
+	python3 - "$1" "$2" <<'PY'
+import json, sys
+mode, warp_file = sys.argv[1], sys.argv[2]
+warp = json.load(open(warp_file)) if warp_file != "-" else None
+direct = {"protocol": "freedom", "settings": {"domainStrategy": "AsIs", "finalRules": [{"action": "allow"}]}, "tag": "direct"}
+blocked = {"protocol": "blackhole", "settings": {}, "tag": "blocked"}
+rules = [{"inboundTag": ["api"], "outboundTag": "api", "type": "field"},
+         {"ip": ["geoip:private"], "outboundTag": "blocked", "type": "field"},
+         {"outboundTag": "blocked", "protocol": ["bittorrent"], "type": "field"}]
+dns = ["1.1.1.1", "1.0.0.1"]
+if warp:
+    dns = [{"address": "localhost", "domains": ["full:engage.cloudflareclient.com"], "skipFallback": True}] + dns
+if mode == "warp" and warp:
+    outbounds, main, dns_out = [warp, direct, blocked], "warp", "warp"
+elif mode == "warp-ru" and warp:
+    outbounds, main, dns_out = [direct, warp, blocked], "direct", "warp"
+    rules += [{"type": "field", "outboundTag": "warp", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
+              {"type": "field", "outboundTag": "warp", "ip": ["geoip:ru"]}]
+else:
+    outbounds, main, dns_out = [direct, blocked], "direct", "direct"
+rules += [{"type": "field", "inboundTag": ["dns-internal"], "outboundTag": dns_out},
+          {"type": "field", "network": "tcp,udp", "outboundTag": main}]
+print(json.dumps({
+    "log": {"access": "none", "dnsLog": False, "error": "", "loglevel": "warning", "maskAddress": ""},
+    "routing": {"domainStrategy": "AsIs", "rules": rules},
+    "inbounds": [{"listen": "127.0.0.1", "port": 62789, "protocol": "tunnel", "settings": {"rewriteAddress": "127.0.0.1"}, "tag": "api"}],
+    "outbounds": outbounds,
+    "policy": {"levels": {"0": {"statsUserDownlink": True, "statsUserOnline": True, "statsUserUplink": True}},
+               "system": {"statsInboundDownlink": True, "statsInboundUplink": True, "statsOutboundDownlink": False, "statsOutboundUplink": False}},
+    "api": {"services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"], "tag": "api"},
+    "stats": {},
+    "metrics": {"listen": "127.0.0.1:11111", "tag": "metrics_out"},
+    "dns": {"servers": dns, "queryStrategy": "UseIP", "tag": "dns-internal"},
+}, ensure_ascii=False))
+PY
+}
+save_state() {
+	local tmp
+	tmp=$(mktemp "$STATE.XXXXXX")
+	cat > "$tmp" <<EOF
+# install-vpn.sh: сгенерированные при установке настройки. Секретно: пароль панели и ключи Reality.
+S_MODE='$MODE'
+S_DOMAIN='$DOMAIN'
+PANEL_USER='$PANEL_USER'
+PANEL_PASS='$PANEL_PASS'
+WEB_PORT='$WEB_PORT'
+WEB_PATH='$WEB_PATH'
+SUB_PATH='$SUB_PATH'
+CLASH_PATH='$CLASH_PATH'
+JSON_PATH='$JSON_PATH'
+REALITY_PRIV='${REALITY_PRIV:-}'
+REALITY_PUB='${REALITY_PUB:-}'
+SHORT_IDS='${SHORT_IDS:-}'
+REALITY_SNI='${REALITY_SNI:-}'
+S_EXIT='$EXIT_MODE'
+EOF
+	chmod 600 "$tmp"
+	mv "$tmp" "$STATE"
+}
+WARP_SAVED=/etc/x-ui/warp/outbound.json   # копия outbound warp: vpn-warp on после off берёт её, а не регистрирует заново
+
+current_warp() {  # current_warp ФАЙЛ ← outbound warp: из шаблона Xray, а если WARP выключен — из сохранённой копии
+	python3 - "$DB" "$1" <<'PY' || { [ -s "$WARP_SAVED" ] && cp "$WARP_SAVED" "$1"; }
+import json, sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+t = json.loads(row[0]) if row and row[0] else {}
+w = next((o for o in t.get("outbounds", []) if o.get("tag") == "warp"), None)
+if not w:
+    sys.exit(1)
+json.dump(w, open(sys.argv[2], "w"))
+PY
+}
+
+save_warp() { install -d -m 700 /etc/x-ui/warp && install -m 600 "$1" "$WARP_SAVED"; }
+
+exit_mode_now() {  # → direct | warp | warp-ru — по шаблону Xray в базе
+	python3 - "$DB" <<'PY'
+import json, sqlite3, sys
+row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+t = json.loads(row[0]) if row and row[0] else {}
+rules = (t.get("routing") or {}).get("rules") or []
+main = next((r.get("outboundTag") for r in rules if r.get("network") == "tcp,udp"), None)
+main = main or ((t.get("outbounds") or [{}])[0].get("tag") or "direct")
+if main == "warp":
+    print("warp")
+elif any(r.get("outboundTag") == "warp" and (r.get("domain") or r.get("ip")) for r in rules):
+    print("warp-ru")
+else:
+    print("direct")
+PY
+}
+
+exit_label() {
+	case $1 in
+		direct) echo "напрямую с IP сервера" ;;
+		warp) echo "всё через Cloudflare WARP" ;;
+		warp-ru) echo "российские сайты через WARP, остальное напрямую" ;;
+		*) echo "$1" ;;
+	esac
+}
+
+api_open() {  # одноразовый API-токен панели (x-ui должен работать); api_close его удаляет
+	local out
+	out=$("$XUI" setting -getApiToken 2>&1 || true)
+	API_TOKEN=$(sed -n 's/^apiToken: *//p' <<<"$out" | tail -1)
+	[ -n "$API_TOKEN" ] || die "x-ui не выдал API-токен: $out"
+	TOKEN_ID=$(sqlite3 "$DB" 'select max(id) from api_tokens;')
+}
+api_close() { sqlite3 "$DB" "delete from api_tokens where id=${TOKEN_ID:-0};" 2>/dev/null || true; API_TOKEN=; }
+api() {  # api POST|GET ПУТЬ [аргументы curl] → тело ответа
+	local m=$1 p=$2
+	shift 2
+	curl -sk --max-time 60 -X "$m" -H "Authorization: Bearer $API_TOKEN" "$@" "$SCHEME://127.0.0.1:$WEB_PORT${WEB_PATH}panel/api/$p"
+}
+api_ok() { python3 -c 'import json, sys; d = json.load(sys.stdin); sys.exit(0 if d.get("success") else 1)' 2>/dev/null; }
+
+warp_register() {  # warp_register ФАЙЛ ← новый outbound warp (регистрация как у кнопки WARP в панели); ошибка — в WARP_ERR
+	local der=$WORK/wg.der priv pub
+	WARP_ERR=
+	openssl genpkey -algorithm X25519 -outform DER -out "$der" 2>/dev/null || { WARP_ERR="openssl не создал ключ"; return 1; }
+	priv=$(tail -c 32 "$der" | base64)   # ключи WireGuard — в обычном base64
+	pub=$(openssl pkey -inform DER -in "$der" -pubout -outform DER 2>/dev/null | tail -c 32 | base64)
+	rm -f "$der"
+	api POST xray/warp/reg --data-urlencode "privateKey=$priv" --data-urlencode "publicKey=$pub" > "$WORK/warp-reg.json" || true
+	if python3 - "$1" "$priv" "$WARP_ENDPOINT" "$WORK/warp-reg.json" <<'PY'; then
+import base64, json, sys
+out, priv, endpoint, reg = sys.argv[1:5]
+d = json.load(open(reg))
+if not d.get("success"):
+    sys.exit(1)
+cfg = json.loads(d["obj"])["config"]["config"]
+addr = cfg["interface"]["addresses"]
+reserved = list(base64.b64decode(cfg["client_id"]))
+json.dump({"tag": "warp", "protocol": "wireguard", "settings": {
+    "mtu": 1420, "secretKey": priv,
+    "address": [a for a in (addr.get("v4") and addr["v4"] + "/32", addr.get("v6") and addr["v6"] + "/128") if a],
+    "reserved": reserved, "domainStrategy": "ForceIPv4v6",
+    "peers": [{"publicKey": cfg["peers"][0]["public_key"], "endpoint": endpoint, "keepAlive": 10}],
+    "noKernelTun": True}}, open(out, "w"))
+PY
+		rm -f "$WORK/warp-reg.json"
+		save_warp "$1"
+		return 0
+	fi
+	WARP_ERR=$(head -c 300 "$WORK/warp-reg.json" 2>/dev/null)
+	rm -f "$WORK/warp-reg.json"
+	return 1
+}
+
+apply_exit() {  # apply_exit РЕЖИМ ФАЙЛ_WARP|- — записать шаблон Xray и перезапустить x-ui
+	systemctl stop x-ui 2>/dev/null || true
+	xui_set "xrayTemplateConfig=$(template_json "$1" "$2")"
+	systemctl restart x-ui || return 1
+	wait_port "127.0.0.1:$WEB_PORT" 40
+}
+
+derive_vars() {  # для --check и --warp: то, что установка вычисляет по ходу (после detect_ips)
+	CERT_DIR=${DOMAIN:+/root/cert/$DOMAIN}
+	K=
+	if [ -n "$DOMAIN" ] && ! openssl x509 -noout -issuer -in "$CERT_DIR/fullchain.pem" 2>/dev/null | grep -qi "let's encrypt"; then K=-k; fi
+	if [ "$MODE" = domain ]; then SHARE_ADDR=$DOMAIN; SCHEME=https; else SHARE_ADDR=$PUBLIC_IP; SCHEME=http; fi
+}
+
 verdict() {
 	echo
 	if [ "$FAILS" = 0 ]; then
@@ -611,16 +802,74 @@ trap 'rm -rf "$WORK" "$CHK_OUT"' EXIT
 if [ "$CHECK_ONLY" = 1 ]; then
 	# shellcheck source=/dev/null
 	. "$STATE"
-	CERT_DIR=${DOMAIN:+/root/cert/$DOMAIN}
-	K=
-	[ -n "$DOMAIN" ] && ! openssl x509 -noout -issuer -in "$CERT_DIR/fullchain.pem" 2>/dev/null | grep -qi "let's encrypt" && K=-k
 	detect_ips
-	if [ "$MODE" = domain ]; then SHARE_ADDR=$DOMAIN; else SHARE_ADDR=$PUBLIC_IP; fi
+	derive_vars
 	printf '\033[1mПроверка VPN на %s (%s)\033[0m\n' "${DOMAIN:-$PUBLIC_IP}" "$([ "$MODE" = domain ] && echo "с доменом" || echo "без домена, Reality под ${REALITY_SNI:-?}")"
 	local_checks
 	reach_check
 	verdict
 	exit $((FAILS > 0))
+fi
+
+# --- Только переключить выход: vpn-warp off | on | ru | status ---
+if [ -n "$WARP_CMD" ]; then
+	# shellcheck source=/dev/null
+	. "$STATE"
+	NOW=$(exit_mode_now)
+	if [ "$TARGET_EXIT" = status ]; then
+		echo "Выход клиентов сейчас: $(exit_label "$NOW")"
+		if [ "$NOW" = direct ]; then echo "Включить WARP: vpn-warp on — весь трафик, vpn-warp ru — только российские сайты"; else echo "Выключить WARP: vpn-warp off"; fi
+		exit 0
+	fi
+	detect_ips
+	derive_vars
+	if [ "$NOW" = "$TARGET_EXIT" ]; then
+		ok "выход уже такой: $(exit_label "$NOW")"
+		EXIT_MODE=$NOW
+		save_state
+		exit 0
+	fi
+	say "Выход клиентов: $(exit_label "$NOW") → $(exit_label "$TARGET_EXIT")"
+	systemctl is-active -q x-ui || die "x-ui не работает — сначала vpn-check"
+	sqlite3 -readonly "$DB" "select value from settings where key='xrayTemplateConfig';" > "$WORK/template.before"
+	if current_warp "$WORK/warp.json"; then save_warp "$WORK/warp.json"; HAVE_WARP=1; else HAVE_WARP=0; fi
+	WARP_FILE=-
+	if [ "$TARGET_EXIT" != direct ]; then
+		if [ "$HAVE_WARP" = 1 ]; then
+			ok "WARP: прежняя регистрация (новое устройство у Cloudflare не нужно)"
+		else
+			api_open
+			if ! warp_register "$WORK/warp.json"; then api_close; die "WARP не зарегистрировался, выход не менял: $WARP_ERR"; fi
+			api_close
+			ok "Cloudflare WARP зарегистрирован (бесплатный аккаунт)"
+		fi
+		WARP_FILE=$WORK/warp.json
+	else
+		ok "WARP выключается целиком: сервер больше не держит туннель к Cloudflare (регистрация сохранена для vpn-warp on)"
+	fi
+	apply_exit "$TARGET_EXIT" "$WARP_FILE" || warn "x-ui долго поднимается после смены выхода"
+	# Настоящий туннель по ссылке первого клиента: на проверочном адресе (не российском) WARP должен
+	# включиться только в режиме on.
+	sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;")
+	link=$(sub_fetch "$sid" | grep -m1 '^vless://' || true)
+	read -r code exit_ip exit_warp log <<<"$(tunnel_check "$link")"
+	want_warp=off
+	[ "$TARGET_EXIT" = warp ] && want_warp=on
+	got_warp=off
+	{ [ "$exit_warp" = on ] || [ "$exit_warp" = plus ]; } && got_warp=on
+	if [ "$code" = 204 ] && [ "$got_warp" = "$want_warp" ]; then
+		EXIT_MODE=$TARGET_EXIT
+		save_state
+		ok "готово: $(exit_label "$TARGET_EXIT") — туннель работает, выход с IP $exit_ip$([ "$got_warp" = on ] && echo " (Cloudflare WARP)")"
+		[ "$TARGET_EXIT" = warp-ru ] && ok "российские сайты пойдут через WARP — это видно только на них, проверочный адрес нероссийский"
+		exit 0
+	fi
+	bad "после переключения туннель не работает как надо (ответ $code, выход ${exit_ip:--}, warp=${exit_warp:--}): $log"
+	systemctl stop x-ui 2>/dev/null || true
+	xui_set "xrayTemplateConfig=$(cat "$WORK/template.before")"
+	systemctl restart x-ui || true
+	wait_port "127.0.0.1:$WEB_PORT" 40 || true
+	die "вернул как было: $(exit_label "$NOW")$([ "$TARGET_EXIT" != direct ] && echo ". WARP с этого сервера сейчас не работает — попробуйте позже")"
 fi
 
 touch "$LOG" && chmod 600 "$LOG"
@@ -706,28 +955,6 @@ fi
 : "${CLASH_PATH:=/$(rnd "$LOWER" 7)/}"
 : "${JSON_PATH:=/$(rnd "$LOWER" 6)/}"
 [ -n "$WEB_PORT" ] || die "не нашёлся свободный порт для панели"
-save_state() {
-	local tmp
-	tmp=$(mktemp "$STATE.XXXXXX")
-	cat > "$tmp" <<EOF
-# install-vpn.sh: сгенерированные при установке настройки. Секретно: пароль панели и ключи Reality.
-S_MODE='$MODE'
-S_DOMAIN='$DOMAIN'
-PANEL_USER='$PANEL_USER'
-PANEL_PASS='$PANEL_PASS'
-WEB_PORT='$WEB_PORT'
-WEB_PATH='$WEB_PATH'
-SUB_PATH='$SUB_PATH'
-CLASH_PATH='$CLASH_PATH'
-JSON_PATH='$JSON_PATH'
-REALITY_PRIV='${REALITY_PRIV:-}'
-REALITY_PUB='${REALITY_PUB:-}'
-SHORT_IDS='${SHORT_IDS:-}'
-REALITY_SNI='${REALITY_SNI:-}'
-EOF
-	chmod 600 "$tmp"
-	mv "$tmp" "$STATE"
-}
 save_state
 
 say "3x-ui $XUI_VERSION"
@@ -1078,65 +1305,6 @@ EOF
 fi
 
 say "3x-ui: подписка, шаблон Xray, подключение VLESS + XHTTP + Reality"
-xui_set() {  # xui_set КЛЮЧ=ЗНАЧЕНИЕ… — строки таблицы settings (x-ui должен быть остановлен)
-	python3 - "$DB" "$@" <<'PY'
-import sqlite3, sys
-db = sqlite3.connect(sys.argv[1])
-for kv in sys.argv[2:]:
-    k, v = kv.split("=", 1)
-    if db.execute("update settings set value=? where key=?", (v, k)).rowcount == 0:
-        db.execute("insert into settings(key, value) values(?, ?)", (k, v))
-db.commit()
-PY
-}
-template_json() {  # template_json РЕЖИМ ФАЙЛ_WARP|- → шаблон Xray (проверенная схема)
-	python3 - "$1" "$2" <<'PY'
-import json, sys
-mode, warp_file = sys.argv[1], sys.argv[2]
-warp = json.load(open(warp_file)) if warp_file != "-" else None
-direct = {"protocol": "freedom", "settings": {"domainStrategy": "AsIs", "finalRules": [{"action": "allow"}]}, "tag": "direct"}
-blocked = {"protocol": "blackhole", "settings": {}, "tag": "blocked"}
-rules = [{"inboundTag": ["api"], "outboundTag": "api", "type": "field"},
-         {"ip": ["geoip:private"], "outboundTag": "blocked", "type": "field"},
-         {"outboundTag": "blocked", "protocol": ["bittorrent"], "type": "field"}]
-dns = ["1.1.1.1", "1.0.0.1"]
-if warp:
-    dns = [{"address": "localhost", "domains": ["full:engage.cloudflareclient.com"], "skipFallback": True}] + dns
-if mode == "warp" and warp:
-    outbounds, main, dns_out = [warp, direct, blocked], "warp", "warp"
-elif mode == "warp-ru" and warp:
-    outbounds, main, dns_out = [direct, warp, blocked], "direct", "warp"
-    rules += [{"type": "field", "outboundTag": "warp", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
-              {"type": "field", "outboundTag": "warp", "ip": ["geoip:ru"]}]
-else:
-    outbounds, main, dns_out = [direct, blocked], "direct", "direct"
-rules += [{"type": "field", "inboundTag": ["dns-internal"], "outboundTag": dns_out},
-          {"type": "field", "network": "tcp,udp", "outboundTag": main}]
-print(json.dumps({
-    "log": {"access": "none", "dnsLog": False, "error": "", "loglevel": "warning", "maskAddress": ""},
-    "routing": {"domainStrategy": "AsIs", "rules": rules},
-    "inbounds": [{"listen": "127.0.0.1", "port": 62789, "protocol": "tunnel", "settings": {"rewriteAddress": "127.0.0.1"}, "tag": "api"}],
-    "outbounds": outbounds,
-    "policy": {"levels": {"0": {"statsUserDownlink": True, "statsUserOnline": True, "statsUserUplink": True}},
-               "system": {"statsInboundDownlink": True, "statsInboundUplink": True, "statsOutboundDownlink": False, "statsOutboundUplink": False}},
-    "api": {"services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"], "tag": "api"},
-    "stats": {},
-    "metrics": {"listen": "127.0.0.1:11111", "tag": "metrics_out"},
-    "dns": {"servers": dns, "queryStrategy": "UseIP", "tag": "dns-internal"},
-}, ensure_ascii=False))
-PY
-}
-current_warp() {  # outbound warp из нынешнего шаблона (повторный запуск не регистрирует WARP заново)
-	python3 - "$DB" "$1" <<'PY'
-import json, sqlite3, sys
-row = sqlite3.connect(sys.argv[1]).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
-t = json.loads(row[0]) if row and row[0] else {}
-w = next((o for o in t.get("outbounds", []) if o.get("tag") == "warp"), None)
-if not w:
-    sys.exit(1)
-json.dump(w, open(sys.argv[2], "w"))
-PY
-}
 systemctl stop x-ui 2>/dev/null || true
 COMMON_SETTINGS=("subEnable=true" "subListen=127.0.0.1" "subPort=$SUB_PORT" "subPath=$SUB_PATH" "subDomain="
 	"subUpdates=1" "subEncrypt=true" "subShowInfo=true" "subEmailInRemark=true" "subEnableRouting=true"
@@ -1158,8 +1326,9 @@ else
 	# Повторный запуск после смены IP сервера: ссылки должны вести на нынешний адрес.
 	sqlite3 "$DB" "update inbounds set share_addr='$PUBLIC_IP' where port=$REALITY_PORT and share_addr_strategy='custom' and share_addr<>'$PUBLIC_IP';" 2>/dev/null || true
 fi
+# Выход клиентов. Копия outbound warp сохраняется всегда — чтобы vpn-warp on не регистрировал WARP заново.
 HAVE_WARP=0
-if [ "$EXIT_MODE" != direct ] && current_warp "$WORK/warp.json"; then HAVE_WARP=1; fi
+if current_warp "$WORK/warp.json"; then save_warp "$WORK/warp.json"; [ "$EXIT_MODE" = direct ] || HAVE_WARP=1; fi
 if [ "$HAVE_WARP" = 1 ]; then
 	xui_set "xrayTemplateConfig=$(template_json "$EXIT_MODE" "$WORK/warp.json")"
 else
@@ -1170,17 +1339,7 @@ systemctl restart x-ui || die "x-ui не запустился (journalctl -u x-u
 wait_port "127.0.0.1:$WEB_PORT" 40 || die "панель x-ui не поднялась на 127.0.0.1:$WEB_PORT (journalctl -u x-ui)"
 
 # API панели — по одноразовому токену, после настройки токен удаляется.
-TOKEN_OUT=$("$XUI" setting -getApiToken 2>&1 || true)
-API_TOKEN=$(sed -n 's/^apiToken: *//p' <<<"$TOKEN_OUT" | tail -1)
-[ -n "$API_TOKEN" ] || die "x-ui не выдал API-токен: $TOKEN_OUT"
-TOKEN_ID=$(sqlite3 "$DB" 'select max(id) from api_tokens;')
-api() {  # api POST|GET ПУТЬ [аргументы curl] → тело ответа
-	local m=$1 p=$2
-	shift 2
-	curl -sk --max-time 60 -X "$m" -H "Authorization: Bearer $API_TOKEN" "$@" "$SCHEME://127.0.0.1:$WEB_PORT${WEB_PATH}panel/api/$p"
-}
-api_ok() { python3 -c 'import json, sys; d = json.load(sys.stdin); sys.exit(0 if d.get("success") else 1)' 2>/dev/null; }
-
+api_open
 INBOUND_ID=$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")
 if [ -n "$INBOUND_ID" ]; then
 	ok "подключение на :$REALITY_PORT уже есть (#$INBOUND_ID), клиенты прежние"
@@ -1223,45 +1382,23 @@ PY
 fi
 
 if [ "$EXIT_MODE" != direct ] && [ "$HAVE_WARP" = 0 ]; then
-	# Регистрация WARP — та же, что у кнопки WARP в панели; ключи WireGuard в обычном base64.
-	openssl genpkey -algorithm X25519 -outform DER -out "$WORK/wg.der" 2>/dev/null
-	WG_PRIV=$(tail -c 32 "$WORK/wg.der" | base64)
-	WG_PUB=$(openssl pkey -inform DER -in "$WORK/wg.der" -pubout -outform DER 2>/dev/null | tail -c 32 | base64)
-	RESP=$(api POST xray/warp/reg --data-urlencode "privateKey=$WG_PRIV" --data-urlencode "publicKey=$WG_PUB")
-	printf '%s' "$RESP" > "$WORK/warp-reg.json"
-	if python3 - "$WORK/warp.json" "$WG_PRIV" "$WARP_ENDPOINT" "$WORK/warp-reg.json" <<'PY'; then
-import base64, json, sys
-out, priv, endpoint, reg = sys.argv[1:5]
-d = json.load(open(reg))
-if not d.get("success"):
-    sys.exit(1)
-cfg = json.loads(d["obj"])["config"]["config"]
-addr = cfg["interface"]["addresses"]
-reserved = list(base64.b64decode(cfg["client_id"]))
-json.dump({"tag": "warp", "protocol": "wireguard", "settings": {
-    "mtu": 1420, "secretKey": priv,
-    "address": [a for a in (addr.get("v4") and addr["v4"] + "/32", addr.get("v6") and addr["v6"] + "/128") if a],
-    "reserved": reserved, "domainStrategy": "ForceIPv4v6",
-    "peers": [{"publicKey": cfg["peers"][0]["public_key"], "endpoint": endpoint, "keepAlive": 10}],
-    "noKernelTun": True}}, open(out, "w"))
-PY
+	if warp_register "$WORK/warp.json"; then
 		HAVE_WARP=1
 		ok "Cloudflare WARP зарегистрирован (бесплатный аккаунт)"
-	else
-		bad "WARP не зарегистрировался — выход остаётся напрямую с IP сервера. Ответ: $(head -c 300 <<<"$RESP")"
-		EXIT_MODE=direct
-	fi
-	if [ "$HAVE_WARP" = 1 ]; then
 		systemctl stop x-ui
 		xui_set "xrayTemplateConfig=$(template_json "$EXIT_MODE" "$WORK/warp.json")"
+	else
+		bad "WARP не зарегистрировался — выход остаётся напрямую с IP сервера. Ответ: $WARP_ERR"
+		EXIT_MODE=direct
 	fi
 fi
-sqlite3 "$DB" "delete from api_tokens where id=${TOKEN_ID:-0};" 2>/dev/null || true
+api_close
+save_state
 systemctl restart x-ui || bad "x-ui не перезапустился (journalctl -u x-ui)"
 case $EXIT_MODE in
-	direct) ok "выход клиентов в интернет — напрямую с IP сервера $PUBLIC_IP" ;;
-	warp) ok "выход клиентов — через Cloudflare WARP (IP сервера сайтам не виден)" ;;
-	warp-ru) ok "выход: российские сайты — через WARP, остальное — напрямую с $PUBLIC_IP" ;;
+	direct) ok "выход клиентов в интернет — напрямую с IP сервера $PUBLIC_IP (включить WARP потом: vpn-warp on или vpn-warp ru)" ;;
+	warp) ok "выход клиентов — через Cloudflare WARP (IP сервера сайтам не виден; выключить: vpn-warp off)" ;;
+	warp-ru) ok "выход: российские сайты — через WARP, остальное — напрямую с $PUBLIC_IP (выключить: vpn-warp off)" ;;
 esac
 
 say "Ядро, swap, часовой пояс"
@@ -1451,7 +1588,7 @@ keep /etc/x-ui/warp /etc/x-ui/install-result.env /etc/default/x-ui \
 	/etc/ssh/sshd_config.d /root/.ssh/authorized_keys \
 	/usr/local/bin/vpn-backup.sh /etc/cron.d/vpn-backup \
 	/usr/local/bin/vpn-exit-watchdog.sh /etc/systemd/system/vpn-exit-watchdog.service \
-	"$KIT_DIR/install-vpn.sh" "$KIT_DIR/mac" /usr/local/bin/vpn-check /etc/vpn-install.env \
+	"$KIT_DIR/install-vpn.sh" "$KIT_DIR/mac" /usr/local/bin/vpn-check /usr/local/bin/vpn-warp /etc/vpn-install.env \
 	/etc/fail2ban/jail.d/vpn-sshd.local \
 	/etc/ufw/user.rules /etc/ufw/user6.rules
 
@@ -2196,7 +2333,9 @@ fi
 install -m 644 "$F/etc/cron.d/vpn-backup" /etc/cron.d/vpn-backup
 # Сервер, поставленный install-vpn.sh: его настройки (для повторного запуска и vpn-check) и команда vpn-check.
 if [ -f "$F/etc/vpn-install.env" ]; then install -m 600 "$F/etc/vpn-install.env" /etc/vpn-install.env; fi
-if [ -f "$F/usr/local/bin/vpn-check" ]; then install -m 755 "$F/usr/local/bin/vpn-check" /usr/local/bin/vpn-check; fi
+for f in vpn-check vpn-warp; do
+	if [ -f "$F/usr/local/bin/$f" ]; then install -m 755 "$F/usr/local/bin/$f" "/usr/local/bin/$f"; fi
+done
 ok "vpn-backup.sh по cron, архивы в /root/backups"
 
 WATCHDOG=0
@@ -2265,6 +2404,12 @@ vpn-check
 что случилось: служба упала (перезапуск: `systemctl restart x-ui`), порт закрыт фаерволом хостера
 (открыть в панели хостера) или IP заблокирован в России (нужен другой IP — переезд ниже).
 
+## Выход через WARP
+
+`vpn-warp off` — напрямую с IP сервера, `vpn-warp on` — весь трафик через Cloudflare WARP,
+`vpn-warp ru` — российские сайты через WARP, `vpn-warp` — как сейчас. После переключения туннель
+проверяется; не заработало — возвращается как было.
+
 ## Бэкап
 
 Каждый день в 04:17 сервер сам кладёт архив в `/root/backups/` (14 последних, `latest.tgz` —
@@ -2330,7 +2475,14 @@ if [ -f /usr/local/lib/vpn-backup/install-vpn.sh ]; then
 exec bash /usr/local/lib/vpn-backup/install-vpn.sh --check "$@"
 EOF
 	chmod 755 /usr/local/bin/vpn-check
+	cat > /usr/local/bin/vpn-warp <<'EOF'
+#!/bin/bash
+# Выход клиентов через Cloudflare WARP: vpn-warp off | on | ru | status (install-vpn.sh --warp).
+exec bash /usr/local/lib/vpn-backup/install-vpn.sh --warp "${1:-status}"
+EOF
+	chmod 755 /usr/local/bin/vpn-warp
 	ok "команда vpn-check: проверить VPN в любой момент (ничего не меняет)"
+	ok "команда vpn-warp: off — WARP выключить, on — всё через WARP, ru — российские сайты через WARP"
 fi
 
 say "Запуск"
@@ -2394,6 +2546,8 @@ chmod 700 /root/vpn-qr
 	echo
 	echo "Если VPN перестал работать — проверка одной командой (службы, туннель, доступность из России):"
 	if [ -x /usr/local/bin/vpn-check ]; then echo "  vpn-check"; else echo "  bash install-vpn.sh --check"; fi
+	echo "Выход клиентов сейчас: $(exit_label "$EXIT_MODE"). Переключить без переустановки:"
+	echo "  vpn-warp off — напрямую, vpn-warp on — всё через WARP, vpn-warp ru — российские сайты через WARP"
 	echo
 	echo "Бэкап: /root/backups/latest.tgz — каждый день в 04:17. Архив секретный: забрать к себе"
 	echo "  scp -P $SSH_PORT root@$PUBLIC_IP:/root/backups/latest.tgz ."
