@@ -7,7 +7,7 @@
 #     nginx на 443: сайт-заглушка, панель и подписка за доменом по секретным путям; Let's Encrypt.
 #     Нужна A-запись домена на IP сервера (в Cloudflare — серое облако, Proxy выключен).
 #   • Без домена: VLESS + XHTTP + Reality на порту 443 под крупный чужой сайт (скрипт сам проверит
-#     и выберет подходящий). Ссылки привязаны к IP сервера, панель — только через SSH-туннель.
+#     и выберет подходящий). Ссылки привязаны к IP сервера, панель — https://IP:порт/секретный-путь/.
 # В обоих: 3x-ui 3.3.1 + Xray 26.6.1 (sha256 закреплены), BBR, IPv6 выключен, swap, фаервол ufw,
 # fail2ban против подбора пароля SSH, ежедневный бэкап для переезда в /root/backups.
 # До установки скрипт проверяет через check-host.net, не заблокирован ли IP сервера в России,
@@ -23,6 +23,7 @@
 #   --domain ДОМЕН    свой домен, A-запись которого уже указывает на этот сервер
 #   --no-domain       без домена: Reality на 443 под крупный чужой сайт
 #   --sni САЙТ        (без домена) под какой сайт маскироваться вместо автовыбора, например www.samsung.com
+#   --panel-local     (без домена) панель только на 127.0.0.1 — заходить через SSH-туннель, снаружи не видна
 #   --clients N       сколько клиентов (устройств) создать, по умолчанию 5; потом — в панели
 #   --exit РЕЖИМ      куда выходит трафик клиентов:
 #                       direct  — с IP сервера (по умолчанию, быстрее всего);
@@ -66,6 +67,7 @@ www.nvidia.com www.oracle.com www.intel.com www.dell.com www.hp.com www.asus.com
 DOMAIN=
 NO_DOMAIN=0
 SNI_ARG=
+PANEL_LOCAL_ARG=
 CLIENTS=5
 EXIT_MODE=
 SSH_KEY_ONLY=0
@@ -83,6 +85,8 @@ while [ $# -gt 0 ]; do
 		--domain) DOMAIN=${2:-}; shift 2 ;;
 		--no-domain) NO_DOMAIN=1; shift ;;
 		--sni) SNI_ARG=${2:-}; shift 2 ;;
+		--panel-local) PANEL_LOCAL_ARG=1; shift ;;
+		--panel-public) PANEL_LOCAL_ARG=0; shift ;;
 		--clients) CLIENTS=${2:-}; shift 2 ;;
 		--exit) EXIT_MODE=${2:-}; shift 2 ;;
 		--ssh-key-only) SSH_KEY_ONLY=1; shift ;;
@@ -145,7 +149,7 @@ else
   1) Да  — лучше: маскировка под свой сайт, подписки в приложениях обновляются сами,
            панель открывается по адресу домена. Нужна A-запись домена на IP этого сервера.
   2) Нет — маскировка под крупный чужой сайт. Ссылки привязаны к IP сервера
-           (переедете на другой сервер — ссылки раздать заново), панель — через SSH-туннель.
+           (переедете на другой сервер — ссылки раздать заново), панель — по IP сервера.
 EOF
 		while [ -z "$MODE" ]; do
 			printf 'Ваш выбор [1/2]: ' > /dev/tty
@@ -440,6 +444,7 @@ reach_check() {  # после установки и в --check: открыты �
 	ssh_port=$(ssh_ports | awk '{print $1}')
 	ports="$ssh_port $REALITY_PORT"
 	[ "$MODE" = domain ] && ports="$ssh_port $REALITY_PORT 443 80"
+	if [ "${PANEL_PUBLIC:-0}" = 1 ]; then ports="$ports $WEB_PORT"; fi
 	# shellcheck disable=SC2086
 	chk_probe "$PUBLIC_IP" $ports > "$CHK_OUT"
 	case $(head -1 "$CHK_OUT") in
@@ -452,6 +457,7 @@ reach_check() {  # после установки и в --check: открыты �
 		case $p in
 			"$ssh_port") what="SSH" ;;
 			"$REALITY_PORT") what="VPN" ;;
+			"$WEB_PORT") what="панель" ;;
 			443) what="подписка и панель" ;;
 			80) what="продление сертификата" ;;
 			*) what="порт" ;;
@@ -556,7 +562,7 @@ local_checks() {
 	for s in x-ui $([ "$MODE" = domain ] && echo nginx) $([ -f "$F2B_JAIL" ] && echo fail2ban); do
 		if systemctl is-active -q "$s"; then ok "служба $s работает"; else bad "служба $s не работает (journalctl -u $s)"; fi
 	done
-	for p in $([ "$MODE" = domain ] && echo "$LISTEN_IP:443 127.0.0.1:8443") "127.0.0.1:$WEB_PORT" "127.0.0.1:$SUB_PORT" ":$REALITY_PORT"; do
+	for p in $([ "$MODE" = domain ] && echo "$LISTEN_IP:443 127.0.0.1:8443") ":$WEB_PORT" "127.0.0.1:$SUB_PORT" ":$REALITY_PORT"; do
 		if wait_port "$p" 15; then ok "слушает $p"; else bad "никто не слушает $p"; fi
 	done
 	ok "выход клиентов: $(exit_label "$(exit_mode_now)") (переключить: vpn-warp off|on|ru)"
@@ -582,8 +588,18 @@ local_checks() {
 		code=$(curl -s $K -o /dev/null -w '%{http_code}' --max-time 10 --resolve "other.example:443:$LISTEN_IP" "https://other.example/" || true)
 		if [ "$code" = 000 ]; then ok "чужой SNI на :443 обрывается"; else bad "чужой SNI на :443 получил ответ $code"; fi
 	else
-		code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://127.0.0.1:$WEB_PORT$WEB_PATH" || true)
-		if [ "$code" = 200 ]; then ok "панель отвечает 200 (на 127.0.0.1)"; else bad "панель отвечает $code"; fi
+		if [ "$PANEL_PUBLIC" = 1 ]; then
+			code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "https://$LISTEN_IP:$WEB_PORT$WEB_PATH" || true)
+			if [ "$code" = 200 ]; then ok "панель отвечает 200 по IP (https://$PUBLIC_IP:$WEB_PORT/…)"; else bad "панель по IP отвечает $code"; fi
+			code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "https://$LISTEN_IP:$WEB_PORT/" || true)
+			case $code in
+				2* | 3*) warn "без секретного пути порт панели отвечает $code — панель проще найти сканерам" ;;
+				*) ok "без секретного пути панель не открывается (ответ $code)" ;;
+			esac
+		else
+			code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://127.0.0.1:$WEB_PORT$WEB_PATH" || true)
+			if [ "$code" = 200 ]; then ok "панель отвечает 200 (на 127.0.0.1, снаружи — через SSH-туннель)"; else bad "панель отвечает $code"; fi
+		fi
 		# Кто прощупывает сервер без ключа, должен увидеть настоящий сайт с верным сертификатом.
 		if timeout 10 openssl s_client -connect "$LISTEN_IP:$REALITY_PORT" -servername "$REALITY_SNI" -verify_hostname "$REALITY_SNI" \
 			-verify_return_error < /dev/null 2>&1 | grep -q 'Verify return code: 0 (ok)'; then
@@ -677,6 +693,7 @@ REALITY_PUB='${REALITY_PUB:-}'
 SHORT_IDS='${SHORT_IDS:-}'
 REALITY_SNI='${REALITY_SNI:-}'
 S_EXIT='$EXIT_MODE'
+S_PANEL_PUBLIC='${PANEL_PUBLIC:-0}'
 EOF
 	chmod 600 "$tmp"
 	mv "$tmp" "$STATE"
@@ -775,14 +792,37 @@ apply_exit() {  # apply_exit РЕЖИМ ФАЙЛ_WARP|- — записать ш�
 	systemctl stop x-ui 2>/dev/null || true
 	xui_set "xrayTemplateConfig=$(template_json "$1" "$2")"
 	systemctl restart x-ui || return 1
-	wait_port "127.0.0.1:$WEB_PORT" 40
+	wait_port ":$WEB_PORT" 40
 }
+
+PANEL_CERT_DIR=/etc/x-ui/panel-cert   # без домена: самоподписанный сертификат панели на IP сервера
+
+xui_get() { sqlite3 -readonly "$DB" "select value from settings where key='$1';" 2>/dev/null || true; }
+
+make_panel_cert() {  # самоподписанный сертификат панели на IP — выпустить, если его нет или в нём не нынешний IP
+	local san="IP:$PUBLIC_IP"
+	[ "$LISTEN_IP" = "$PUBLIC_IP" ] || san="$san,IP:$LISTEN_IP"
+	if [ -s "$PANEL_CERT_DIR/fullchain.pem" ] &&
+		openssl x509 -noout -ext subjectAltName -in "$PANEL_CERT_DIR/fullchain.pem" 2>/dev/null | grep -qE "IP Address:${PUBLIC_IP//./\\.}(,|\$)"; then
+		return 0
+	fi
+	install -d -m 700 "$PANEL_CERT_DIR"
+	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj "/CN=$PUBLIC_IP" \
+		-addext "subjectAltName=$san" -keyout "$PANEL_CERT_DIR/privkey.pem" -out "$PANEL_CERT_DIR/fullchain.pem" >/dev/null 2>&1 ||
+		die "не создался сертификат панели"
+	chmod 600 "$PANEL_CERT_DIR/privkey.pem"
+}
+
+panel_fingerprint() { openssl x509 -noout -fingerprint -sha256 -in "$PANEL_CERT_DIR/fullchain.pem" 2>/dev/null | cut -d= -f2; }
 
 derive_vars() {  # для --check и --warp: то, что установка вычисляет по ходу (после detect_ips)
 	CERT_DIR=${DOMAIN:+/root/cert/$DOMAIN}
 	K=
 	if [ -n "$DOMAIN" ] && ! openssl x509 -noout -issuer -in "$CERT_DIR/fullchain.pem" 2>/dev/null | grep -qi "let's encrypt"; then K=-k; fi
-	if [ "$MODE" = domain ]; then SHARE_ADDR=$DOMAIN; SCHEME=https; else SHARE_ADDR=$PUBLIC_IP; SCHEME=http; fi
+	if [ "$MODE" = domain ]; then SHARE_ADDR=$DOMAIN; else SHARE_ADDR=$PUBLIC_IP; fi
+	if [ -n "$(xui_get webCertFile)" ]; then SCHEME=https; else SCHEME=http; fi
+	PANEL_PUBLIC=0
+	if [ "$MODE" = nodomain ] && [ "$(xui_get webListen)" != 127.0.0.1 ]; then PANEL_PUBLIC=1; fi
 }
 
 verdict() {
@@ -868,7 +908,7 @@ if [ -n "$WARP_CMD" ]; then
 	systemctl stop x-ui 2>/dev/null || true
 	xui_set "xrayTemplateConfig=$(cat "$WORK/template.before")"
 	systemctl restart x-ui || true
-	wait_port "127.0.0.1:$WEB_PORT" 40 || true
+	wait_port ":$WEB_PORT" 40 || true
 	die "вернул как было: $(exit_label "$NOW")$([ "$TARGET_EXIT" != direct ] && echo ". WARP с этого сервера сейчас не работает — попробуйте позже")"
 fi
 
@@ -954,6 +994,15 @@ fi
 : "${SUB_PATH:=/$(rnd "$LOWER" 8)/}"
 : "${CLASH_PATH:=/$(rnd "$LOWER" 7)/}"
 : "${JSON_PATH:=/$(rnd "$LOWER" 6)/}"
+# Панель без домена: по умолчанию открыта по IP (https://IP:порт/путь/, сертификат самоподписанный);
+# --panel-local — только 127.0.0.1 и SSH-туннель. С доменом панель всегда за nginx по домену.
+if [ "$MODE" = domain ]; then
+	PANEL_PUBLIC=0
+elif [ -n "$PANEL_LOCAL_ARG" ]; then
+	PANEL_PUBLIC=$((1 - PANEL_LOCAL_ARG))
+else
+	PANEL_PUBLIC=${S_PANEL_PUBLIC:-1}
+fi
 [ -n "$WEB_PORT" ] || die "не нашёлся свободный порт для панели"
 save_state
 
@@ -991,7 +1040,7 @@ mkdir -p /etc/x-ui
 if [ "$MODE" = domain ]; then
 	ok "панель: только 127.0.0.1:$WEB_PORT, снаружи — через nginx по секретному пути"
 else
-	ok "панель: только 127.0.0.1:$WEB_PORT, снаружи не видна (заходить через SSH-туннель)"
+	ok "панель: случайные логин, пароль, порт $WEB_PORT и секретный путь (где она слушает — ниже)"
 fi
 
 if [ -z "${REALITY_PRIV:-}" ]; then
@@ -1311,17 +1360,25 @@ COMMON_SETTINGS=("subEnable=true" "subListen=127.0.0.1" "subPort=$SUB_PORT" "sub
 	"subJsonEnable=false" "subJsonPath=$JSON_PATH" "subClashPath=$CLASH_PATH"
 	"remarkModel=-ieo" "timeLocation=Local" "trustedProxyCIDRs=127.0.0.1/32,::1/128" "webDomain=")
 if [ "$MODE" = domain ]; then
-	xui_set "${COMMON_SETTINGS[@]}" "webCertFile=$CERT_DIR/fullchain.pem" "webKeyFile=$CERT_DIR/privkey.pem" \
+	xui_set "${COMMON_SETTINGS[@]}" "webListen=127.0.0.1" "webCertFile=$CERT_DIR/fullchain.pem" "webKeyFile=$CERT_DIR/privkey.pem" \
 		"subCertFile=$CERT_DIR/fullchain.pem" "subKeyFile=$CERT_DIR/privkey.pem" "subURI=https://$DOMAIN$SUB_PATH" \
 		"subClashEnable=true" "subClashURI=https://$DOMAIN$CLASH_PATH" "subJsonURI=https://$DOMAIN$JSON_PATH"
 	SCHEME=https
 	SHARE_ADDR=$DOMAIN
 else
-	# Без домена панель и подписка — только на 127.0.0.1 без TLS: снаружи их не видно,
-	# подписку скрипт читает сам, чтобы выдать готовые ссылки.
-	xui_set "${COMMON_SETTINGS[@]}" "webCertFile=" "webKeyFile=" "subCertFile=" "subKeyFile=" "subURI=" \
-		"subClashEnable=false" "subClashURI=" "subJsonURI="
-	SCHEME=http
+	# Без домена подписка — только на 127.0.0.1 без TLS (скрипт читает её сам, чтобы выдать готовые ссылки).
+	# Панель — по IP с самоподписанным сертификатом (по умолчанию) или только на 127.0.0.1 (--panel-local).
+	xui_set "${COMMON_SETTINGS[@]}" "subCertFile=" "subKeyFile=" "subURI=" "subClashEnable=false" "subClashURI=" "subJsonURI="
+	if [ "$PANEL_PUBLIC" = 1 ]; then
+		make_panel_cert
+		xui_set "webListen=" "webCertFile=$PANEL_CERT_DIR/fullchain.pem" "webKeyFile=$PANEL_CERT_DIR/privkey.pem"
+		SCHEME=https
+		ok "панель открыта по IP: https://$PUBLIC_IP:$WEB_PORT/… (секретный путь, сертификат самоподписанный)"
+	else
+		xui_set "webListen=127.0.0.1" "webCertFile=" "webKeyFile="
+		SCHEME=http
+		ok "панель только на 127.0.0.1 (--panel-local), снаружи — через SSH-туннель"
+	fi
 	SHARE_ADDR=$PUBLIC_IP
 	# Повторный запуск после смены IP сервера: ссылки должны вести на нынешний адрес.
 	sqlite3 "$DB" "update inbounds set share_addr='$PUBLIC_IP' where port=$REALITY_PORT and share_addr_strategy='custom' and share_addr<>'$PUBLIC_IP';" 2>/dev/null || true
@@ -1336,7 +1393,7 @@ else
 fi
 systemctl enable x-ui >/dev/null 2>&1 || true
 systemctl restart x-ui || die "x-ui не запустился (journalctl -u x-ui)"
-wait_port "127.0.0.1:$WEB_PORT" 40 || die "панель x-ui не поднялась на 127.0.0.1:$WEB_PORT (journalctl -u x-ui)"
+wait_port ":$WEB_PORT" 40 || die "панель x-ui не поднялась на порту $WEB_PORT (journalctl -u x-ui)"
 
 # API панели — по одноразовому токену, после настройки токен удаляется.
 api_open
@@ -1510,9 +1567,12 @@ if [ "$DO_UFW" = 1 ]; then
 		for p in $SSH_PORTS; do echo "$p/tcp"; done
 		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
 		if [ "$MODE" = domain ]; then echo 80/tcp; echo 443/tcp; fi
+		if [ "$PANEL_PUBLIC" = 1 ]; then echo "$WEB_PORT/tcp"; fi
 		echo "$REALITY_PORT/tcp"
 	} | sort -u -t/ -k1,1n)
 	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
+	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
+	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
 	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился (ufw status)"; fi
 else
 	warn "фаервол не трогали (--no-ufw)"
@@ -1549,10 +1609,13 @@ setting() { sqlite3 -readonly "$DB" "select value from settings where key='$1';"
 # сервер поставлен без домена (Reality под чужой сайт), архив тогда называется по IP.
 CERT_FILE=$(setting webCertFile)
 DOMAIN=
-if [ -n "$CERT_FILE" ]; then
-	DOMAIN=$(basename "$(dirname "$CERT_FILE")")
-	case $DOMAIN in . | /) die "не удалось определить домен по webCertFile ($CERT_FILE)" ;; esac
-fi
+case $CERT_FILE in
+	/root/cert/*/*)
+		DOMAIN=$(basename "$(dirname "$CERT_FILE")")
+		# Самоподписанный сертификат панели на IP (сервер без домена) — не домен.
+		if [[ $DOMAIN != *.* ]] || [[ $DOMAIN =~ ^[0-9.]+$ ]]; then DOMAIN=; fi
+		;;
+esac
 
 SRC_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
 PUBLIC_IP=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo "$SRC_IP")
@@ -1578,7 +1641,7 @@ keep() {  # копирует существующие пути в files/ с со
 	done
 	return 0
 }
-keep /etc/x-ui/warp /etc/x-ui/install-result.env /etc/default/x-ui \
+keep /etc/x-ui/warp /etc/x-ui/panel-cert /etc/x-ui/install-result.env /etc/default/x-ui \
 	/etc/systemd/system/x-ui.service /usr/bin/x-ui \
 	/etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/stream-enabled /etc/nginx/sites-enabled \
 	/var/www/html \
@@ -1636,8 +1699,11 @@ if domain:
     print("Подписка: https://%s%s<subId>" % (domain, st.get("subPath", "/sub/")))
 else:
     print("Сервер без домена, ссылки клиентов ведут на IP %s" % ip)
-    print("Панель:   через SSH-туннель — ssh -N -L %s:127.0.0.1:%s root@%s, потом http://127.0.0.1:%s%s" % (
-        st.get("webPort"), st.get("webPort"), ip, st.get("webPort"), st.get("webBasePath", "/")))
+    if (st.get("webListen") or "") not in ("127.0.0.1", "localhost"):
+        print("Панель:   https://%s:%s%s (сертификат самоподписанный)" % (ip, st.get("webPort"), st.get("webBasePath", "/")))
+    else:
+        print("Панель:   через SSH-туннель — ssh -N -L %s:127.0.0.1:%s root@%s, потом http://127.0.0.1:%s%s" % (
+            st.get("webPort"), st.get("webPort"), ip, st.get("webPort"), st.get("webBasePath", "/")))
 print()
 for iid, remark, port, listen, proto, enable, ss in db.execute(
         "select id, remark, port, listen, protocol, enable, stream_settings from inbounds order by id"):
@@ -1941,7 +2007,7 @@ verify() {
 	if [ -f /etc/systemd/system/vpn-exit-watchdog.service ]; then
 		if systemctl is-active -q vpn-exit-watchdog; then ok "вотчдог выхода работает"; else bad "вотчдог выхода не работает (journalctl -u vpn-exit-watchdog)"; fi
 	fi
-	for p in $([ "$HAS_NGINX" = 1 ] && echo "$LISTEN_IP:443 127.0.0.1:8443") "127.0.0.1:$web_port" "127.0.0.1:$sub_port"; do
+	for p in $([ "$HAS_NGINX" = 1 ] && echo "$LISTEN_IP:443 127.0.0.1:8443") ":$web_port" "127.0.0.1:$sub_port"; do
 		if wait_port "$p" 10; then ok "слушает $p"; else bad "никто не слушает $p"; fi
 	done
 	for p in $(inbound_ports "$DB" | grep /tcp | cut -d/ -f1); do
@@ -1961,7 +2027,13 @@ verify() {
 		if [ "$code" = 200 ]; then ok "панель https://$DOMAIN$web_path отвечает 200"; else bad "панель отвечает $code"; fi
 	else
 		code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "$(local_scheme webCertFile)://127.0.0.1:$web_port$web_path" || true)
-		if [ "$code" = 200 ]; then ok "панель на 127.0.0.1:$web_port отвечает 200 (снаружи — через SSH-туннель)"; else bad "панель отвечает $code"; fi
+		if [ "$code" != 200 ]; then
+			bad "панель отвечает $code"
+		elif [ "$(setting webListen)" != 127.0.0.1 ]; then
+			ok "панель отвечает 200 — открыта по IP: https://$PUBLIC_IP:$web_port/…"
+		else
+			ok "панель на 127.0.0.1:$web_port отвечает 200 (снаружи — через SSH-туннель)"
+		fi
 	fi
 
 	if [ "$HAS_NGINX" = 1 ] && [ -n "$DOMAIN" ]; then
@@ -2052,6 +2124,9 @@ EOF
 ссылки (в приложении удалить старую и добавить новую: «+» → «Импорт из буфера обмена»):
 EOF
 		client_links
+		if [ "$(setting webListen)" != 127.0.0.1 ]; then
+			echo "Панель: https://$PUBLIC_IP:$(setting webPort)$(setting webBasePath) (сертификат самоподписанный, логин и пароль — прежние)"
+		fi
 		cat <<EOF
 Ключи те же, меняется только адрес. Старый сервер ($SRC_PUBLIC_IP) не удалять, пока все не перейдут.
 EOF
@@ -2183,6 +2258,21 @@ if [ -z "$DOMAIN" ] && [[ $SRC_PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] 
 	n=$(sqlite3 "$DB" "update inbounds set share_addr='$PUBLIC_IP' where share_addr_strategy='custom' and share_addr='$SRC_PUBLIC_IP'; select changes();")
 	ok "адрес в ссылках клиентов: $SRC_PUBLIC_IP → $PUBLIC_IP (подключений: $n)"
 fi
+# Без домена панель открыта по IP с самоподписанным сертификатом (install-vpn.sh): на новом IP — новый сертификат.
+if [ -z "$DOMAIN" ] && [ -d "$F/etc/x-ui/panel-cert" ]; then
+	cp -a "$F/etc/x-ui/panel-cert" /etc/x-ui/
+	if [ "$SRC_PUBLIC_IP" != "$PUBLIC_IP" ]; then
+		san="IP:$PUBLIC_IP"
+		[ "$LISTEN_IP" = "$PUBLIC_IP" ] || san="$san,IP:$LISTEN_IP"
+		if openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj "/CN=$PUBLIC_IP" \
+			-addext "subjectAltName=$san" -keyout /etc/x-ui/panel-cert/privkey.pem -out /etc/x-ui/panel-cert/fullchain.pem >/dev/null 2>&1; then
+			chmod 600 /etc/x-ui/panel-cert/privkey.pem
+			ok "сертификат панели выпущен заново на новый IP $PUBLIC_IP"
+		else
+			bad "не перевыпустился сертификат панели на новый IP"
+		fi
+	fi
+fi
 
 if [ -n "$DOMAIN" ]; then
 say "Сертификат $DOMAIN и acme.sh"
@@ -2313,6 +2403,8 @@ if [ "$DO_UFW" = 1 ]; then
 		sshd -T 2>/dev/null | awk '$1=="port"{print $2"/tcp"}'
 		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
 		if [ "$HAS_NGINX" = 1 ]; then echo 80/tcp; echo 443/tcp; fi
+		# Без домена панель может быть открыта по IP (install-vpn.sh) — её порт тоже.
+		if [ -z "$DOMAIN" ] && [ "$(setting webListen)" != 127.0.0.1 ]; then echo "$(setting webPort)/tcp"; fi
 		inbound_ports "$DB"
 	} | sort -u -t/ -k1,1n -k2)
 	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
@@ -2352,7 +2444,7 @@ say "Запуск"
 systemctl enable x-ui cron $([ "$HAS_NGINX" = 1 ] && echo nginx) >/dev/null 2>&1 || warn "не удалось включить автозапуск служб"
 systemctl restart cron || warn "cron не перезапустился"
 systemctl restart x-ui || bad "x-ui не запустился (journalctl -u x-ui)"
-wait_port "127.0.0.1:$(setting webPort)" 30 || true
+wait_port ":$(setting webPort)" 30 || true
 if [ "$HAS_NGINX" = 1 ]; then systemctl restart nginx || bad "nginx не запустился (journalctl -u nginx)"; fi
 if [ "$WATCHDOG" = 1 ]; then
 	systemctl enable vpn-exit-watchdog >/dev/null 2>&1 || warn "не удалось включить автозапуск вотчдога"
@@ -2449,9 +2541,10 @@ scp root@IP_СЕРВЕРА:/root/backups/latest.tgz ./vpn-backup.tgz
   настоящий сайт с nginx (`127.0.0.1:8443`). На 443 nginx пускает свой домен к сайту, панели и подписке,
   остальное обрывает.
 - Без домена — Reality на 443 под крупный чужой сайт (какой — видно в панели, поле SNI подключения):
-  тот, кто прощупывает сервер, получает настоящий сайт. Панель и подписка слушают только 127.0.0.1;
-  панель открывать через SSH-туннель: `ssh -N -L ПОРТ:127.0.0.1:ПОРТ root@IP`, потом
-  `http://127.0.0.1:ПОРТ/путь` (порт и путь — в `/root/vpn-info.txt`).
+  тот, кто прощупывает сервер, получает настоящий сайт. Панель открыта по IP:
+  `https://IP:ПОРТ/путь/` с самоподписанным сертификатом (браузер предупредит — «Дополнительно» →
+  «Перейти»), адрес, логин и пароль — в `/root/vpn-info.txt`. Спрятать её за SSH-туннель — повторный
+  запуск установщика с `--panel-local` (вернуть — `--panel-public`).
 - В подключении стоят uTLS `chrome` и xmux (меньше TLS-рукопожатий — меньше заморозок у провайдеров);
   если их поменять, клиентам надо обновить подписку или ссылки.
 VPN_KIT_EOF_2
@@ -2492,7 +2585,7 @@ SERVICES="x-ui cron"
 systemctl enable $SERVICES >/dev/null 2>&1 || warn "не удалось включить автозапуск служб"
 systemctl restart cron || warn "cron не перезапустился"
 systemctl restart x-ui || bad "x-ui не запустился (journalctl -u x-ui)"
-wait_port "127.0.0.1:$WEB_PORT" 40 || true
+wait_port ":$WEB_PORT" 40 || true
 if [ "$MODE" = domain ]; then systemctl restart nginx || bad "nginx не запустился (journalctl -u nginx)"; fi
 
 K=
@@ -2532,12 +2625,20 @@ chmod 700 /root/vpn-qr
 		echo "Ссылки привязаны к IP $PUBLIC_IP. Переедете на другой сервер (restore.sh из бэкапа) —"
 		echo "restore.sh напечатает новые ссылки, их надо заново добавить в приложения."
 		echo
-		echo "Панель управления — только через SSH-туннель, снаружи её не видно:"
-		echo "  1) на своём компьютере в терминале (окно не закрывать):"
-		echo "       ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT -p $SSH_PORT root@$PUBLIC_IP"
-		echo "  2) в браузере: http://127.0.0.1:$WEB_PORT$WEB_PATH"
-		echo "     логин:  $PANEL_USER"
-		echo "     пароль: $PANEL_PASS"
+		if [ "$PANEL_PUBLIC" = 1 ]; then
+			echo "Панель управления: https://$PUBLIC_IP:$WEB_PORT$WEB_PATH"
+			echo "  логин:  $PANEL_USER"
+			echo "  пароль: $PANEL_PASS"
+			echo "  Сертификат самоподписанный: браузер предупредит — «Дополнительно» → «Перейти на сайт»."
+			echo "  Отпечаток сертификата SHA-256 (сверить в браузере): $(panel_fingerprint)"
+		else
+			echo "Панель управления — только через SSH-туннель, снаружи её не видно:"
+			echo "  1) на своём компьютере в терминале (окно не закрывать):"
+			echo "       ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT -p $SSH_PORT root@$PUBLIC_IP"
+			echo "  2) в браузере: http://127.0.0.1:$WEB_PORT$WEB_PATH"
+			echo "     логин:  $PANEL_USER"
+			echo "     пароль: $PANEL_PASS"
+		fi
 	fi
 	echo
 	echo "Приложения (нужно ядро Xray, sing-box-приложения вроде Hiddify XHTTP не умеют):"
@@ -2563,5 +2664,21 @@ while IFS='|' read -r c l; do
 done < "$WORK/qr"
 echo "То же самое — в $INFO, QR-картинки — в /root/vpn-qr/. Журнал установки: $LOG"
 echo "Заняло $(($(date +%s) - START)) с."
+# Панель — последним блоком: QR-коды выше длинные, и начало вывода уезжает за экран.
+printf '\n\033[1;36m═══ Панель 3x-ui ═══\033[0m\n'
+if [ "$MODE" = domain ]; then
+	printf '  Адрес:  \033[1mhttps://%s%s\033[0m\n' "$DOMAIN" "$WEB_PATH"
+elif [ "$PANEL_PUBLIC" = 1 ]; then
+	printf '  Адрес:  \033[1mhttps://%s:%s%s\033[0m\n' "$PUBLIC_IP" "$WEB_PORT" "$WEB_PATH"
+	echo "  Браузер предупредит о самоподписанном сертификате — «Дополнительно» → «Перейти на сайт»."
+else
+	echo "  Снаружи панель не видна (так её не найдут сканеры) — открывать через SSH-туннель:"
+	echo "  1) на своём компьютере в терминале, окно не закрывать:"
+	printf '       \033[1mssh -N -L %s:127.0.0.1:%s -p %s root@%s\033[0m\n' "$WEB_PORT" "$WEB_PORT" "$SSH_PORT" "$PUBLIC_IP"
+	printf '  2) в браузере:  \033[1mhttp://127.0.0.1:%s%s\033[0m\n' "$WEB_PORT" "$WEB_PATH"
+fi
+printf '  Логин:  \033[1m%s\033[0m\n' "$PANEL_USER"
+printf '  Пароль: \033[1m%s\033[0m\n' "$PANEL_PASS"
+echo "  Показать ещё раз (вместе со ссылками клиентов): cat $INFO"
 verdict
 exit $((FAILS > 0))
