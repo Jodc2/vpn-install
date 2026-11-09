@@ -24,6 +24,9 @@
 #   --no-domain       без домена: Reality на 443 под крупный чужой сайт
 #   --sni САЙТ        (без домена) под какой сайт маскироваться вместо автовыбора, например www.samsung.com
 #   --panel-local     (без домена) панель только на 127.0.0.1 — заходить через SSH-туннель, снаружи не видна
+#   --no-ip-cert      (без домена) не брать сертификат Let's Encrypt на IP: подписка только внутри сервера
+#                     (в QR — прямые ссылки), панель с самоподписанным сертификатом. По умолчанию сертификат
+#                     берётся (нужен открытый TCP 80): подписка по https://IP:2096/…, панель без предупреждений
 #   --clients N       сколько клиентов (устройств) создать, по умолчанию 1; остальные — в панели
 #   --port N          порт подключения (по умолчанию 2083, как у основного сервера); на уже
 #                     установленном сервере переносит подключение — клиентам выдать новые ссылки
@@ -79,6 +82,10 @@ DOMAIN=
 NO_DOMAIN=0
 SNI_ARG=
 PANEL_LOCAL_ARG=
+IP_CERT_ARG=
+SUB_TLS=0
+IP_CERT_OK=0
+IPK=
 CLIENTS=1
 PORT_ARG=
 EXIT_MODE=
@@ -106,6 +113,8 @@ while [ $# -gt 0 ]; do
 		--sni) SNI_ARG=${2:-}; shift 2 ;;
 		--panel-local) PANEL_LOCAL_ARG=1; shift ;;
 		--panel-public) PANEL_LOCAL_ARG=0; shift ;;
+		--no-ip-cert) IP_CERT_ARG=0; shift ;;
+		--ip-cert) IP_CERT_ARG=1; shift ;;
 		--clients) CLIENTS=${2:-}; shift 2 ;;
 		--port) PORT_ARG=${2:-}; shift 2 ;;
 		--exit) EXIT_MODE=${2:-}; shift 2 ;;
@@ -610,6 +619,7 @@ reach_check() {  # после установки и в --check: открыты �
 	ports="$ssh_port $REALITY_PORT"
 	[ "$MODE" = domain ] && ports="$ssh_port $REALITY_PORT 443 80"
 	if [ "${PANEL_PUBLIC:-0}" = 1 ]; then ports="$ports $WEB_PORT"; fi
+	if [ "${SUB_TLS:-0}" = 1 ]; then ports="$ports $SUB_PORT"; fi   # :80 при сертификате на IP открыт только во время продления
 	# shellcheck disable=SC2086
 	chk_probe "$PUBLIC_IP" $ports > "$CHK_OUT"
 	case $(head -1 "$CHK_OUT") in
@@ -622,6 +632,7 @@ reach_check() {  # после установки и в --check: открыты �
 		case $p in
 			"$ssh_port") what="SSH" ;;
 			"$REALITY_PORT") what="VPN" ;;
+			"$SUB_PORT") what="подписка" ;;
 			"$WEB_PORT") what="панель" ;;
 			443) what="подписка и панель" ;;
 			80) what="продление сертификата" ;;
@@ -716,7 +727,11 @@ sub_fetch() {  # sub_fetch SUBID → строки подписки (ссылки
 	if [ "$MODE" = domain ]; then
 		raw=$(curl -s $K --max-time 15 --resolve "$DOMAIN:443:$LISTEN_IP" "https://$DOMAIN$SUB_PATH$1") || return 1
 	else
-		raw=$(curl -s --max-time 15 "http://127.0.0.1:$SUB_PORT$SUB_PATH$1") || return 1
+		if [ "${SUB_TLS:-0}" = 1 ]; then
+			raw=$(curl -sk --max-time 15 "https://127.0.0.1:$SUB_PORT$SUB_PATH$1") || return 1
+		else
+			raw=$(curl -s --max-time 15 "http://127.0.0.1:$SUB_PORT$SUB_PATH$1") || return 1
+		fi
 	fi
 	base64 -d <<<"$raw" 2>/dev/null || printf '%s\n' "$raw"
 }
@@ -727,7 +742,7 @@ local_checks() {
 	for s in x-ui $([ "$MODE" = domain ] && echo nginx) $([ -f "$F2B_JAIL" ] && echo fail2ban); do
 		if systemctl is-active -q "$s"; then ok "служба $s работает"; else bad "служба $s не работает (journalctl -u $s)"; fi
 	done
-	for p in $([ "$MODE" = domain ] && echo "$LISTEN_IP:443 127.0.0.1:8443") ":$WEB_PORT" "127.0.0.1:$SUB_PORT" ":$REALITY_PORT"; do
+	for p in $([ "$MODE" = domain ] && echo "$LISTEN_IP:443 127.0.0.1:8443") ":$WEB_PORT" "$([ "${SUB_TLS:-0}" = 1 ] && echo ":$SUB_PORT" || echo "127.0.0.1:$SUB_PORT")" ":$REALITY_PORT"; do
 		if wait_port "$p" 15; then ok "слушает $p"; else bad "никто не слушает $p"; fi
 	done
 	if [ "$(exit_mode_now)" = chain ]; then
@@ -779,8 +794,20 @@ local_checks() {
 		else
 			bad "проба :$REALITY_PORT с SNI $REALITY_SNI не получила настоящий сертификат сайта"
 		fi
+		if [ "${SUB_TLS:-0}" = 1 ]; then
+			if openssl x509 -checkend 172800 -noout -in "$IPCERT_DIR/fullchain.pem" >/dev/null 2>&1; then
+				ok "сертификат Let's Encrypt на IP действует до $(openssl x509 -enddate -noout -in "$IPCERT_DIR/fullchain.pem" | cut -d= -f2) (продлевается сам)"
+			else
+				bad "сертификат на IP истёк или истекает меньше чем через 2 дня — продление не идёт (порт 80 открыт? /root/.acme.sh/acme.sh --cron --home /root/.acme.sh)"
+			fi
+		fi
 	fi
 	sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;" 2>/dev/null || true)
+	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" = 1 ] && [ -n "$sid" ]; then
+		# Как приложение: по адресу IP, с проверкой сертификата.
+		code=$(curl -s $IPK -o /dev/null -w '%{http_code}' --max-time 15 --connect-to "$PUBLIC_IP:$SUB_PORT:$LISTEN_IP:$SUB_PORT" "https://$PUBLIC_IP:$SUB_PORT$SUB_PATH$sid" || true)
+		if [ "$code" = 200 ]; then ok "подписка открывается по https://$PUBLIC_IP:$SUB_PORT/… с проверкой сертификата"; else bad "подписка по https://$PUBLIC_IP:$SUB_PORT/… отвечает $code"; fi
+	fi
 	link=$( { [ -n "$sid" ] && sub_fetch "$sid"; } | grep -m1 '^vless://' || true)
 	if [ -n "$link" ]; then
 		ok "подписка отдаёт ссылку"
@@ -871,6 +898,8 @@ SHORT_IDS='${SHORT_IDS:-}'
 REALITY_SNI='${REALITY_SNI:-}'
 S_EXIT='$EXIT_MODE'
 S_PANEL_PUBLIC='${PANEL_PUBLIC:-0}'
+S_IP_CERT='${IP_CERT:-0}'
+S_IP_CERT_IP='${IP_CERT_IP:-}'
 S_REALITY_PORT='$REALITY_PORT'
 CHAIN_IP='${CHAIN_IP:-}'
 CHAIN_PORT='${CHAIN_PORT:-}'
@@ -1499,6 +1528,96 @@ apply_exit() {  # apply_exit РЕЖИМ ФАЙЛ_WARP|- — записать ш�
 	wait_port ":$WEB_PORT" 40
 }
 
+IPCERT_DIR=/etc/x-ui/ip-cert   # без домена: сертификат Let's Encrypt на IP (подписка и панель)
+# 3x-ui перечитывает сертификаты панели и подписки по HUP (перезапускает их, Xray — нет). НЕ systemctl reload x-ui:
+# там USR1 — перезапуск Xray (обрыв VPN у клиентов), а сертификат панели остаётся старым. PID 0 (x-ui не запущен)
+# не трогаем: kill -HUP 0 разослал бы сигнал всей группе процессов, и acme.sh тоже.
+XUI_RELOAD_CERT='p=$(systemctl show -p MainPID --value x-ui); [ "${p:-0}" -gt 0 ] && kill -HUP "$p"; true'
+
+ensure_acme() {  # acme.sh закреплённой версии (sha256) в /root/.acme.sh
+	ACME=/root/.acme.sh/acme.sh
+	[ -x "$ACME" ] && return 0
+	local tmp
+	tmp=$(mktemp -d)
+	if curl -fsSL --retry 3 -o "$tmp/acme.sh" "https://raw.githubusercontent.com/acmesh-official/acme.sh/$ACME_TAG/acme.sh" &&
+		echo "$ACME_SHA256  $tmp/acme.sh" | sha256sum -c --quiet - >/dev/null 2>&1 &&
+		(cd "$tmp" && sh ./acme.sh --install --home /root/.acme.sh --nocron --noprofile >/dev/null 2>&1); then
+		rm -rf "$tmp"
+		return 0
+	fi
+	rm -rf "$tmp"
+	return 1
+}
+
+acme_cron() {  # строка cron acme.sh: acme_cron 1 — раз в сутки, acme_cron 2 — дважды (короткие сертификаты на IP)
+	local m=$((RANDOM % 60)) h=$((RANDOM % 12)) when
+	if [ "${1:-1}" = 2 ]; then when="$m $h,$((h + 12))"; else when="$m $((RANDOM % 24))"; fi
+	{ crontab -l 2>/dev/null || true; } | { grep -vF 'acme.sh --cron' || true; } > /root/.crontab.new
+	echo "$when * * * \"/root/.acme.sh\"/acme.sh --cron --home \"/root/.acme.sh\" > /dev/null" >> /root/.crontab.new
+	crontab /root/.crontab.new
+	rm -f /root/.crontab.new
+}
+
+issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCERT_DIR; ошибка → IPCERT_ERR
+	IPCERT_ERR=
+	local rc=0 ca=letsencrypt log=$WORK/acme-ip.log opened80=0 have
+	[ "$ACME_STAGING" = 1 ] && ca=letsencrypt_test
+	"${APT[@]}" install socat >/dev/null 2>&1 || { IPCERT_ERR="не установился socat (им acme.sh отвечает Let's Encrypt на :80)"; return 1; }
+	ensure_acme || { IPCERT_ERR="не скачался или не установился acme.sh $ACME_TAG"; return 1; }
+	"$ACME" --register-account --server "$ca" >/dev/null 2>&1 || true
+	# Сервер сменил IP — сертификат прежнего адреса снять, иначе acme.sh так и будет пытаться его продлевать.
+	if [ -n "$IP_CERT_IP" ] && [ "$IP_CERT_IP" != "$PUBLIC_IP" ]; then
+		"$ACME" --remove -d "$IP_CERT_IP" --ecc >/dev/null 2>&1 || true
+		rm -rf "/root/.acme.sh/${IP_CERT_IP}_ecc"
+	fi
+	# Сертификат тестового центра, а нужен настоящий (или наоборот) — выпустить заново.
+	have=/root/.acme.sh/${PUBLIC_IP}_ecc/$PUBLIC_IP.cer
+	if [ -s "$have" ]; then
+		if openssl x509 -noout -issuer -in "$have" 2>/dev/null | grep -qi staging; then
+			[ "$ACME_STAGING" = 1 ] || rm -rf "/root/.acme.sh/${PUBLIC_IP}_ecc"
+		else
+			[ "$ACME_STAGING" != 1 ] || rm -rf "/root/.acme.sh/${PUBLIC_IP}_ecc"
+		fi
+	fi
+	[ -z "$(port_users 80)" ] || { IPCERT_ERR="порт 80 занят ($(port_users 80)) — Let's Encrypt не сможет проверить сервер"; return 1; }
+	if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active' && ! ufw status | grep -qE '^80/tcp +ALLOW'; then
+		ufw allow 80/tcp >/dev/null 2>&1 && opened80=1
+	fi
+	# Let's Encrypt проверяет сервер по http://IP/ — на время проверки acme.sh сам слушает :80 (socat).
+	# Сертификат на IP бывает только коротким (профиль shortlived, ~160 ч): продление через 2–3 дня.
+	"$ACME" --issue -d "$PUBLIC_IP" --standalone --httpport 80 --server "$ca" --cert-profile shortlived --days 3 \
+		--keylength ec-256 > "$log" 2>&1 || rc=$?
+	case $rc in
+		0) ok "Let's Encrypt выдал сертификат на IP $PUBLIC_IP$([ "$ACME_STAGING" = 1 ] && echo " (тестовый центр — браузеры и приложения ему не верят)")" ;;
+		2) ok "сертификат на IP $PUBLIC_IP уже есть, продлевать рано" ;;
+		*)
+			IPCERT_ERR=$(grep -vE '^\s*$' "$log" | tail -3 | sed -E 's/^\[[^]]*\] //' | tr '\n' ' ' | cut -c1-320)
+			[ "$opened80" = 0 ] || ufw delete allow 80/tcp >/dev/null 2>&1 || true
+			return 1
+			;;
+	esac
+	install -d -m 700 "$IPCERT_DIR"
+	# После продления 3x-ui перечитывает сертификат по HUP: перезапускаются панель и подписка, Xray — нет.
+	if ! "$ACME" --install-cert -d "$PUBLIC_IP" --ecc --key-file "$IPCERT_DIR/privkey.pem" --fullchain-file "$IPCERT_DIR/fullchain.pem" \
+		--reloadcmd "$XUI_RELOAD_CERT" >/dev/null 2>&1; then
+		IPCERT_ERR="acme.sh --install-cert не прошёл"
+		return 1
+	fi
+	chmod 600 "$IPCERT_DIR/privkey.pem"
+	acme_cron 2
+	IP_CERT_IP=$PUBLIC_IP
+	if [ "$ACME_STAGING" = 1 ]; then IPK=-k; else IPK=; fi
+	return 0
+}
+
+drop_ip_cert() {  # --no-ip-cert после сертификата на IP: снять его и его продление
+	local ip=${IP_CERT_IP:-$PUBLIC_IP}
+	if [ -x /root/.acme.sh/acme.sh ]; then /root/.acme.sh/acme.sh --remove -d "$ip" --ecc >/dev/null 2>&1 || true; fi
+	rm -rf "/root/.acme.sh/${ip}_ecc" "$IPCERT_DIR"
+	IP_CERT_IP=
+	ok "сертификат на IP снят (--no-ip-cert): подписка только внутри сервера, панель — с самоподписанным"
+}
+
 PANEL_CERT_DIR=/etc/x-ui/panel-cert   # без домена: самоподписанный сертификат панели на IP сервера
 
 xui_get() { sqlite3 -readonly "$DB" "select value from settings where key='$1';" 2>/dev/null || true; }
@@ -1527,6 +1646,12 @@ derive_vars() {  # для --check и --warp: то, что установка в�
 	if [ -n "$(xui_get webCertFile)" ]; then SCHEME=https; else SCHEME=http; fi
 	PANEL_PUBLIC=0
 	if [ "$MODE" = nodomain ] && [ "$(xui_get webListen)" != 127.0.0.1 ]; then PANEL_PUBLIC=1; fi
+	SUB_TLS=0
+	IP_CERT_OK=0
+	IPK=
+	if [ "$MODE" = nodomain ] && [ -n "$(xui_get subCertFile)" ]; then SUB_TLS=1; fi
+	if [ "$SUB_TLS" = 1 ] || [ "$(xui_get webCertFile)" = "$IPCERT_DIR/fullchain.pem" ]; then IP_CERT_OK=1; fi
+	if openssl x509 -noout -issuer -in "$IPCERT_DIR/fullchain.pem" 2>/dev/null | grep -qi staging; then IPK=-k; fi
 }
 
 verdict() {
@@ -1712,6 +1837,16 @@ elif [ -n "$PANEL_LOCAL_ARG" ]; then
 else
 	PANEL_PUBLIC=${S_PANEL_PUBLIC:-1}
 fi
+# Без домена: сертификат Let's Encrypt на IP (короткий, ~6 дней, продлевается сам) — подписка по https://IP:2096/…
+# и панель без предупреждения браузера. --no-ip-cert — как раньше: подписка только внутри, панель с самоподписанным.
+if [ "$MODE" = domain ]; then
+	IP_CERT=0
+elif [ -n "$IP_CERT_ARG" ]; then
+	IP_CERT=$IP_CERT_ARG
+else
+	IP_CERT=${S_IP_CERT:-1}
+fi
+IP_CERT_IP=${S_IP_CERT_IP:-}
 [ -n "$WEB_PORT" ] || die "не нашёлся свободный порт для панели"
 save_state
 
@@ -1976,15 +2111,7 @@ PY
 		fi
 		warn "сертификат самоподписанный (--test-selfsigned): так только для проверки скрипта"
 	else
-		ACME=/root/.acme.sh/acme.sh
-		if [ ! -x "$ACME" ]; then
-			TMP=$(mktemp -d)
-			curl -fsSL --retry 3 -o "$TMP/acme.sh" "https://raw.githubusercontent.com/acmesh-official/acme.sh/$ACME_TAG/acme.sh" ||
-				die "не скачался acme.sh"
-			echo "$ACME_SHA256  $TMP/acme.sh" | sha256sum -c --quiet - >/dev/null 2>&1 || die "acme.sh не совпал по sha256"
-			(cd "$TMP" && sh ./acme.sh --install --home /root/.acme.sh --nocron --noprofile >/dev/null 2>&1) || die "acme.sh не установился"
-			rm -rf "$TMP"
-		fi
+		ensure_acme || die "не скачался, не совпал по sha256 или не установился acme.sh $ACME_TAG"
 		CA=letsencrypt
 		[ "$ACME_STAGING" = 1 ] && CA=letsencrypt_test
 		"$ACME" --set-default-ca --server "$CA" >/dev/null 2>&1 || true
@@ -2001,13 +2128,9 @@ PY
 		esac
 		rm -f /root/.acme-issue.log
 		"$ACME" --install-cert -d "$DOMAIN" --ecc --key-file "$CERT_DIR/privkey.pem" --fullchain-file "$CERT_DIR/fullchain.pem" \
-			--reloadcmd "systemctl reload nginx ; x-ui restart" >/dev/null 2>&1 || die "acme.sh --install-cert не прошёл"
+			--reloadcmd "systemctl reload nginx ; $XUI_RELOAD_CERT" >/dev/null 2>&1 || die "acme.sh --install-cert не прошёл"
 		"$ACME" --upgrade --auto-upgrade >/dev/null 2>&1 || true
-		CRON_LINE="$((RANDOM % 60)) $((RANDOM % 24)) * * * \"/root/.acme.sh\"/acme.sh --cron --home \"/root/.acme.sh\" > /dev/null"
-		{ crontab -l 2>/dev/null || true; } | { grep -vF 'acme.sh --cron' || true; } > /root/.crontab.new
-		echo "$CRON_LINE" >> /root/.crontab.new
-		crontab /root/.crontab.new
-		rm -f /root/.crontab.new
+		acme_cron 1
 		ok "автопродление: acme.sh по cron, проверка через nginx :80"
 	fi
 	chmod 600 "$CERT_DIR/privkey.pem"
@@ -2062,6 +2185,21 @@ EOF
 	ok "nginx: $LISTEN_IP:443 (демультиплексор по SNI) и 127.0.0.1:8443 (сайт, панель, подписка — target для Reality)"
 fi
 
+if [ "$MODE" = nodomain ]; then
+	if [ "$IP_CERT" = 1 ]; then
+		say "Сертификат Let's Encrypt на IP $PUBLIC_IP: подписка и панель по https"
+		if issue_ip_cert; then
+			IP_CERT_OK=1
+			ok "сертификат на IP действует до $(openssl x509 -enddate -noout -in "$IPCERT_DIR/fullchain.pem" | cut -d= -f2), продлевается сам (проверка дважды в сутки)"
+		else
+			warn "сертификат на IP не получен — подписка останется внутри сервера, в QR будут прямые ссылки. Ответ: ${IPCERT_ERR:-?}"
+			warn "чаще всего порт 80 закрыт фаерволом хостера: откройте TCP 80 в панели хостера и запустите скрипт ещё раз"
+		fi
+	elif [ -d "$IPCERT_DIR" ] || [ -n "$IP_CERT_IP" ]; then
+		drop_ip_cert
+	fi
+fi
+
 say "3x-ui: подписка, шаблон Xray, подключение VLESS + XHTTP + Reality"
 systemctl stop x-ui 2>/dev/null || true
 # Повторный запуск с другим --port: перенести уже созданное подключение (ключи и клиенты те же).
@@ -2098,14 +2236,28 @@ if [ "$MODE" = domain ]; then
 	SCHEME=https
 	SHARE_ADDR=$DOMAIN
 else
-	# Без домена подписка — только на 127.0.0.1 без TLS (скрипт читает её сам, чтобы выдать готовые ссылки).
-	# Панель — по IP с самоподписанным сертификатом (по умолчанию) или только на 127.0.0.1 (--panel-local).
-	xui_set "${COMMON_SETTINGS[@]}" "subCertFile=" "subKeyFile=" "subURI=" "subClashEnable=false" "subClashURI=" "subJsonURI="
+	# Без домена подписка: с сертификатом Let's Encrypt на IP — открыта по https://IP:2096/…; без него — только на
+	# 127.0.0.1 без TLS (скрипт читает её сам, чтобы выдать прямые ссылки). Панель — по IP (сертификат на IP или
+	# самоподписанный) либо только на 127.0.0.1 (--panel-local).
+	if [ "$IP_CERT_OK" = 1 ]; then
+		xui_set "${COMMON_SETTINGS[@]}" "subListen=" "subCertFile=$IPCERT_DIR/fullchain.pem" "subKeyFile=$IPCERT_DIR/privkey.pem" \
+			"subURI=https://$PUBLIC_IP:$SUB_PORT$SUB_PATH" "subClashEnable=false" "subClashURI=" "subJsonURI="
+		SUB_TLS=1
+		ok "подписка открыта по https://$PUBLIC_IP:$SUB_PORT/… (секретный путь, сертификат Let's Encrypt)"
+	else
+		xui_set "${COMMON_SETTINGS[@]}" "subCertFile=" "subKeyFile=" "subURI=" "subClashEnable=false" "subClashURI=" "subJsonURI="
+		SUB_TLS=0
+	fi
 	if [ "$PANEL_PUBLIC" = 1 ]; then
-		make_panel_cert
-		xui_set "webListen=" "webCertFile=$PANEL_CERT_DIR/fullchain.pem" "webKeyFile=$PANEL_CERT_DIR/privkey.pem"
+		make_panel_cert   # самоподписанный держим всегда: запасной, если сертификата на IP не станет (восстановление из бэкапа)
+		if [ "$IP_CERT_OK" = 1 ]; then
+			xui_set "webListen=" "webCertFile=$IPCERT_DIR/fullchain.pem" "webKeyFile=$IPCERT_DIR/privkey.pem"
+			ok "панель открыта по IP: https://$PUBLIC_IP:$WEB_PORT/… (секретный путь, сертификат Let's Encrypt)"
+		else
+			xui_set "webListen=" "webCertFile=$PANEL_CERT_DIR/fullchain.pem" "webKeyFile=$PANEL_CERT_DIR/privkey.pem"
+			ok "панель открыта по IP: https://$PUBLIC_IP:$WEB_PORT/… (секретный путь, сертификат самоподписанный)"
+		fi
 		SCHEME=https
-		ok "панель открыта по IP: https://$PUBLIC_IP:$WEB_PORT/… (секретный путь, сертификат самоподписанный)"
 	else
 		xui_set "webListen=127.0.0.1" "webCertFile=" "webKeyFile="
 		SCHEME=http
@@ -2365,6 +2517,7 @@ if [ "$DO_UFW" = 1 ]; then
 		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
 		if [ "$MODE" = domain ]; then echo 80/tcp; echo 443/tcp; fi
 		if [ "$PANEL_PUBLIC" = 1 ]; then echo "$WEB_PORT/tcp"; fi
+		if [ "${SUB_TLS:-0}" = 1 ]; then echo 80/tcp; echo "$SUB_PORT/tcp"; fi   # :80 — продление сертификата на IP
 		echo "$REALITY_PORT/tcp"
 		for pp in $OTHER_VPN_PORTS; do echo "$pp"; done
 	} | sort -u -t/ -k1,1n)
@@ -2374,6 +2527,10 @@ if [ "$DO_UFW" = 1 ]; then
 		ok "старый порт подключения $MOVED_FROM закрыт в ufw"
 	fi
 	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
+	# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
+	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
+		for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || ufw delete allow "$p" >/dev/null 2>&1 || true; done
+	fi
 	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
 	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
 	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился (ufw status)"; fi
@@ -2504,10 +2661,14 @@ if domain:
 else:
     print("Сервер без домена, ссылки клиентов ведут на IP %s" % ip)
     if (st.get("webListen") or "") not in ("127.0.0.1", "localhost"):
-        print("Панель:   https://%s:%s%s (сертификат самоподписанный)" % (ip, st.get("webPort"), st.get("webBasePath", "/")))
+        kind = "Let's Encrypt на IP" if "/ip-cert/" in (st.get("webCertFile") or "") else "самоподписанный"
+        print("Панель:   https://%s:%s%s (сертификат %s)" % (ip, st.get("webPort"), st.get("webBasePath", "/"), kind))
     else:
         print("Панель:   через SSH-туннель — ssh -N -L %s:127.0.0.1:%s root@%s, потом http://127.0.0.1:%s%s" % (
             st.get("webPort"), st.get("webPort"), ip, st.get("webPort"), st.get("webBasePath", "/")))
+    if st.get("subCertFile"):
+        print("Подписка: https://%s:%s%s<subId> (сертификат Let's Encrypt на IP; в архив не входит — после переезда\n"
+              "          его выпустит повторный запуск install-vpn.sh)" % (ip, st.get("subPort"), st.get("subPath", "/sub/")))
 print()
 for iid, remark, port, listen, proto, enable, ss in db.execute(
         "select id, remark, port, listen, protocol, enable, stream_settings from inbounds order by id"):
@@ -2931,6 +3092,10 @@ EOF
 		if [ "$(setting webListen)" != 127.0.0.1 ]; then
 			echo "Панель: https://$PUBLIC_IP:$(setting webPort)$(setting webBasePath) (сертификат самоподписанный, логин и пароль — прежние)"
 		fi
+		if [ "${IPCERT_FALLBACK:-0}" = 1 ]; then
+			echo "Подписку по IP (https://$PUBLIC_IP:$(setting subPort)/…) вернёт повторный запуск: bash /usr/local/lib/vpn-backup/install-vpn.sh"
+			echo "(выпустит сертификат Let's Encrypt на этот IP; до тех пор выше — прямые ссылки)"
+		fi
 		cat <<EOF
 Ключи те же, меняется только адрес. Старый сервер ($SRC_PUBLIC_IP) не удалять, пока все не перейдут.
 EOF
@@ -3076,6 +3241,27 @@ if [ -z "$DOMAIN" ] && [ -d "$F/etc/x-ui/panel-cert" ]; then
 			bad "не перевыпустился сертификат панели на новый IP"
 		fi
 	fi
+fi
+
+# Без домена с сертификатом Let's Encrypt на IP (install-vpn.sh): его в архиве нет — он на ~6 дней и привязан к адресу.
+# Панель — на самоподписанный, подписка — внутрь сервера; подписку по IP вернёт повторный запуск install-vpn.sh.
+IPCERT_FALLBACK=0
+if [ -z "$DOMAIN" ] && { [ "$(setting subCertFile)" = /etc/x-ui/ip-cert/fullchain.pem ] || [ "$(setting webCertFile)" = /etc/x-ui/ip-cert/fullchain.pem ]; }; then
+	if [ ! -s /etc/x-ui/panel-cert/fullchain.pem ]; then
+		install -d -m 700 /etc/x-ui/panel-cert
+		san="IP:$PUBLIC_IP"
+		[ "$LISTEN_IP" = "$PUBLIC_IP" ] || san="$san,IP:$LISTEN_IP"
+		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj "/CN=$PUBLIC_IP" \
+			-addext "subjectAltName=$san" -keyout /etc/x-ui/panel-cert/privkey.pem -out /etc/x-ui/panel-cert/fullchain.pem >/dev/null 2>&1 ||
+			bad "не создался самоподписанный сертификат панели"
+		chmod 600 /etc/x-ui/panel-cert/privkey.pem 2>/dev/null || true
+	fi
+	sqlite3 "$DB" "update settings set value='/etc/x-ui/panel-cert/fullchain.pem' where key='webCertFile' and value like '/etc/x-ui/ip-cert/%';
+		update settings set value='/etc/x-ui/panel-cert/privkey.pem' where key='webKeyFile' and value like '/etc/x-ui/ip-cert/%';
+		update settings set value='127.0.0.1' where key='subListen';
+		update settings set value='' where key in ('subCertFile', 'subKeyFile', 'subURI');"
+	IPCERT_FALLBACK=1
+	warn "сертификата Let's Encrypt на IP в архиве нет (он на ~6 дней): панель — на самоподписанном, подписка — внутри сервера"
 fi
 
 if [ -n "$DOMAIN" ]; then
@@ -3366,10 +3552,12 @@ scp root@IP_СЕРВЕРА:/root/backups/latest.tgz ./vpn-backup.tgz
   остальное обрывает.
 - Без домена — Reality на порту 2083 (как у основного сервера; другой — `--port`) под крупный чужой сайт
   (какой — видно в панели, поле SNI подключения):
-  тот, кто прощупывает сервер, получает настоящий сайт. Панель открыта по IP:
-  `https://IP:ПОРТ/путь/` с самоподписанным сертификатом (браузер предупредит — «Дополнительно» →
-  «Перейти»), адрес, логин и пароль — в `/root/vpn-info.txt`. Спрятать её за SSH-туннель — повторный
-  запуск установщика с `--panel-local` (вернуть — `--panel-public`).
+  тот, кто прощупывает сервер, получает настоящий сайт. Сертификат Let's Encrypt на IP (короткий, ~6 дней,
+  продлевается сам через порт 80): подписка — `https://IP:2096/путь/…`, панель — `https://IP:ПОРТ/путь/`
+  без предупреждения браузера; адреса, логин и пароль — в `/root/vpn-info.txt`. Сертификат не получен
+  (порт 80 закрыт у хостера) — подписка только внутри сервера, в QR прямые ссылки, панель с самоподписанным:
+  откройте TCP 80 и запустите установщик ещё раз. После переезда из бэкапа сертификат на новый IP выпускает
+  повторный запуск установщика. Спрятать панель за SSH-туннель — запуск с `--panel-local` (вернуть — `--panel-public`).
 - В подключении стоят uTLS `chrome` и xmux (меньше TLS-рукопожатий — меньше заморозок у провайдеров);
   если их поменять, клиентам надо обновить подписку или ссылки.
 VPN_KIT_EOF_2
@@ -3433,14 +3621,23 @@ chmod 700 /root/vpn-qr
 	else
 		echo "VPN на сервере $PUBLIC_IP без домена (Reality под $REALITY_SNI), установлен $(date '+%F %R')"
 		echo
-		echo "Ссылки — по одной на устройство. В приложении: «+» → «Импорт из буфера обмена» (или отсканировать QR):"
-		sub_list | while IFS='|' read -r c s; do
-			l=$(sub_fetch "$s" | grep -m1 '^vless://' || true)
-			[ -n "$l" ] || continue
-			echo "  $c:"
-			echo "    $l"
-			printf '%s|%s\n' "$c" "$l" >> "$WORK/qr"
-		done
+		if [ "${SUB_TLS:-0}" = 1 ]; then
+			echo "Подписки — по одной на устройство. В приложении: «+» → добавить подписку по ссылке (или отсканировать QR):"
+			sub_list | while IFS='|' read -r c s; do
+				echo "  $c: https://$PUBLIC_IP:$SUB_PORT$SUB_PATH$s"
+				printf '%s|%s\n' "$c" "https://$PUBLIC_IP:$SUB_PORT$SUB_PATH$s" >> "$WORK/qr"
+			done
+			echo "Подписка сама обновляет настройки в приложениях. Сертификат — Let's Encrypt на IP: ~6 дней, продлевается сам."
+		else
+			echo "Ссылки — по одной на устройство. В приложении: «+» → «Импорт из буфера обмена» (или отсканировать QR):"
+			sub_list | while IFS='|' read -r c s; do
+				l=$(sub_fetch "$s" | grep -m1 '^vless://' || true)
+				[ -n "$l" ] || continue
+				echo "  $c:"
+				echo "    $l"
+				printf '%s|%s\n' "$c" "$l" >> "$WORK/qr"
+			done
+		fi
 		echo
 		echo "Ссылки привязаны к IP $PUBLIC_IP. Переедете на другой сервер (restore.sh из бэкапа) —"
 		echo "restore.sh напечатает новые ссылки, их надо заново добавить в приложения."
@@ -3449,8 +3646,12 @@ chmod 700 /root/vpn-qr
 			echo "Панель управления: https://$PUBLIC_IP:$WEB_PORT$WEB_PATH"
 			echo "  логин:  $PANEL_USER"
 			echo "  пароль: $PANEL_PASS"
-			echo "  Сертификат самоподписанный: браузер предупредит — «Дополнительно» → «Перейти на сайт»."
-			echo "  Отпечаток сертификата SHA-256 (сверить в браузере): $(panel_fingerprint)"
+			if [ "$IP_CERT_OK" = 1 ]; then
+				echo "  Сертификат Let's Encrypt на IP — браузер откроет без предупреждений."
+			else
+				echo "  Сертификат самоподписанный: браузер предупредит — «Дополнительно» → «Перейти на сайт»."
+				echo "  Отпечаток сертификата SHA-256 (сверить в браузере): $(panel_fingerprint)"
+			fi
 		else
 			echo "Панель управления — только через SSH-туннель, снаружи её не видно:"
 			echo "  1) на своём компьютере в терминале (окно не закрывать):"
@@ -3500,7 +3701,7 @@ if [ "$MODE" = domain ]; then
 	printf '  Адрес:  \033[1mhttps://%s%s\033[0m\n' "$DOMAIN" "$WEB_PATH"
 elif [ "$PANEL_PUBLIC" = 1 ]; then
 	printf '  Адрес:  \033[1mhttps://%s:%s%s\033[0m\n' "$PUBLIC_IP" "$WEB_PORT" "$WEB_PATH"
-	echo "  Браузер предупредит о самоподписанном сертификате — «Дополнительно» → «Перейти на сайт»."
+	if [ "$IP_CERT_OK" != 1 ]; then echo "  Браузер предупредит о самоподписанном сертификате — «Дополнительно» → «Перейти на сайт»."; fi
 else
 	echo "  Снаружи панель не видна (так её не найдут сканеры) — открывать через SSH-туннель:"
 	echo "  1) на своём компьютере в терминале, окно не закрывать:"
