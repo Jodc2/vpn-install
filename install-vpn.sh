@@ -733,7 +733,7 @@ local_checks() {
 	if [ "$(exit_mode_now)" = chain ]; then
 		ok "выход клиентов: $(exit_label chain); сейчас активно — $(active_label "$(chain_active)")"
 		if [ -f /etc/systemd/system/vpn-exit-watchdog.service ]; then
-			if systemctl is-active -q vpn-exit-watchdog; then ok "вотчдог следит за старым сервером (упадёт — WARP, вернётся — назад)"; else bad "вотчдог не работает (journalctl -u vpn-exit-watchdog)"; fi
+			if systemctl is-active -q vpn-exit-watchdog; then ok "вотчдог следит за старым сервером (упадёт — российские сайты через WARP, остальное напрямую; вернётся — назад)"; else bad "вотчдог не работает (journalctl -u vpn-exit-watchdog)"; fi
 		fi
 	else
 		ok "выход клиентов: $(exit_label "$(exit_mode_now)") (переключить: vpn-warp off|on|ru)"
@@ -830,7 +830,7 @@ elif mode == "warp-ru" and warp:
     rules += [{"type": "field", "outboundTag": "warp", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
               {"type": "field", "outboundTag": "warp", "ip": ["geoip:ru"]}]
 elif mode == "chain" and chain:
-    # Цепочка через чужой сервер первым выходом, WARP — запасным (вотчдог переключает между chain и warp).
+    # Цепочка через чужой сервер первым выходом; WARP — для российских сайтов в запасном режиме (вотчдог переключает).
     outbounds = [chain] + ([warp] if warp else []) + [direct, blocked]
     main, dns_out = "chain", "chain"
 else:
@@ -930,7 +930,7 @@ exit_label() {
 	esac
 }
 
-chain_active() {  # какой выход активен ПРЯМО сейчас в режиме цепочки: chain (старый сервер) или warp (аварийный)
+chain_active() {  # активный выход цепочки: chain (старый сервер) | direct (запасной: РФ через WARP) | warp (запасной прежней версии)
 	python3 - "$DB" <<'PY'
 import json, sqlite3, sys
 row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
@@ -942,24 +942,51 @@ PY
 
 active_label() {  # понятное имя активного пути цепочки
 	case $1 in
-		warp) echo "аварийный WARP" ;;
+		direct) echo "запасной режим — российские сайты через WARP, остальное напрямую" ;;
+		warp) echo "аварийный WARP (весь трафик)" ;;
 		chain) echo "старый сервер ${CHAIN_IP:-?}" ;;
 		*) echo "$1" ;;
 	esac
 }
 
-chain_activate() {  # chain_activate chain|warp — активный выход цепочки (x-ui остановлен; как переключение вотчдога)
-	python3 - "$DB" "$1" <<'PY'
-import json, sqlite3, sys
-db = sqlite3.connect(sys.argv[1])
-tag = sys.argv[2]
+chain_activate() {  # chain_activate chain|fallback — как переключение вотчдога (x-ui остановлен)
+	python3 - "$DB" "$1" chain <<'PY'
+import json
+import sqlite3
+import sys
+
+path, mode, chain = sys.argv[1:4]
+RU_TAG = "ru-via-warp"
+db = sqlite3.connect(path)
 t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
-obs = t["outbounds"]
-t["outbounds"] = [o for o in obs if o.get("tag") == tag] + [o for o in obs if o.get("tag") != tag]
-for r in t["routing"]["rules"]:
-    if r.get("network") == "tcp,udp" or "dns-internal" in (r.get("inboundTag") or []):
-        r["outboundTag"] = tag
+
+
+def is_ru(r):
+    return r.get("ruleTag") == RU_TAG or (r.get("outboundTag") == "warp" and (
+        "geosite:category-ru" in (r.get("domain") or []) or "geoip:ru" in (r.get("ip") or [])))
+
+
+def is_main(r):
+    return r.get("network") == "tcp,udp" or "dns-internal" in (r.get("inboundTag") or [])
+
+
+rules = [r for r in t["routing"]["rules"] if not is_ru(r)]
+main = chain if mode == "chain" else "direct"
+for r in rules:
+    if is_main(r):
+        r["outboundTag"] = main
         r.pop("balancerTag", None)
+if mode == "fallback":
+    at = next((i for i, r in enumerate(rules) if is_main(r)), len(rules))
+    rules[at:at] = [
+        {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp",
+         "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
+        {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp", "ip": ["geoip:ru"]},
+    ]
+t["routing"]["rules"] = rules
+# Основной выход первым, остальные в постоянном порядке — переключение туда-обратно даёт тот же шаблон.
+rank = {chain: 0, "warp": 1, "direct": 2, "blocked": 3}
+t["outbounds"] = sorted(t["outbounds"], key=lambda o: (o.get("tag") != main, rank.get(o.get("tag"), 9)))
 db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(t, ensure_ascii=False),))
 db.commit()
 PY
@@ -1182,44 +1209,78 @@ echo "EXIT_RESULT=OK"
 VPN_EXIT_SETUP
 }
 
-install_watchdog() {  # вотчдог: держит выход на цепочке, при недоступности старого сервера — WARP, вернулся — назад
+install_watchdog() {  # вотчдог: выход на цепочке; старый сервер недоступен — РФ через WARP, остальное напрямую; вернулся — назад
 	cat > /usr/local/bin/vpn-exit-watchdog.sh <<'VPN_WD'
 #!/bin/bash
-# Выход цепочкой через EXIT_IP:EXIT_PORT. При FAIL_LIMIT недоступностях подряд — на WARP; при OK_LIMIT доступностях — назад.
+# Выход цепочкой через EXIT_IP:EXIT_PORT. Сервер-выход недоступен FAIL_LIMIT проверок подряд — запасной режим:
+# российские сайты (.ru/.su/.рф, geosite:category-ru, geoip:ru) через WARP, остальное и DNS напрямую.
+# Доступен OK_LIMIT проверок подряд — обратно на цепочку.
 set -u
 DB=/etc/x-ui/x-ui.db
 EXIT_IP=${EXIT_IP:?}
 EXIT_PORT=${EXIT_PORT:?}
+CHAIN=chain
 FAIL_LIMIT=${FAIL_LIMIT:-4}; OK_LIMIT=${OK_LIMIT:-3}; INTERVAL=${INTERVAL:-30}
 fails=0; oks=0
-state() { python3 - <<PY
-import sqlite3,json
-t=json.loads(sqlite3.connect("$DB").execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
-cat=[r for r in t["routing"]["rules"] if r.get("network")=="tcp,udp"]
-print(cat[0].get("outboundTag","?") if cat else "?")
+state() {  # chain | direct (запасной) | warp (запасной прежней версии)
+python3 - "$DB" <<'PY'
+import json, sqlite3, sys
+t = json.loads(sqlite3.connect(sys.argv[1]).execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+cat = [r for r in t["routing"]["rules"] if r.get("network") == "tcp,udp"]
+print(cat[0].get("outboundTag", "?") if cat else "?")
 PY
 }
-switch() { python3 - "$1" <<PY
-import sqlite3,json,sys
-tag=sys.argv[1]; db=sqlite3.connect("$DB")
-t=json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
-obs=t["outbounds"]
-t["outbounds"]=[o for o in obs if o.get("tag")==tag]+[o for o in obs if o.get("tag")!=tag]
-for r in t["routing"]["rules"]:
-    if r.get("network")=="tcp,udp" or "dns-internal" in (r.get("inboundTag") or []):
-        r["outboundTag"]=tag; r.pop("balancerTag",None)
-db.execute("update settings set value=? where key='xrayTemplateConfig'",(json.dumps(t,ensure_ascii=False),)); db.commit()
+switch() {  # switch chain|fallback
+python3 - "$DB" "$1" "$CHAIN" <<'PY'
+import json
+import sqlite3
+import sys
+
+path, mode, chain = sys.argv[1:4]
+RU_TAG = "ru-via-warp"
+db = sqlite3.connect(path)
+t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+
+
+def is_ru(r):
+    return r.get("ruleTag") == RU_TAG or (r.get("outboundTag") == "warp" and (
+        "geosite:category-ru" in (r.get("domain") or []) or "geoip:ru" in (r.get("ip") or [])))
+
+
+def is_main(r):
+    return r.get("network") == "tcp,udp" or "dns-internal" in (r.get("inboundTag") or [])
+
+
+rules = [r for r in t["routing"]["rules"] if not is_ru(r)]
+main = chain if mode == "chain" else "direct"
+for r in rules:
+    if is_main(r):
+        r["outboundTag"] = main
+        r.pop("balancerTag", None)
+if mode == "fallback":
+    at = next((i for i, r in enumerate(rules) if is_main(r)), len(rules))
+    rules[at:at] = [
+        {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp",
+         "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
+        {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp", "ip": ["geoip:ru"]},
+    ]
+t["routing"]["rules"] = rules
+# Основной выход первым, остальные в постоянном порядке — переключение туда-обратно даёт тот же шаблон.
+rank = {chain: 0, "warp": 1, "direct": 2, "blocked": 3}
+t["outbounds"] = sorted(t["outbounds"], key=lambda o: (o.get("tag") != main, rank.get(o.get("tag"), 9)))
+db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(t, ensure_ascii=False),))
+db.commit()
 PY
 systemctl restart x-ui
 }
 probe() { timeout 3 bash -c "cat </dev/null >/dev/tcp/$EXIT_IP/$EXIT_PORT" 2>/dev/null; }
-logger -t vpn-watchdog "started exit=$EXIT_IP:$EXIT_PORT (fail=$FAIL_LIMIT ok=$OK_LIMIT interval=${INTERVAL}s)"
+logger -t vpn-watchdog "started exit=$EXIT_IP:$EXIT_PORT (fail=$FAIL_LIMIT ok=$OK_LIMIT interval=${INTERVAL}s; fallback: RU via WARP, rest direct)"
 while true; do
   st=$(state)
   if probe; then oks=$((oks+1)); fails=0; else fails=$((fails+1)); oks=0; fi
-  if [ "$st" = chain ] && [ "$fails" -ge "$FAIL_LIMIT" ]; then
-     logger -t vpn-watchdog "exit $EXIT_IP unreachable x$fails -> WARP"; switch warp; fails=0
-  elif [ "$st" = warp ] && [ "$oks" -ge "$OK_LIMIT" ]; then
+  if [ "$st" = "$CHAIN" ] && [ "$fails" -ge "$FAIL_LIMIT" ]; then
+     logger -t vpn-watchdog "exit $EXIT_IP unreachable x$fails -> fallback: RU via WARP, rest direct"; switch fallback; fails=0
+  elif { [ "$st" = direct ] || [ "$st" = warp ]; } && [ "$oks" -ge "$OK_LIMIT" ]; then
      logger -t vpn-watchdog "exit $EXIT_IP recovered x$oks -> chain"; switch chain; oks=0
   fi
   sleep "$INTERVAL"
@@ -1500,7 +1561,7 @@ if [ -n "$WARP_CMD" ]; then
 	. "$STATE"
 	NOW=$(exit_mode_now)
 	if [ "$NOW" = chain ]; then
-		echo "Выход цепочкой через ${CHAIN_IP:-?}, сейчас активно: $(active_label "$(chain_active)"). Переключением на WARP и обратно управляет вотчдог (journalctl -t vpn-watchdog)."
+		echo "Выход цепочкой через ${CHAIN_IP:-?}, сейчас активно: $(active_label "$(chain_active)"). В запасной режим (российские сайты через WARP, остальное напрямую) и обратно переключает вотчдог (journalctl -t vpn-watchdog)."
 		[ "$TARGET_EXIT" = status ] || echo "Чтобы сменить выход насовсем — переустанови: bash install-vpn.sh --exit direct (или warp)."
 		exit 0
 	fi
@@ -2125,18 +2186,18 @@ fi
 api_close
 if [ "$EXIT_MODE" = chain ]; then
 	say "Выход цепочкой через другой сервер"
-	if [ "$HAVE_WARP" != 1 ]; then bad "без WARP цепочке нет аварийного выхода — оставляю прямой выход"; EXIT_MODE=direct
+	if [ "$HAVE_WARP" != 1 ]; then bad "без WARP у цепочки нет запасного режима — оставляю прямой выход"; EXIT_MODE=direct
 	elif setup_chain_exit; then
 		install_watchdog
 		systemctl stop x-ui
 		xui_set "xrayTemplateConfig=$(template_json chain "$WORK/warp.json" "$CHAIN_SAVED")"
 		if timeout 6 bash -c "cat </dev/null >/dev/tcp/$CHAIN_IP/$CHAIN_PORT" 2>/dev/null; then
-			ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — вотчдог уведёт на WARP и вернёт назад"
+			ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — вотчдог включит запасной режим (российские сайты через WARP, остальное напрямую) и вернёт назад"
 		else
 			# Вход на старом настроен, но порт с нового закрыт — почти всегда облачный фаервол хостера.
 			CHAIN_BLOCKED=1
-			chain_activate warp
-			warn "порт $CHAIN_PORT старого сервера $CHAIN_IP с нового не открывается — его закрывает фаервол хостера. Откройте входящий TCP $CHAIN_PORT для $PUBLIC_IP в панели хостера (AWS — Security Group, Oracle — Security List или NSG). Пока трафик идёт через WARP; как порт откроется, вотчдог сам переключит на старый сервер"
+			chain_activate fallback
+			warn "порт $CHAIN_PORT старого сервера $CHAIN_IP с нового не открывается — его закрывает фаервол хостера. Откройте входящий TCP $CHAIN_PORT для $PUBLIC_IP в панели хостера (AWS — Security Group, Oracle — Security List или NSG). Пока — запасной режим (российские сайты через WARP, остальное напрямую); как порт откроется, вотчдог сам переключит на старый сервер"
 		fi
 	else
 		bad "цепочку настроить не удалось — оставляю выход напрямую. Причина: ${CHAIN_ERR:-?}"
@@ -2160,9 +2221,9 @@ case $EXIT_MODE in
 	warp-ru) ok "выход: российские сайты — через WARP, остальное — напрямую с $PUBLIC_IP (выключить: vpn-warp off)" ;;
 	chain)
 		if [ "${CHAIN_BLOCKED:-0}" = 1 ]; then
-			warn "выход клиентов — цепочкой через $CHAIN_IP, но пока порт $CHAIN_PORT закрыт фаерволом хостера — через WARP (вотчдог переключит сам)"
+			warn "выход клиентов — цепочкой через $CHAIN_IP, но пока порт $CHAIN_PORT закрыт фаерволом хостера — запасной режим (российские сайты через WARP, остальное напрямую), вотчдог переключит сам"
 		else
-			ok "выход клиентов — цепочкой через $CHAIN_IP (аварийный — WARP, управляет вотчдог vpn-exit-watchdog)"
+			ok "выход клиентов — цепочкой через $CHAIN_IP (упадёт — российские сайты через WARP, остальное напрямую; управляет вотчдог vpn-exit-watchdog)"
 		fi ;;
 esac
 
@@ -3243,17 +3304,21 @@ vpn-check
 ## Выход через другой сервер (chain)
 
 При установке можно выбрать пункт «через другой мой сервер» (или `--exit chain --exit-host IP_СТАРОГО`).
-Вход на старый — по паролю или по SSH-ключу: ключ можно вставить целиком (OpenSSH, PEM, PKCS#8,
-PuTTY .ppk) или указать файл (`--exit-ssh-key`, парольная фраза — `EXIT_KEY_PASS`). Пользователь — root
-или, как на AWS/Oracle, `ubuntu` с sudo (`--exit-ssh-user ubuntu`; пароль sudo — `EXIT_SUDO_PASS` или спросит).
-На облаках откройте порт цепочки (TCP 2087) для IP нового сервера в панели хостера (AWS — Security Group,
-Oracle — Security List); пока он закрыт, трафик идёт через WARP, потом вотчдог переключит сам. Тогда новый сервер сам зайдёт на старый по SSH,
-поднимет там лёгкий вход Xray и пустит весь трафик новый → старый → интернет — сайты будут видеть IP
-старого сервера. Заодно регистрируется WARP и ставится вотчдог: упадёт старый — трафик уходит на WARP
-и возвращается, когда старый поднимется (`vpn-check` / `vpn-warp` показывают, что активно сейчас).
-Если на старом ещё работает 3x-ui — цепочке это не мешает; захочешь, скрипт предложит его выключить
-(или сразу `--exit-stop-xui`). Переехал новый сервер на другой IP — на старом открой ему порт:
-`ufw allow from НОВЫЙ_IP to any port 2087 proto tcp`.
+Новый сервер сам зайдёт на старый по SSH, поднимет там лёгкий вход Xray и пустит весь трафик
+новый → старый → интернет — сайты будут видеть IP старого сервера.
+
+- Вход на старый — по паролю или по SSH-ключу: ключ можно вставить целиком (OpenSSH, PEM, PKCS#8,
+  PuTTY .ppk) или указать файл (`--exit-ssh-key`, парольная фраза — `EXIT_KEY_PASS`). Пользователь — root
+  или, как на AWS/Oracle, `ubuntu` с sudo (`--exit-ssh-user ubuntu`; пароль sudo — `EXIT_SUDO_PASS` или спросит).
+- Старый сервер упал — примерно через 2 минуты вотчдог включает запасной режим: российские сайты (зоны
+  .ru/.su/.рф, список российских сервисов `geosite:category-ru`, российские IP `geoip:ru`) — через Cloudflare
+  WARP, остальное — напрямую с IP нового сервера. Старый поднялся — примерно через 1,5 минуты всё снова
+  через него. Что активно сейчас — `vpn-check` или `vpn-warp`.
+- На облаках откройте порт цепочки (TCP 2087) для IP нового сервера в панели хостера (AWS — Security Group,
+  Oracle — Security List). Пока он закрыт — запасной режим, потом вотчдог переключит сам.
+- Если на старом ещё работает 3x-ui — цепочке это не мешает; захочешь, скрипт предложит его выключить
+  (или сразу `--exit-stop-xui`). Переехал новый сервер на другой IP — на старом открой ему порт:
+  `ufw allow from НОВЫЙ_IP to any port 2087 proto tcp`.
 
 ## Выход через WARP
 
@@ -3403,9 +3468,9 @@ chmod 700 /root/vpn-qr
 	echo "Если VPN перестал работать — проверка одной командой (службы, туннель, доступность из России):"
 	if [ -x /usr/local/bin/vpn-check ]; then echo "  vpn-check"; else echo "  bash install-vpn.sh --check"; fi
 	if [ "$EXIT_MODE" = chain ]; then
-		echo "Выход клиентов: цепочкой через $CHAIN_IP (его IP видят сайты). Если он упадёт — вотчдог уводит на WARP и возвращает."
+		echo "Выход клиентов: цепочкой через $CHAIN_IP (его IP видят сайты). Если он упадёт — вотчдог включит запасной режим (российские сайты через WARP, остальное напрямую) и вернёт обратно."
 		if [ "${CHAIN_BLOCKED:-0}" = 1 ]; then
-			echo "  ⚠ Сейчас — через WARP: порт $CHAIN_PORT старого сервера закрыт фаерволом хостера. Откройте входящий TCP $CHAIN_PORT"
+			echo "  ⚠ Сейчас — запасной режим (РФ через WARP, остальное напрямую): порт $CHAIN_PORT закрыт фаерволом хостера. Откройте входящий TCP $CHAIN_PORT"
 			echo "    для $PUBLIC_IP (AWS — Security Group, Oracle — Security List/NSG) — вотчдог сам переключит на старый сервер."
 		fi
 		echo "  Переехал новый сервер на другой IP — на старом открой порт новому (ufw allow from НОВЫЙ_IP to any port $CHAIN_PORT"
