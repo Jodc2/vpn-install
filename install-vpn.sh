@@ -45,6 +45,7 @@
 #   --exit-ssh-port N порт SSH старого сервера (по умолчанию 22); пароль root — в EXIT_PASS или спросит
 #   --exit-ssh-key Ф  вместо пароля — SSH-ключ к старому серверу
 #   --exit-port N     порт цепочки на старом сервере (по умолчанию 2087)
+#   --exit-stop-xui   выключить 3x-ui на старом сервере (если он теперь только выход); --exit-keep-xui — оставить
 # Повторный запуск безопасен: ключи, пароли, клиенты и выбранный выход сохраняются (/etc/vpn-install.env).
 set -euo pipefail
 umask 022
@@ -87,6 +88,7 @@ EXIT_HOST=
 EXIT_SSH_PORT=22
 EXIT_SSH_KEY=
 EXIT_PORT_ARG=
+EXIT_STOP_XUI=
 TEST_SELFSIGNED=0   # только для проверки самого скрипта: самоподписанный сертификат вместо Let's Encrypt
 ACME_STAGING=0      # только для проверки: тестовый сервер Let's Encrypt
 while [ $# -gt 0 ]; do
@@ -102,6 +104,8 @@ while [ $# -gt 0 ]; do
 		--exit-ssh-port) EXIT_SSH_PORT=${2:-22}; shift 2 ;;
 		--exit-ssh-key) EXIT_SSH_KEY=${2:-}; shift 2 ;;
 		--exit-port) EXIT_PORT_ARG=${2:-}; shift 2 ;;
+		--exit-stop-xui) EXIT_STOP_XUI=1; shift ;;
+		--exit-keep-xui) EXIT_STOP_XUI=0; shift ;;
 		--ssh-key-only) SSH_KEY_ONLY=1; shift ;;
 		--no-fail2ban) DO_F2B=0; shift ;;
 		--no-ufw) DO_UFW=0; shift ;;
@@ -885,6 +889,16 @@ case $(uname -m) in
 esac
 for t in 1 2 3 4 5 6; do apt-get -y -q -o DPkg::Lock::Timeout=600 update >/dev/null 2>&1 && break; [ "$t" = 6 ] && { echo "EXIT_RESULT=FAIL apt update"; exit 1; }; sleep 15; done
 apt-get -y -q install curl ca-certificates python3 openssl iproute2 tar >/dev/null 2>&1 || { echo "EXIT_RESULT=FAIL пакеты"; exit 1; }
+# Старый сервер мог быть прежним VPN на 3x-ui. Цепочке он не мешает (отдельный процесс, другой порт),
+# но по желанию (STOP_XUI=1) выключаем — если старый теперь только выход.
+XUISTAT=absent
+if [ -f /etc/systemd/system/x-ui.service ] || [ -x /usr/local/x-ui/x-ui ]; then
+	if systemctl is-active -q x-ui 2>/dev/null; then XUISTAT=running; else XUISTAT=stopped; fi
+fi
+if [ "${STOP_XUI:-0}" = 1 ] && [ "$XUISTAT" != absent ]; then
+	systemctl disable --now x-ui >/dev/null 2>&1 || true
+	XUISTAT=stopped
+fi
 DIR=/usr/local/vpn-exit; install -d -m 755 "$DIR"
 if [ -s /root/.vpn-exit-bin/xray ]; then
 	install -m 755 /root/.vpn-exit-bin/xray "$DIR/xray"
@@ -944,10 +958,15 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
+systemctl stop vpn-exit 2>/dev/null || true   # свой прежний экземпляр — чтобы проверка порта не спутала его с чужим
+if ss -Htln "sport = :$EXIT_PORT" 2>/dev/null | grep -q .; then
+	who=$(ss -Htlnp "sport = :$EXIT_PORT" 2>/dev/null | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | tr '\n' ' ')
+	echo "EXIT_RESULT=FAIL порт $EXIT_PORT на старом сервере занят (${who:-другой процесс}) — укажи другой --exit-port или выключи 3x-ui (--exit-stop-xui)"; exit 1
+fi
 systemctl enable vpn-exit >/dev/null 2>&1 || true
 systemctl restart vpn-exit
-ok=0; for _ in $(seq 1 20); do ss -Htln "sport = :$EXIT_PORT" 2>/dev/null | grep -q . && { ok=1; break; }; sleep 1; done
-[ "$ok" = 1 ] || { echo "EXIT_RESULT=FAIL Xray не слушает порт $EXIT_PORT (journalctl -u vpn-exit)"; exit 1; }
+ok=0; for _ in $(seq 1 20); do systemctl is-active -q vpn-exit 2>/dev/null && ss -Htln "sport = :$EXIT_PORT" 2>/dev/null | grep -q . && { ok=1; break; }; sleep 1; done
+[ "$ok" = 1 ] || { echo "EXIT_RESULT=FAIL vpn-exit не слушает порт $EXIT_PORT (journalctl -u vpn-exit)"; exit 1; }
 # Фаервол: если ufw активен — пустить новый сервер на порт цепочки (ssh не трогаем). Неактивный ufw не включаем, чтобы не запереть.
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
 	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
@@ -956,6 +975,7 @@ else
 	echo "EXIT_UFW=open"
 fi
 echo "EXIT_SNI=$SNI"
+echo "EXIT_XUI=$XUISTAT"
 echo "EXIT_RESULT=OK"
 VPN_EXIT_SETUP
 }
@@ -1058,10 +1078,25 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 		scp_exit /usr/local/x-ui/bin/geoip.dat /root/.vpn-exit-bin/geoip.dat >/dev/null 2>&1 || true
 		scp_exit /usr/local/x-ui/bin/geosite.dat /root/.vpn-exit-bin/geosite.dat >/dev/null 2>&1 || true
 	fi
+	# На старом сервере может работать 3x-ui (прежний VPN). Цепочке он не мешает, но можно выключить.
+	if [ -z "$EXIT_STOP_XUI" ]; then
+		local rxui
+		rxui=$(ssh_exit 'command -v systemctl >/dev/null 2>&1 && systemctl is-active x-ui 2>/dev/null || echo none' 2>/dev/null | tr -d '\r')
+		if [ "$rxui" = active ]; then
+			if { : > /dev/tty; } 2>/dev/null; then
+				printf 'На старом сервере работает панель 3x-ui. Выключить её (старый теперь только выход)? [y/N]: ' > /dev/tty
+				read -r a < /dev/tty || a=
+				case $a in y | Y | yes | да | Да) EXIT_STOP_XUI=1 ;; *) EXIT_STOP_XUI=0 ;; esac
+			else
+				EXIT_STOP_XUI=0
+				warn "на старом сервере работает 3x-ui — оставляю (цепочке не мешает). Выключить: переустанови с --exit-stop-xui"
+			fi
+		fi
+	fi
 	emit_exit_setup
 	scp_exit "$WORK/exit-setup.sh" /root/.vpn-exit-setup.sh || { CHAIN_ERR="не удалось передать скрипт на старый сервер"; return 1; }
 	local out
-	out=$(ssh_exit "CHAIN_PRIV='$CHAIN_PRIV' CHAIN_UUID='$CHAIN_UUID' CHAIN_SID='$CHAIN_SID' ENTRY_IP='$PUBLIC_IP' EXIT_PORT='$CHAIN_PORT' EXIT_SNI_HINT='${REALITY_SNI:-}' XUI_VER='$XUI_VERSION' XUI_SHA_AMD64='$XUI_SHA256_AMD64' XUI_SHA_ARM64='$XUI_SHA256_ARM64' bash /root/.vpn-exit-setup.sh" 2>&1) || true
+	out=$(ssh_exit "CHAIN_PRIV='$CHAIN_PRIV' CHAIN_UUID='$CHAIN_UUID' CHAIN_SID='$CHAIN_SID' ENTRY_IP='$PUBLIC_IP' EXIT_PORT='$CHAIN_PORT' EXIT_SNI_HINT='${REALITY_SNI:-}' STOP_XUI='${EXIT_STOP_XUI:-0}' XUI_VER='$XUI_VERSION' XUI_SHA_AMD64='$XUI_SHA256_AMD64' XUI_SHA_ARM64='$XUI_SHA256_ARM64' bash /root/.vpn-exit-setup.sh" 2>&1) || true
 	ssh_exit 'rm -f /root/.vpn-exit-setup.sh' >/dev/null 2>&1 || true
 	if ! grep -q '^EXIT_RESULT=OK' <<<"$out"; then
 		CHAIN_ERR=$(grep -m1 '^EXIT_RESULT=FAIL' <<<"$out" | sed 's/^EXIT_RESULT=FAIL //'); CHAIN_ERR=${CHAIN_ERR:-"настройка старого сервера не прошла"}
@@ -1070,6 +1105,10 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 	CHAIN_SNI=$(sed -n 's/^EXIT_SNI=//p' <<<"$out" | tail -1)
 	[ -n "$CHAIN_SNI" ] || { CHAIN_ERR="старый сервер не выбрал сайт для маскировки"; return 1; }
 	grep -q '^EXIT_UFW=open' <<<"$out" && warn "на старом сервере ufw выключен — порт $CHAIN_PORT открыт всем; включи там ufw и оставь доступ только новому серверу"
+	case $(sed -n 's/^EXIT_XUI=//p' <<<"$out" | tail -1) in
+		running) ok "на старом сервере 3x-ui продолжает работать — цепочке не мешает (выключить: переустанови с --exit-stop-xui)" ;;
+		stopped) [ "${EXIT_STOP_XUI:-0}" = 1 ] && ok "3x-ui на старом сервере выключен (теперь он только выход)" ;;
+	esac
 	ok "старый сервер $CHAIN_IP настроен: вход цепочки на :$CHAIN_PORT (маскировка под $CHAIN_SNI)"
 	build_chain_outbound "$WORK/chain.json"; save_chain "$WORK/chain.json"
 	return 0
@@ -2862,7 +2901,9 @@ vpn-check
 поднимет там лёгкий вход Xray и пустит весь трафик новый → старый → интернет — сайты будут видеть IP
 старого сервера. Заодно регистрируется WARP и ставится вотчдог: упадёт старый — трафик уходит на WARP
 и возвращается, когда старый поднимется (`vpn-check` / `vpn-warp` показывают, что активно сейчас).
-Переехал новый сервер на другой IP — на старом открой ему порт: `ufw allow from НОВЫЙ_IP to any port 2087 proto tcp`.
+Если на старом ещё работает 3x-ui — цепочке это не мешает; захочешь, скрипт предложит его выключить
+(или сразу `--exit-stop-xui`). Переехал новый сервер на другой IP — на старом открой ему порт:
+`ufw allow from НОВЫЙ_IP to any port 2087 proto tcp`.
 
 ## Выход через WARP
 
