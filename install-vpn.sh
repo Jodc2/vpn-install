@@ -9,7 +9,7 @@
 #   • Без домена: VLESS + XHTTP + Reality на порту 443 под крупный чужой сайт (скрипт сам проверит
 #     и выберет подходящий). Ссылки привязаны к IP сервера, панель — https://IP:порт/секретный-путь/.
 # В обоих: 3x-ui 3.3.1 + Xray 26.6.1 (sha256 закреплены), BBR, IPv6 выключен, swap, фаервол ufw,
-# fail2ban против подбора пароля SSH, ежедневный бэкап для переезда в /root/backups.
+# fail2ban против подбора пароля SSH, бэкап для переезда — вручную (vpn-backup.sh), сам не запускается.
 # До установки скрипт проверяет через check-host.net, не заблокирован ли IP сервера в России,
 # после установки — открыты ли порты VPN из России и Европы.
 #
@@ -37,14 +37,16 @@
 #   --ssh-key-only    выключить вход по паролю (только если у root уже есть SSH-ключ)
 #   --no-fail2ban     не ставить fail2ban
 #   --no-ufw          не трогать фаервол
-#   --tz ЗОНА         часовой пояс для cron (по умолчанию Europe/Moscow)
+#   --tz ЗОНА         часовой пояс сервера (по умолчанию Europe/Moscow)
 #   --skip-dns-check  не сверять A-запись домена с IP сервера
 #   --skip-ip-check   не проверять до установки, доступен ли IP из России
 #   --check           только проверить: службы, туннель, доступность портов из России и Европы
 #   --warp off|on|ru  быстро переключить выход без переустановки (то же — команда vpn-warp):
 #                     off — напрямую, on — всё через WARP, ru — российские сайты через WARP
 #   --exit-host IP    (с --exit chain) IP старого сервера, через который выходить; его настроит скрипт по SSH
-#   --exit-ssh-port N порт SSH старого сервера (по умолчанию 22); пароль root — в EXIT_PASS или спросит
+#   --exit-ssh-port N порт SSH старого сервера (по умолчанию 22); пароль — в EXIT_PASS или спросит
+#   --exit-ssh-user И пользователь на старом сервере (по умолчанию root; AWS и Oracle — ubuntu). Не root —
+#                     настройка через sudo; пароль sudo, если нужен, — EXIT_SUDO_PASS или спросит
 #   --exit-ssh-key Ф  вместо пароля — файл SSH-ключа к старому серверу (OpenSSH, PEM, PKCS#8 или
 #                     PuTTY .ppk; парольная фраза — в EXIT_KEY_PASS). На вопросе ключ можно вставить целиком
 #   --exit-port N     порт цепочки на старом сервере (по умолчанию 2087)
@@ -89,7 +91,8 @@ SKIP_IP_CHECK=0
 CHECK_ONLY=0
 WARP_CMD=
 EXIT_HOST=
-EXIT_SSH_PORT=22
+EXIT_SSH_PORT=
+EXIT_SSH_USER=
 EXIT_SSH_KEY=
 EXIT_KEY_TEXT=
 EXIT_PORT_ARG=
@@ -108,6 +111,7 @@ while [ $# -gt 0 ]; do
 		--exit) EXIT_MODE=${2:-}; shift 2 ;;
 		--exit-host) EXIT_HOST=${2:-}; shift 2 ;;
 		--exit-ssh-port) EXIT_SSH_PORT=${2:-22}; shift 2 ;;
+		--exit-ssh-user) EXIT_SSH_USER=${2:-}; shift 2 ;;
 		--exit-ssh-key) EXIT_SSH_KEY=${2:-}; shift 2 ;;
 		--exit-port) EXIT_PORT_ARG=${2:-}; shift 2 ;;
 		--exit-stop-xui) EXIT_STOP_XUI=1; shift ;;
@@ -159,6 +163,10 @@ CHAIN_PUB=$(state_val CHAIN_PUB || true)
 CHAIN_PRIV=$(state_val CHAIN_PRIV || true)
 CHAIN_SID=$(state_val CHAIN_SID || true)
 CHAIN_SNI=$(state_val CHAIN_SNI || true)
+CHAIN_SSH_USER=$(state_val CHAIN_SSH_USER || true)
+CHAIN_SSH_PORT=$(state_val CHAIN_SSH_PORT || true)
+EXIT_SSH_USER=${EXIT_SSH_USER:-${CHAIN_SSH_USER:-root}}   # не задан — как в прошлый раз
+EXIT_SSH_PORT=${EXIT_SSH_PORT:-${CHAIN_SSH_PORT:-22}}
 if [ "$CHECK_ONLY" = 1 ] || [ -n "$WARP_CMD" ]; then
 	[ -n "$S_MODE" ] || die "VPN этим скриптом здесь ещё не ставился (нет $STATE) — сначала bash $0"
 	MODE=$S_MODE
@@ -271,12 +279,12 @@ read_key_rest() {  # $1 — первая строка вставленного �
 }
 ask_exit_auth() {  # доступ к старому серверу: пароль root или SSH-ключ (вставить целиком / путь к файлу)
 	local ans first clean
-	printf 'Вход на старый сервер: 1) по паролю root, 2) по SSH-ключу [1]: ' > /dev/tty
+	printf 'Вход на старый сервер под %s: 1) по паролю, 2) по SSH-ключу [1]: ' "$EXIT_SSH_USER" > /dev/tty
 	read -r ans < /dev/tty || ans=
 	if [ "$ans" = 2 ]; then
 		printf 'Вставьте приватный ключ целиком (от -----BEGIN до -----END, на экране не отобразится)\nили путь к файлу ключа на этом сервере: ' > /dev/tty
 	else
-		printf 'root-пароль старого сервера (не отобразится; можно вставить и SSH-ключ целиком): ' > /dev/tty
+		printf 'Пароль %s на старом сервере (не отобразится; можно вставить и SSH-ключ целиком): ' "$EXIT_SSH_USER" > /dev/tty
 	fi
 	IFS= read -rs first < /dev/tty || first=
 	echo > /dev/tty
@@ -312,7 +320,8 @@ EOF
 	done
 	if [ "$EXIT_MODE" = chain ]; then
 		printf 'IP старого сервера-выхода: ' > /dev/tty; read -r EXIT_HOST < /dev/tty || true
-		printf 'SSH-порт старого сервера [22]: ' > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_PORT=$a
+		printf 'SSH-порт старого сервера [%s]: ' "$EXIT_SSH_PORT" > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_PORT=$a
+		printf 'Пользователь на старом сервере [%s] (AWS, Oracle — ubuntu): ' "$EXIT_SSH_USER" > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_USER=$a
 		if [ -z "$EXIT_SSH_KEY" ] && [ -z "${EXIT_PASS:-}" ]; then ask_exit_auth; fi
 	fi
 fi
@@ -320,6 +329,8 @@ EXIT_MODE=${EXIT_MODE:-${S_EXIT:-direct}}   # не указан — как в п
 case $EXIT_MODE in direct | warp | warp-ru | chain) ;; *) die "--exit: direct, warp, warp-ru или chain" ;; esac
 if [ "$EXIT_MODE" = chain ]; then
 	[ -n "$EXIT_HOST" ] && EXIT_HOST=$(norm_host "$EXIT_HOST")
+	[[ $EXIT_SSH_USER =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || die "--exit-ssh-user: имя пользователя вида ubuntu (сейчас: «$EXIT_SSH_USER»)"
+	[[ $EXIT_SSH_PORT =~ ^[0-9]+$ ]] && [ "$EXIT_SSH_PORT" -ge 1 ] && [ "$EXIT_SSH_PORT" -le 65535 ] || die "--exit-ssh-port: число от 1 до 65535"
 	# Первый раз (нет сохранённой цепочки) нужен IP старого сервера; повторный запуск берёт из state.
 	if [ -z "$EXIT_HOST" ] && [ -z "$CHAIN_IP" ]; then
 		die "для --exit chain укажите --exit-host IP старого сервера (и EXIT_PASS=… либо --exit-ssh-key)"
@@ -868,6 +879,8 @@ CHAIN_PUB='${CHAIN_PUB:-}'
 CHAIN_PRIV='${CHAIN_PRIV:-}'
 CHAIN_SID='${CHAIN_SID:-}'
 CHAIN_SNI='${CHAIN_SNI:-}'
+CHAIN_SSH_USER='${CHAIN_SSH_USER:-}'
+CHAIN_SSH_PORT='${CHAIN_SSH_PORT:-}'
 EOF
 	chmod 600 "$tmp"
 	mv "$tmp" "$STATE"
@@ -935,6 +948,23 @@ active_label() {  # понятное имя активного пути цепо
 	esac
 }
 
+chain_activate() {  # chain_activate chain|warp — активный выход цепочки (x-ui остановлен; как переключение вотчдога)
+	python3 - "$DB" "$1" <<'PY'
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+tag = sys.argv[2]
+t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+obs = t["outbounds"]
+t["outbounds"] = [o for o in obs if o.get("tag") == tag] + [o for o in obs if o.get("tag") != tag]
+for r in t["routing"]["rules"]:
+    if r.get("network") == "tcp,udp" or "dns-internal" in (r.get("inboundTag") or []):
+        r["outboundTag"] = tag
+        r.pop("balancerTag", None)
+db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(t, ensure_ascii=False),))
+db.commit()
+PY
+}
+
 CHAIN_SAVED=/etc/x-ui/chain/outbound.json   # копия outbound цепочки (для повторной сборки шаблона и бэкапа)
 save_chain() { install -d -m 700 /etc/x-ui/chain && install -m 600 "$1" "$CHAIN_SAVED"; }
 
@@ -962,17 +992,26 @@ exit_ssh_opts() {  # общие опции ssh/scp к старому серве�
 ssh_exit() {  # ssh на старый сервер (ключ EXIT_SSH_KEY, иначе пароль из EXIT_PASS); -n — не трогать терминал
 	exit_ssh_opts
 	if [ -n "$EXIT_SSH_KEY" ]; then
-		ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "root@$EXIT_HOST" "$@"
+		ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
 	else
-		SSHPASS="${EXIT_PASS:-}" sshpass -e ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "root@$EXIT_HOST" "$@"
+		SSHPASS="${EXIT_PASS:-}" sshpass -e ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
 	fi
 }
 scp_exit() {  # scp файла $1 на старый сервер в $2
 	exit_ssh_opts
 	if [ -n "$EXIT_SSH_KEY" ]; then
-		scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "root@$EXIT_HOST:$2"
+		scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "$EXIT_SSH_USER@$EXIT_HOST:$2"
 	else
-		SSHPASS="${EXIT_PASS:-}" sshpass -e scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "root@$EXIT_HOST:$2"
+		SSHPASS="${EXIT_PASS:-}" sshpass -e scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "$EXIT_SSH_USER@$EXIT_HOST:$2"
+	fi
+}
+
+ssh_exit_in() {  # как ssh_exit, но stdin уходит удалённой команде (пароль для sudo -S)
+	exit_ssh_opts
+	if [ -n "$EXIT_SSH_KEY" ]; then
+		ssh "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
+	else
+		SSHPASS="${EXIT_PASS:-}" sshpass -e ssh "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
 	fi
 }
 
@@ -1025,8 +1064,15 @@ emit_exit_setup() {  # пишет в $WORK/exit-setup.sh скрипт настр
 	cat > "$WORK/exit-setup.sh" <<'VPN_EXIT_SETUP'
 #!/bin/bash
 # Настройка сервера-выхода: Xray с одним входом VLESS-TCP+Reality, который дёргает новый сервер.
-# Секреты и параметры приходят через env: CHAIN_PRIV CHAIN_UUID CHAIN_SID ENTRY_IP EXIT_PORT XUI_VER XUI_SHA_AMD64 XUI_SHA_ARM64
+# Запускается от root (напрямую или через sudo). Параметры и секреты — в exit.env рядом со скриптом;
+# папка со скриптом (~/.vpn-exit-stage) удаляется в конце, в том числе при ошибке.
 set -eu
+STAGE=$(dirname "$(readlink -f "$0")")
+case $STAGE in */.vpn-exit-stage) trap 'rm -rf "$STAGE"' EXIT ;; esac
+[ -f "$STAGE/exit.env" ] || { echo "EXIT_RESULT=FAIL нет параметров (exit.env)"; exit 1; }
+# shellcheck source=/dev/null
+. "$STAGE/exit.env"
+[ "$(id -u)" = 0 ] || { echo "EXIT_RESULT=FAIL настройка старого сервера запущена не от root"; exit 1; }
 export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive
 command -v apt-get >/dev/null || { echo "EXIT_RESULT=FAIL нужен Ubuntu/Debian на старом сервере"; exit 1; }
 case $(uname -m) in
@@ -1047,10 +1093,9 @@ if [ "${STOP_XUI:-0}" = 1 ] && [ "$XUISTAT" != absent ]; then
 	XUISTAT=stopped
 fi
 DIR=/usr/local/vpn-exit; install -d -m 755 "$DIR"
-if [ -s /root/.vpn-exit-bin/xray ]; then
-	install -m 755 /root/.vpn-exit-bin/xray "$DIR/xray"
-	cp -a /root/.vpn-exit-bin/geoip.dat /root/.vpn-exit-bin/geosite.dat "$DIR/" 2>/dev/null || true
-	rm -rf /root/.vpn-exit-bin
+if [ -s "$STAGE/xray" ]; then
+	install -m 755 "$STAGE/xray" "$DIR/xray"
+	cp -a "$STAGE/geoip.dat" "$STAGE/geosite.dat" "$DIR/" 2>/dev/null || true
 else
 	TMP=$(mktemp -d); U=https://github.com/MHSanaei/3x-ui/releases/download/v$XUI_VER/x-ui-linux-$A.tar.gz
 	curl -fL --retry 3 -s -o "$TMP/x.tgz" "$U" || { echo "EXIT_RESULT=FAIL не скачался Xray"; exit 1; }
@@ -1118,6 +1163,16 @@ ok=0; for _ in $(seq 1 20); do systemctl is-active -q vpn-exit 2>/dev/null && ss
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
 	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
 	echo "EXIT_UFW=restricted"
+elif command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -qE -- '-j (REJECT|DROP)|^-P INPUT DROP'; then
+	# iptables без ufw, лишнее отклоняется (так у образов Oracle Cloud): пустить новый сервер и сохранить правило.
+	iptables -C INPUT -p tcp -s "$ENTRY_IP" --dport "$EXIT_PORT" -j ACCEPT 2>/dev/null ||
+		iptables -I INPUT 1 -p tcp -s "$ENTRY_IP" --dport "$EXIT_PORT" -j ACCEPT
+	if command -v netfilter-persistent >/dev/null; then
+		netfilter-persistent save >/dev/null 2>&1 || true
+	elif [ -d /etc/iptables ]; then
+		iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+	fi
+	echo "EXIT_UFW=iptables"
 else
 	echo "EXIT_UFW=open"
 fi
@@ -1204,15 +1259,48 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 		"${APT[@]}" install sshpass >/dev/null 2>&1 || { CHAIN_ERR="не установился sshpass (вход по паролю к старому серверу)"; return 1; }
 	fi
 	: > "$WORK/exit_known_hosts"
-	local sshe
-	if ! sshe=$(ssh_exit true 2>&1 >/dev/null); then
-		sshe=$(grep -v '^Warning: Permanently added' <<<"$sshe" | tail -1)
+	local sshe uhint
+	sshe=$(ssh_exit true 2>&1) && sshe=OK
+	# Облака с cloud-init (AWS, Oracle и др.) пускают root по ключу, но вместо входа отвечают
+	# «Please login as the user "ubuntu" rather than the user "root"» — войти под ним.
+	uhint=$(grep -oE 'Please login as the user "[a-z_][a-z0-9_.-]*"' <<<"$sshe" | head -1 | cut -d'"' -f2)
+	if [ "$sshe" != OK ] && [ "$EXIT_SSH_USER" = root ] && [ -n "$uhint" ]; then
+		ok "root на старом сервере хостер не пускает и просит входить под $uhint — вхожу под ним (настройка через sudo)"
+		EXIT_SSH_USER=$uhint
+		sshe=$(ssh_exit true 2>&1) && sshe=OK
+	fi
+	if [ "$sshe" != OK ]; then
+		sshe=$(grep -v -e '^Warning: Permanently added' -e '^$' <<<"$sshe" | tail -1)
 		if [ -n "$EXIT_SSH_KEY" ]; then
-			CHAIN_ERR="SSH к старому серверу $EXIT_HOST:$EXIT_SSH_PORT по ключу не прошёл (${sshe:-нет ответа}) — публичная часть ключа должна быть в /root/.ssh/authorized_keys старого сервера"
+			CHAIN_ERR="SSH к старому серверу $EXIT_SSH_USER@$EXIT_HOST:$EXIT_SSH_PORT по ключу не прошёл (${sshe:-нет ответа}) — публичная часть ключа должна быть в ~$EXIT_SSH_USER/.ssh/authorized_keys старого сервера"
 		else
-			CHAIN_ERR="SSH к старому серверу $EXIT_HOST:$EXIT_SSH_PORT по паролю не прошёл (${sshe:-нет ответа}) — проверь адрес, порт и пароль; если root там входит только по ключу — выбери вход по ключу"
+			CHAIN_ERR="SSH к старому серверу $EXIT_SSH_USER@$EXIT_HOST:$EXIT_SSH_PORT по паролю не прошёл (${sshe:-нет ответа}) — проверь адрес, порт и пароль; если там вход только по ключу — выбери вход по ключу"
 		fi
+		[ "$EXIT_SSH_USER" != root ] || CHAIN_ERR="$CHAIN_ERR; если root там запрещён — укажи пользователя (--exit-ssh-user ubuntu)"
 		return 1
+	fi
+	# Не root: всё, что требует root, — через sudo (AWS, Oracle: ubuntu с sudo без пароля). Проверяем до передачи секретов.
+	EXIT_SUDO=
+	if [ "$EXIT_SSH_USER" != root ]; then
+		if ssh_exit 'sudo -n true' >/dev/null 2>&1; then
+			EXIT_SUDO=nopass
+		else
+			local spw=${EXIT_SUDO_PASS:-${EXIT_PASS:-}} serr=""
+			if [ -z "$spw" ] && { : > /dev/tty; } 2>/dev/null; then
+				printf 'Пароль sudo для %s на старом сервере (не отобразится): ' "$EXIT_SSH_USER" > /dev/tty
+				IFS= read -rs spw < /dev/tty || true
+				echo > /dev/tty
+			fi
+			if [ -n "$spw" ] && serr=$(printf '%s\n' "$spw" | ssh_exit_in "sudo -S -p '' true" 2>&1); then
+				EXIT_SUDO=pass
+				EXIT_SUDO_PW=$spw
+			else
+				serr=$(grep -v -e '^Warning: Permanently added' -e '^$' <<<"$serr" | tail -1)
+				CHAIN_ERR="у $EXIT_SSH_USER на старом сервере нет sudo без пароля, а пароль sudo $([ -n "$spw" ] && echo "не подошёл${serr:+ ($serr)}" || echo "не задан (EXIT_SUDO_PASS)")"
+				return 1
+			fi
+		fi
+		ok "на старом сервере вхожу под $EXIT_SSH_USER, настройка — через sudo$([ "$EXIT_SUDO" = pass ] && echo " (с паролем)")"
 	fi
 	# Ключи цепочки генерируем на новом сервере (у него есть xray); приватный уйдёт в вход старого по SSH.
 	if [ -z "$CHAIN_PRIV" ]; then
@@ -1224,16 +1312,18 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 		CHAIN_UUID=$("$XRAY" uuid 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')
 		[ -n "$CHAIN_PRIV" ] && [ -n "$CHAIN_PUB" ] && [ -n "$CHAIN_UUID" ] || { CHAIN_ERR="не сгенерировались ключи цепочки"; return 1; }
 	fi
-	# Если архитектуры совпадают — отдать старому серверу тот же бинарник Xray и гео-файлы (без скачивания у него).
-	local rarch="" ra=""
-	rarch=$(ssh_exit 'uname -m' 2>/dev/null | tr -d '
-')
+	# Временная папка в домашней папке пользователя: туда скрипт, параметры и (при той же архитектуре) Xray.
+	local rhome stage rarch="" ra=""
+	rhome=$(ssh_exit 'printf %s "$HOME"' 2>/dev/null) || rhome=
+	[[ $rhome == /* ]] || { CHAIN_ERR="не удалось узнать домашнюю папку $EXIT_SSH_USER на старом сервере"; return 1; }
+	stage=$rhome/.vpn-exit-stage
+	ssh_exit "rm -rf '$stage' && install -d -m 700 '$stage'" >/dev/null 2>&1 || { CHAIN_ERR="не удалось создать $stage на старом сервере"; return 1; }
+	rarch=$(ssh_exit 'uname -m' 2>/dev/null | tr -d '\r\n')
 	case $rarch in x86_64 | amd64) ra=amd64 ;; aarch64 | arm64) ra=arm64 ;; esac
-	if [ "$ra" = "$ARCH" ] && [ -x "$XRAY" ]; then
-		ssh_exit 'install -d -m 700 /root/.vpn-exit-bin' >/dev/null 2>&1 || true
-		scp_exit "$XRAY" /root/.vpn-exit-bin/xray >/dev/null 2>&1 || true
-		scp_exit /usr/local/x-ui/bin/geoip.dat /root/.vpn-exit-bin/geoip.dat >/dev/null 2>&1 || true
-		scp_exit /usr/local/x-ui/bin/geosite.dat /root/.vpn-exit-bin/geosite.dat >/dev/null 2>&1 || true
+	if [ "$ra" = "$ARCH" ] && [ -x "$XRAY" ]; then   # та же архитектура — свой Xray и гео-файлы, без скачивания там
+		scp_exit "$XRAY" "$stage/xray" >/dev/null 2>&1 || true
+		scp_exit /usr/local/x-ui/bin/geoip.dat "$stage/geoip.dat" >/dev/null 2>&1 || true
+		scp_exit /usr/local/x-ui/bin/geosite.dat "$stage/geosite.dat" >/dev/null 2>&1 || true
 	fi
 	# На старом сервере может работать 3x-ui (прежний VPN). Цепочке он не мешает, но можно выключить.
 	if [ -z "$EXIT_STOP_XUI" ]; then
@@ -1251,21 +1341,43 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 		fi
 	fi
 	emit_exit_setup
-	scp_exit "$WORK/exit-setup.sh" /root/.vpn-exit-setup.sh || { CHAIN_ERR="не удалось передать скрипт на старый сервер"; return 1; }
-	local out
-	out=$(ssh_exit "CHAIN_PRIV='$CHAIN_PRIV' CHAIN_UUID='$CHAIN_UUID' CHAIN_SID='$CHAIN_SID' ENTRY_IP='$PUBLIC_IP' EXIT_PORT='$CHAIN_PORT' EXIT_SNI_HINT='${REALITY_SNI:-}' STOP_XUI='${EXIT_STOP_XUI:-0}' XUI_VER='$XUI_VERSION' XUI_SHA_AMD64='$XUI_SHA256_AMD64' XUI_SHA_ARM64='$XUI_SHA256_ARM64' bash /root/.vpn-exit-setup.sh" 2>&1) || true
-	ssh_exit 'rm -f /root/.vpn-exit-setup.sh' >/dev/null 2>&1 || true
+	# Параметры (и приватный ключ цепочки) — файлом рядом со скриптом: в командной строке sudo их видно в ps.
+	(umask 077 && {
+		printf 'CHAIN_PRIV=%q\nCHAIN_UUID=%q\nCHAIN_SID=%q\nENTRY_IP=%q\nEXIT_PORT=%q\nEXIT_SNI_HINT=%q\nSTOP_XUI=%q\n' \
+			"$CHAIN_PRIV" "$CHAIN_UUID" "$CHAIN_SID" "$PUBLIC_IP" "$CHAIN_PORT" "${REALITY_SNI:-}" "${EXIT_STOP_XUI:-0}"
+		printf 'XUI_VER=%q\nXUI_SHA_AMD64=%q\nXUI_SHA_ARM64=%q\n' "$XUI_VERSION" "$XUI_SHA256_AMD64" "$XUI_SHA256_ARM64"
+	} > "$WORK/exit.env")
+	if ! { scp_exit "$WORK/exit-setup.sh" "$stage/exit-setup.sh" && scp_exit "$WORK/exit.env" "$stage/exit.env"; } >/dev/null 2>&1; then
+		rm -f "$WORK/exit.env"
+		ssh_exit "rm -rf '$stage'" >/dev/null 2>&1 || true
+		CHAIN_ERR="не удалось передать файлы на старый сервер"
+		return 1
+	fi
+	rm -f "$WORK/exit.env"
+	local out run="bash '$stage/exit-setup.sh'"
+	case $EXIT_SUDO in
+		nopass) out=$(ssh_exit "sudo -n $run" 2>&1) || true ;;
+		pass) out=$(printf '%s\n' "$EXIT_SUDO_PW" | ssh_exit_in "sudo -S -p '' $run" 2>&1) || true ;;
+		*) out=$(ssh_exit "$run" 2>&1) || true ;;
+	esac
+	EXIT_SUDO_PW=
+	ssh_exit "rm -rf '$stage'" >/dev/null 2>&1 || true   # скрипт удаляет её сам; это — если он не дошёл до старта
 	if ! grep -q '^EXIT_RESULT=OK' <<<"$out"; then
 		CHAIN_ERR=$(grep -m1 '^EXIT_RESULT=FAIL' <<<"$out" | sed 's/^EXIT_RESULT=FAIL //'); CHAIN_ERR=${CHAIN_ERR:-"настройка старого сервера не прошла"}
 		return 1
 	fi
 	CHAIN_SNI=$(sed -n 's/^EXIT_SNI=//p' <<<"$out" | tail -1)
 	[ -n "$CHAIN_SNI" ] || { CHAIN_ERR="старый сервер не выбрал сайт для маскировки"; return 1; }
-	grep -q '^EXIT_UFW=open' <<<"$out" && warn "на старом сервере ufw выключен — порт $CHAIN_PORT открыт всем; включи там ufw и оставь доступ только новому серверу"
+	case $(sed -n 's/^EXIT_UFW=//p' <<<"$out" | tail -1) in
+		open) warn "на старом сервере ufw выключен — порт $CHAIN_PORT открыт всем; включи там ufw и оставь доступ только новому серверу" ;;
+		iptables) ok "на старом сервере фаервол iptables (как у Oracle): порт $CHAIN_PORT открыт новому серверу, правило сохранено" ;;
+	esac
 	case $(sed -n 's/^EXIT_XUI=//p' <<<"$out" | tail -1) in
 		running) ok "на старом сервере 3x-ui продолжает работать — цепочке не мешает (выключить: переустанови с --exit-stop-xui)" ;;
 		stopped) [ "${EXIT_STOP_XUI:-0}" = 1 ] && ok "3x-ui на старом сервере выключен (теперь он только выход)" ;;
 	esac
+	CHAIN_SSH_USER=$EXIT_SSH_USER
+	CHAIN_SSH_PORT=$EXIT_SSH_PORT
 	ok "старый сервер $CHAIN_IP настроен: вход цепочки на :$CHAIN_PORT (маскировка под $CHAIN_SNI)"
 	build_chain_outbound "$WORK/chain.json"; save_chain "$WORK/chain.json"
 	return 0
@@ -2018,10 +2130,17 @@ if [ "$EXIT_MODE" = chain ]; then
 		install_watchdog
 		systemctl stop x-ui
 		xui_set "xrayTemplateConfig=$(template_json chain "$WORK/warp.json" "$CHAIN_SAVED")"
-		ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — вотчдог уведёт на WARP и вернёт назад"
+		if timeout 6 bash -c "cat </dev/null >/dev/tcp/$CHAIN_IP/$CHAIN_PORT" 2>/dev/null; then
+			ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — вотчдог уведёт на WARP и вернёт назад"
+		else
+			# Вход на старом настроен, но порт с нового закрыт — почти всегда облачный фаервол хостера.
+			CHAIN_BLOCKED=1
+			chain_activate warp
+			warn "порт $CHAIN_PORT старого сервера $CHAIN_IP с нового не открывается — его закрывает фаервол хостера. Откройте входящий TCP $CHAIN_PORT для $PUBLIC_IP в панели хостера (AWS — Security Group, Oracle — Security List или NSG). Пока трафик идёт через WARP; как порт откроется, вотчдог сам переключит на старый сервер"
+		fi
 	else
 		bad "цепочку настроить не удалось — оставляю выход напрямую. Причина: ${CHAIN_ERR:-?}"
-		warn "проверь IP/порт/пароль старого сервера и повтори: bash install-vpn.sh --exit chain --exit-host $EXIT_HOST (EXIT_PASS=…)"
+		warn "проверь адрес, порт, пользователя и пароль/ключ старого сервера и повтори: bash install-vpn.sh --exit chain --exit-host $EXIT_HOST$([ "$EXIT_SSH_USER" = root ] || echo " --exit-ssh-user $EXIT_SSH_USER")"
 		EXIT_MODE=direct
 		systemctl stop x-ui
 		xui_set "xrayTemplateConfig=$(template_json direct -)"
@@ -2039,7 +2158,12 @@ case $EXIT_MODE in
 	direct) ok "выход клиентов в интернет — напрямую с IP сервера $PUBLIC_IP (включить WARP потом: vpn-warp on или vpn-warp ru)" ;;
 	warp) ok "выход клиентов — через Cloudflare WARP (IP сервера сайтам не виден; выключить: vpn-warp off)" ;;
 	warp-ru) ok "выход: российские сайты — через WARP, остальное — напрямую с $PUBLIC_IP (выключить: vpn-warp off)" ;;
-	chain) ok "выход клиентов — цепочкой через $CHAIN_IP (аварийный — WARP, управляет вотчдог vpn-exit-watchdog)" ;;
+	chain)
+		if [ "${CHAIN_BLOCKED:-0}" = 1 ]; then
+			warn "выход клиентов — цепочкой через $CHAIN_IP, но пока порт $CHAIN_PORT закрыт фаерволом хостера — через WARP (вотчдог переключит сам)"
+		else
+			ok "выход клиентов — цепочкой через $CHAIN_IP (аварийный — WARP, управляет вотчдог vpn-exit-watchdog)"
+		fi ;;
 esac
 
 OTHER_VPN=; OTHER_VPN_PORTS=
@@ -2102,7 +2226,7 @@ else
 fi
 # Не через timedatectl: в контейнере он сдвигает часы хоста.
 ln -sfn "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime && echo "$TZ_NAME" > /etc/timezone
-ok "часовой пояс $TZ_NAME (по нему cron запускает бэкап$([ "$MODE" = domain ] && echo " и продление сертификата"))"
+ok "часовой пояс $TZ_NAME$([ "$MODE" = domain ] && echo " (по нему cron продлевает сертификат)")"
 
 say "SSH"
 if ! command -v sshd >/dev/null; then
@@ -2196,7 +2320,7 @@ else
 	warn "фаервол не трогали (--no-ufw)"
 fi
 
-say "Ежедневный бэкап и команда проверки"
+say "Команды проверки и бэкап для переезда"
 install -d -m 755 /usr/local/lib/vpn-backup
 cat > /usr/local/bin/vpn-backup.sh <<'VPN_KIT_EOF_0'
 #!/bin/bash
@@ -2206,7 +2330,8 @@ cat > /usr/local/bin/vpn-backup.sh <<'VPN_KIT_EOF_0'
 # Из архива restore.sh поднимает такую же копию на чистом сервере (см. README.md в архиве).
 #
 # Архивы: /root/backups/vpn-backup-<домен>-<дата>.tgz, ссылка latest.tgz, хранится KEEP штук.
-# Запуск: vpn-backup.sh (ежедневно из /etc/cron.d/vpn-backup). Последняя строка вывода — путь к архиву.
+# Запуск: vpn-backup.sh (вручную; на основном сервере — ежедневно из /etc/cron.d/vpn-backup).
+# Последняя строка вывода — путь к архиву.
 set -euo pipefail
 umask 077
 
@@ -2969,7 +3094,7 @@ if [ -z "${TIMEZONE:-}" ] || [ ! -e "/usr/share/zoneinfo/$TIMEZONE" ]; then
 	warn "часовой пояс «${TIMEZONE:-}» не выставлен"
 # Не через timedatectl: в контейнере его первый вызов сдвигает часы ядра хоста на смещение пояса.
 elif ln -sfn "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime && echo "$TIMEZONE" > /etc/timezone; then
-	ok "часовой пояс $TIMEZONE (по нему cron запускает бэкап$([ -n "$DOMAIN" ] && echo " и продление сертификата"))"
+	ok "часовой пояс $TIMEZONE$([ -n "$DOMAIN" ] && echo " (по нему cron продлевает сертификат)")"
 else
 	warn "часовой пояс $TIMEZONE не выставлен"
 fi
@@ -3040,7 +3165,8 @@ install -m 644 "$HERE/README.md" /usr/local/lib/vpn-backup/README.md
 if [ -d "$F/usr/local/lib/vpn-backup" ]; then
 	find "$F/usr/local/lib/vpn-backup" -mindepth 1 -maxdepth 1 ! -name restore.sh ! -name README.md -exec cp -a {} /usr/local/lib/vpn-backup/ \;
 fi
-install -m 644 "$F/etc/cron.d/vpn-backup" /etc/cron.d/vpn-backup
+# Ежедневный автобэкап — только если он был на старом сервере (install-vpn.sh его не ставит).
+if [ -f "$F/etc/cron.d/vpn-backup" ]; then install -m 644 "$F/etc/cron.d/vpn-backup" /etc/cron.d/vpn-backup; fi
 # Сервер, поставленный install-vpn.sh: его настройки (для повторного запуска и vpn-check) и команда vpn-check.
 if [ -f "$F/etc/vpn-install.env" ]; then install -m 600 "$F/etc/vpn-install.env" /etc/vpn-install.env; fi
 for f in vpn-check vpn-warp; do
@@ -3098,7 +3224,7 @@ cat > /usr/local/lib/vpn-backup/README.md <<'VPN_KIT_EOF_2'
 | (с доменом) сертификат домена и acme.sh (автопродление) | `/root/cert/<домен>/`, `/root/.acme.sh/` |
 | Ядро: BBR, IPv6 выключен | `/etc/sysctl.d/99-vpn.conf` |
 | SSH-ключи root и настройки входа | `/root/.ssh/authorized_keys`, `/etc/ssh/sshd_config.d/` |
-| Служба x-ui, скрипт бэкапа и его cron | `/etc/systemd/system/x-ui.service`, `/usr/local/bin/vpn-backup.sh`, `/etc/cron.d/vpn-backup` |
+| Служба x-ui и скрипт бэкапа | `/etc/systemd/system/x-ui.service`, `/usr/local/bin/vpn-backup.sh` |
 | fail2ban (бан за подбор пароля SSH), настройки установки и команда проверки `vpn-check` | `/etc/fail2ban/jail.d/vpn-sshd.local`, `/etc/vpn-install.env`, `/usr/local/bin/vpn-check` |
 
 `info/summary.txt` — коротко: адрес панели, подписки, число клиентов, срок сертификата.
@@ -3117,8 +3243,11 @@ vpn-check
 ## Выход через другой сервер (chain)
 
 При установке можно выбрать пункт «через другой мой сервер» (или `--exit chain --exit-host IP_СТАРОГО`).
-Вход на старый — по паролю root или по SSH-ключу: ключ можно вставить целиком (OpenSSH, PEM, PKCS#8,
-PuTTY .ppk) или указать файл (`--exit-ssh-key`, парольная фраза — `EXIT_KEY_PASS`). Тогда новый сервер сам зайдёт на старый по SSH,
+Вход на старый — по паролю или по SSH-ключу: ключ можно вставить целиком (OpenSSH, PEM, PKCS#8,
+PuTTY .ppk) или указать файл (`--exit-ssh-key`, парольная фраза — `EXIT_KEY_PASS`). Пользователь — root
+или, как на AWS/Oracle, `ubuntu` с sudo (`--exit-ssh-user ubuntu`; пароль sudo — `EXIT_SUDO_PASS` или спросит).
+На облаках откройте порт цепочки (TCP 2087) для IP нового сервера в панели хостера (AWS — Security Group,
+Oracle — Security List); пока он закрыт, трафик идёт через WARP, потом вотчдог переключит сам. Тогда новый сервер сам зайдёт на старый по SSH,
 поднимет там лёгкий вход Xray и пустит весь трафик новый → старый → интернет — сайты будут видеть IP
 старого сервера. Заодно регистрируется WARP и ставится вотчдог: упадёт старый — трафик уходит на WARP
 и возвращается, когда старый поднимется (`vpn-check` / `vpn-warp` показывают, что активно сейчас).
@@ -3134,8 +3263,8 @@ PuTTY .ppk) или указать файл (`--exit-ssh-key`, парольная
 
 ## Бэкап
 
-Каждый день в 04:17 сервер сам кладёт архив в `/root/backups/` (14 последних, `latest.tgz` —
-свежий). Сделать сейчас: `vpn-backup.sh`. Забрать к себе на компьютер:
+Сам сервер бэкапы не делает. Когда нужен (перед переездом) — `vpn-backup.sh`: архив ляжет в
+`/root/backups/` (`latest.tgz` — последний). Забрать к себе на компьютер:
 
 ```bash
 scp root@IP_СЕРВЕРА:/root/backups/latest.tgz ./vpn-backup.tgz
@@ -3180,14 +3309,9 @@ scp root@IP_СЕРВЕРА:/root/backups/latest.tgz ./vpn-backup.tgz
   если их поменять, клиентам надо обновить подписку или ссылки.
 VPN_KIT_EOF_2
 chmod 644 /usr/local/lib/vpn-backup/README.md
-cat > /etc/cron.d/vpn-backup <<'VPN_KIT_EOF_3'
-# Ежедневный полный бэкап VPN-сервера для переезда (см. /usr/local/lib/vpn-backup/README.md)
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-17 4 * * * root /usr/local/bin/vpn-backup.sh >/var/log/vpn-backup.log 2>&1
-VPN_KIT_EOF_3
-chmod 644 /etc/cron.d/vpn-backup
-ok "vpn-backup.sh каждый день в 04:17, архивы в /root/backups (переезд — README.md внутри архива)"
+# Автобэкап не ставим; прежняя версия скрипта ставила ежедневный — снять.
+if [ -f /etc/cron.d/vpn-backup ]; then rm -f /etc/cron.d/vpn-backup && ok "ежедневный автобэкап снят (бэкап — вручную, когда нужен)"; fi
+ok "vpn-backup.sh — бэкап для переезда вручную, сам не запускается (архив в /root/backups, README.md внутри)"
 # Копия самого скрипта — рядом с комплектом: для vpn-check и повторных запусков, даже если скачанный файл удалят.
 if [ -f "$0" ] && [ "$(readlink -f "$0")" != /usr/local/lib/vpn-backup/install-vpn.sh ]; then
 	install -m 755 "$0" /usr/local/lib/vpn-backup/install-vpn.sh
@@ -3280,15 +3404,20 @@ chmod 700 /root/vpn-qr
 	if [ -x /usr/local/bin/vpn-check ]; then echo "  vpn-check"; else echo "  bash install-vpn.sh --check"; fi
 	if [ "$EXIT_MODE" = chain ]; then
 		echo "Выход клиентов: цепочкой через $CHAIN_IP (его IP видят сайты). Если он упадёт — вотчдог уводит на WARP и возвращает."
-		echo "  Переехал новый сервер на другой IP — на старом открой порт новому: ufw allow from НОВЫЙ_IP to any port $CHAIN_PORT proto tcp (или переустанови с --exit-host)."
+		if [ "${CHAIN_BLOCKED:-0}" = 1 ]; then
+			echo "  ⚠ Сейчас — через WARP: порт $CHAIN_PORT старого сервера закрыт фаерволом хостера. Откройте входящий TCP $CHAIN_PORT"
+			echo "    для $PUBLIC_IP (AWS — Security Group, Oracle — Security List/NSG) — вотчдог сам переключит на старый сервер."
+		fi
+		echo "  Переехал новый сервер на другой IP — на старом открой порт новому (ufw allow from НОВЫЙ_IP to any port $CHAIN_PORT"
+		echo "  proto tcp; у AWS/Oracle — ещё и в панели хостера) или переустанови с --exit-host."
 	else
 		echo "Выход клиентов сейчас: $(exit_label "$EXIT_MODE"). Переключить без переустановки:"
 		echo "  vpn-warp off — напрямую, vpn-warp on — всё через WARP, vpn-warp ru — российские сайты через WARP"
 	fi
 	echo
-	echo "Бэкап: /root/backups/latest.tgz — каждый день в 04:17. Архив секретный: забрать к себе"
-	echo "  scp -P $SSH_PORT root@$PUBLIC_IP:/root/backups/latest.tgz ."
-	echo "Переезд на другой сервер — README.md в архиве (restore.sh$([ "$MODE" = domain ] && echo ", потом смена A-записи"))."
+	echo "Переезд на другой сервер с теми же ключами и клиентами: vpn-backup.sh — архив в /root/backups"
+	echo "  (секретный; забрать: scp -P $SSH_PORT root@$PUBLIC_IP:/root/backups/latest.tgz .), дальше — README.md"
+	echo "  в архиве (restore.sh$([ "$MODE" = domain ] && echo ", потом смена A-записи")). Сам бэкап не запускается."
 } > "$INFO"
 chmod 600 "$INFO"
 cat "$INFO"
