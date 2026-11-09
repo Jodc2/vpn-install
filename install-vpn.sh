@@ -24,7 +24,9 @@
 #   --no-domain       без домена: Reality на 443 под крупный чужой сайт
 #   --sni САЙТ        (без домена) под какой сайт маскироваться вместо автовыбора, например www.samsung.com
 #   --panel-local     (без домена) панель только на 127.0.0.1 — заходить через SSH-туннель, снаружи не видна
-#   --clients N       сколько клиентов (устройств) создать, по умолчанию 5; потом — в панели
+#   --clients N       сколько клиентов (устройств) создать, по умолчанию 1; остальные — в панели
+#   --port N          порт подключения (по умолчанию 2083, как у основного сервера); на уже
+#                     установленном сервере переносит подключение — клиентам выдать новые ссылки
 #   --exit РЕЖИМ      куда выходит трафик клиентов:
 #                       direct  — с IP сервера (по умолчанию, быстрее всего);
 #                       warp    — всё через Cloudflare WARP: IP сервера не виден сайтам,
@@ -74,7 +76,8 @@ DOMAIN=
 NO_DOMAIN=0
 SNI_ARG=
 PANEL_LOCAL_ARG=
-CLIENTS=5
+CLIENTS=1
+PORT_ARG=
 EXIT_MODE=
 SSH_KEY_ONLY=0
 DO_F2B=1
@@ -99,6 +102,7 @@ while [ $# -gt 0 ]; do
 		--panel-local) PANEL_LOCAL_ARG=1; shift ;;
 		--panel-public) PANEL_LOCAL_ARG=0; shift ;;
 		--clients) CLIENTS=${2:-}; shift 2 ;;
+		--port) PORT_ARG=${2:-}; shift 2 ;;
 		--exit) EXIT_MODE=${2:-}; shift 2 ;;
 		--exit-host) EXIT_HOST=${2:-}; shift 2 ;;
 		--exit-ssh-port) EXIT_SSH_PORT=${2:-22}; shift 2 ;;
@@ -197,14 +201,41 @@ if [ "$MODE" = domain ]; then
 	is_host "$DOMAIN" || die "нужен домен вида vpn.example.com (сейчас: «$DOMAIN»)"
 	[ -z "$S_DOMAIN_OLD" ] || [ "$S_DOMAIN_OLD" = "$DOMAIN" ] ||
 		die "сервер уже ставился на домен $S_DOMAIN_OLD. Для другого домена нужен чистый сервер"
-	REALITY_PORT=2083
 else
 	DOMAIN=
 	if [ -n "$SNI_ARG" ]; then
 		SNI_ARG=$(norm_host "$SNI_ARG")
 		is_host "$SNI_ARG" || die "--sni: нужно имя сайта вида www.example.com (сейчас: «$SNI_ARG»)"
 	fi
-	REALITY_PORT=443
+fi
+# Порт подключения Reality — как у основного сервера, 2083, с доменом и без (--port меняет).
+# Повторный запуск берёт порт уже созданного подключения из базы: иначе установка прежней версией
+# (без домена ставила 443) получила бы второе подключение.
+existing_reality_port() {
+	[ -f "$DB" ] && command -v python3 >/dev/null 2>&1 || return 0
+	python3 - "$DB" <<'PY' 2>/dev/null || true
+import json, sqlite3, sys
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+for port, ss in db.execute("select port, stream_settings from inbounds where protocol='vless' order by id"):
+    try:
+        if json.loads(ss or "{}").get("security") == "reality":
+            print(port)
+            break
+    except ValueError:
+        pass
+PY
+}
+OLD_REALITY_PORT=$(existing_reality_port)
+S_REALITY_PORT=$(state_val S_REALITY_PORT || true)
+if [ -n "$PORT_ARG" ] && [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
+	[[ $PORT_ARG =~ ^[0-9]+$ ]] && [ "$PORT_ARG" -ge 1 ] && [ "$PORT_ARG" -le 65535 ] || die "--port: число от 1 до 65535"
+	[ "$PORT_ARG" != "$SUB_PORT" ] || die "--port $PORT_ARG: на нём подписка 3x-ui — выберите другой"
+	if [ "$MODE" = domain ]; then
+		case $PORT_ARG in 80 | 443 | 8443) die "--port $PORT_ARG: с доменом 80, 443 и 8443 заняты nginx — выберите другой (по умолчанию 2083)" ;; esac
+	fi
+	REALITY_PORT=$PORT_ARG
+else
+	REALITY_PORT=${OLD_REALITY_PORT:-${S_REALITY_PORT:-2083}}
 fi
 [[ $CLIENTS =~ ^[0-9]+$ ]] && [ "$CLIENTS" -ge 1 ] && [ "$CLIENTS" -le 100 ] || die "--clients: число от 1 до 100"
 # Первая установка без --exit и без терминала-ответа — спросить, куда выходить (как спрашивали про домен).
@@ -282,11 +313,13 @@ rnd() { python3 -c 'import secrets, sys; print("".join(secrets.choice(sys.argv[1
 LOWER=abcdefghijklmnopqrstuvwxyz
 DIGITS=0123456789
 
-free_port() {  # случайный свободный TCP-порт из 20000–60000
-	python3 - <<'PY'
-import random, socket
+free_port() {  # случайный свободный TCP-порт из 20000–60000 (не порт подключения)
+	python3 - "${REALITY_PORT:-0}" <<'PY'
+import random, socket, sys
 for _ in range(200):
     p = random.randint(20000, 59999)
+    if p == int(sys.argv[1]):
+        continue
     s = socket.socket()
     try:
         s.bind(("127.0.0.1", p))
@@ -769,6 +802,7 @@ SHORT_IDS='${SHORT_IDS:-}'
 REALITY_SNI='${REALITY_SNI:-}'
 S_EXIT='$EXIT_MODE'
 S_PANEL_PUBLIC='${PANEL_PUBLIC:-0}'
+S_REALITY_PORT='$REALITY_PORT'
 CHAIN_IP='${CHAIN_IP:-}'
 CHAIN_PORT='${CHAIN_PORT:-}'
 CHAIN_UUID='${CHAIN_UUID:-}'
@@ -1734,6 +1768,29 @@ fi
 
 say "3x-ui: подписка, шаблон Xray, подключение VLESS + XHTTP + Reality"
 systemctl stop x-ui 2>/dev/null || true
+# Повторный запуск с другим --port: перенести уже созданное подключение (ключи и клиенты те же).
+MOVED_FROM=
+if [ -n "$OLD_REALITY_PORT" ] && [ "$OLD_REALITY_PORT" != "$REALITY_PORT" ]; then
+	[ -z "$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")" ] ||
+		die "на порту $REALITY_PORT в панели уже есть другое подключение — выберите другой --port"
+	# Имя подключения 3x-ui содержит порт (in-2083-tcp, в старых версиях inbound-2083) — заменить в нём номер.
+	python3 - "$DB" "$OLD_REALITY_PORT" "$REALITY_PORT" <<'PY' || die "не удалось перенести подключение на порт $REALITY_PORT"
+import re, sqlite3, sys
+path, old, new = sys.argv[1:4]
+db = sqlite3.connect(path)
+for iid, tag in db.execute("select id, tag from inbounds where port=?", (int(old),)).fetchall():
+    newtag = re.sub(r"(?<![0-9])%s(?![0-9])" % re.escape(old), new, tag or "") or "in-%s-tcp" % new
+    db.execute("update inbounds set port=?, listen='0.0.0.0', tag=? where id=?", (int(new), newtag, iid))
+db.commit()
+PY
+	MOVED_FROM=$OLD_REALITY_PORT
+	ok "подключение перенесено с :$OLD_REALITY_PORT на :$REALITY_PORT (ключи и клиенты те же)"
+	if [ "$MODE" = domain ]; then
+		warn "у кого подписка — обновится сама; у кого ссылка без подписки — выдать новую (порт в ней сменился)"
+	else
+		warn "порт в ссылках клиентов сменился — старые ссылки перестанут работать, новые будут в конце"
+	fi
+fi
 COMMON_SETTINGS=("subEnable=true" "subListen=127.0.0.1" "subPort=$SUB_PORT" "subPath=$SUB_PATH" "subDomain="
 	"subUpdates=1" "subEncrypt=true" "subShowInfo=true" "subEmailInRemark=true" "subEnableRouting=true"
 	"subJsonEnable=false" "subJsonPath=$JSON_PATH" "subClashPath=$CLASH_PATH"
@@ -1802,7 +1859,7 @@ stream = {
                                      "mldsa65Verify": ""}},
 }
 json.dump({"up": 0, "down": 0, "total": 0, "remark": "", "enable": True, "expiryTime": 0, "trafficReset": "never",
-           "listen": "", "port": int(port), "protocol": "vless",
+           "listen": "0.0.0.0", "port": int(port), "protocol": "vless",
            "settings": json.dumps({"clients": clients, "decryption": "none", "encryption": "none"}),
            "streamSettings": json.dumps(stream), "sniffing": json.dumps({"enabled": False}),
            "shareAddrStrategy": "custom", "shareAddr": share, "subSortIndex": 1}, open(out, "w"))
@@ -1998,6 +2055,10 @@ if [ "$DO_UFW" = 1 ]; then
 		for pp in $OTHER_VPN_PORTS; do echo "$pp"; done
 	} | sort -u -t/ -k1,1n)
 	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
+	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ]; then
+		ufw delete allow "$MOVED_FROM/tcp" >/dev/null 2>&1 || true
+		ok "старый порт подключения $MOVED_FROM закрыт в ufw"
+	fi
 	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
 	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
 	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
@@ -2979,7 +3040,8 @@ scp root@IP_СЕРВЕРА:/root/backups/latest.tgz ./vpn-backup.tgz
 - С доменом — Reality «steal-oneself»: подключение на порту 2083, SNI — сам домен, Reality отдаёт чужим
   настоящий сайт с nginx (`127.0.0.1:8443`). На 443 nginx пускает свой домен к сайту, панели и подписке,
   остальное обрывает.
-- Без домена — Reality на 443 под крупный чужой сайт (какой — видно в панели, поле SNI подключения):
+- Без домена — Reality на порту 2083 (как у основного сервера; другой — `--port`) под крупный чужой сайт
+  (какой — видно в панели, поле SNI подключения):
   тот, кто прощупывает сервер, получает настоящий сайт. Панель открыта по IP:
   `https://IP:ПОРТ/путь/` с самоподписанным сертификатом (браузер предупредит — «Дополнительно» →
   «Перейти»), адрес, логин и пароль — в `/root/vpn-info.txt`. Спрятать её за SSH-туннель — повторный
