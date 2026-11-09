@@ -30,7 +30,8 @@
 #                       warp    — всё через Cloudflare WARP: IP сервера не виден сайтам,
 #                                 но бывают капчи Google и потолок около 100 Мбит/с;
 #                       warp-ru — российские сайты через WARP, остальное напрямую
-#                     выбор запоминается; переключить потом — vpn-warp off|on|ru
+#                       chain   — через другой мой сервер (его IP как выход); нужен --exit-host
+#                     выбор запоминается; переключить WARP потом — vpn-warp off|on|ru
 #   --ssh-key-only    выключить вход по паролю (только если у root уже есть SSH-ключ)
 #   --no-fail2ban     не ставить fail2ban
 #   --no-ufw          не трогать фаервол
@@ -40,6 +41,10 @@
 #   --check           только проверить: службы, туннель, доступность портов из России и Европы
 #   --warp off|on|ru  быстро переключить выход без переустановки (то же — команда vpn-warp):
 #                     off — напрямую, on — всё через WARP, ru — российские сайты через WARP
+#   --exit-host IP    (с --exit chain) IP старого сервера, через который выходить; его настроит скрипт по SSH
+#   --exit-ssh-port N порт SSH старого сервера (по умолчанию 22); пароль root — в EXIT_PASS или спросит
+#   --exit-ssh-key Ф  вместо пароля — SSH-ключ к старому серверу
+#   --exit-port N     порт цепочки на старом сервере (по умолчанию 2087)
 # Повторный запуск безопасен: ключи, пароли, клиенты и выбранный выход сохраняются (/etc/vpn-install.env).
 set -euo pipefail
 umask 022
@@ -78,6 +83,10 @@ SKIP_DNS=0
 SKIP_IP_CHECK=0
 CHECK_ONLY=0
 WARP_CMD=
+EXIT_HOST=
+EXIT_SSH_PORT=22
+EXIT_SSH_KEY=
+EXIT_PORT_ARG=
 TEST_SELFSIGNED=0   # только для проверки самого скрипта: самоподписанный сертификат вместо Let's Encrypt
 ACME_STAGING=0      # только для проверки: тестовый сервер Let's Encrypt
 while [ $# -gt 0 ]; do
@@ -89,6 +98,10 @@ while [ $# -gt 0 ]; do
 		--panel-public) PANEL_LOCAL_ARG=0; shift ;;
 		--clients) CLIENTS=${2:-}; shift 2 ;;
 		--exit) EXIT_MODE=${2:-}; shift 2 ;;
+		--exit-host) EXIT_HOST=${2:-}; shift 2 ;;
+		--exit-ssh-port) EXIT_SSH_PORT=${2:-22}; shift 2 ;;
+		--exit-ssh-key) EXIT_SSH_KEY=${2:-}; shift 2 ;;
+		--exit-port) EXIT_PORT_ARG=${2:-}; shift 2 ;;
 		--ssh-key-only) SSH_KEY_ONLY=1; shift ;;
 		--no-fail2ban) DO_F2B=0; shift ;;
 		--no-ufw) DO_UFW=0; shift ;;
@@ -129,6 +142,13 @@ S_MODE=$(state_val S_MODE || true)
 S_DOMAIN_OLD=$(state_val S_DOMAIN || true)
 if [ -z "$S_MODE" ] && [ -n "$S_DOMAIN_OLD" ]; then S_MODE=domain; fi   # установка прежней версией скрипта
 S_EXIT=$(state_val S_EXIT || true)
+CHAIN_IP=$(state_val CHAIN_IP || true)
+CHAIN_PORT=$(state_val CHAIN_PORT || true)
+CHAIN_UUID=$(state_val CHAIN_UUID || true)
+CHAIN_PUB=$(state_val CHAIN_PUB || true)
+CHAIN_PRIV=$(state_val CHAIN_PRIV || true)
+CHAIN_SID=$(state_val CHAIN_SID || true)
+CHAIN_SNI=$(state_val CHAIN_SNI || true)
 if [ "$CHECK_ONLY" = 1 ] || [ -n "$WARP_CMD" ]; then
 	[ -n "$S_MODE" ] || die "VPN этим скриптом здесь ещё не ставился (нет $STATE) — сначала bash $0"
 	MODE=$S_MODE
@@ -183,8 +203,47 @@ else
 	REALITY_PORT=443
 fi
 [[ $CLIENTS =~ ^[0-9]+$ ]] && [ "$CLIENTS" -ge 1 ] && [ "$CLIENTS" -le 100 ] || die "--clients: число от 1 до 100"
+# Первая установка без --exit и без терминала-ответа — спросить, куда выходить (как спрашивали про домен).
+if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ] && [ -z "$EXIT_MODE" ] && [ -z "$S_EXIT" ] && { : > /dev/tty; } 2>/dev/null; then
+	cat > /dev/tty <<'EOF'
+
+Куда выпускать трафик клиентов в интернет?
+  1) Напрямую с IP этого сервера (по умолчанию, быстрее всего)
+  2) Через Cloudflare WARP (IP сервера не виден сайтам; бывают капчи Google, потолок ~100 Мбит/с)
+  3) Российские сайты — через WARP, остальное напрямую
+  4) Через другой мой сервер (его IP как выход; например старый IP, забаненный как вход из РФ)
+EOF
+	while [ -z "$EXIT_MODE" ]; do
+		printf 'Ваш выбор [1/2/3/4]: ' > /dev/tty
+		read -r ans < /dev/tty || die "не удалось прочитать ответ"
+		case $ans in
+			1 | "") EXIT_MODE=direct ;;
+			2) EXIT_MODE=warp ;;
+			3) EXIT_MODE=warp-ru ;;
+			4) EXIT_MODE=chain ;;
+		esac
+	done
+	if [ "$EXIT_MODE" = chain ]; then
+		printf 'IP старого сервера-выхода: ' > /dev/tty; read -r EXIT_HOST < /dev/tty || true
+		printf 'SSH-порт старого сервера [22]: ' > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_PORT=$a
+		if [ -z "$EXIT_SSH_KEY" ]; then
+			printf 'root-пароль старого сервера (не отобразится): ' > /dev/tty
+			read -rs EXIT_PASS < /dev/tty || true; echo > /dev/tty
+		fi
+	fi
+fi
 EXIT_MODE=${EXIT_MODE:-${S_EXIT:-direct}}   # не указан — как в прошлый раз
-case $EXIT_MODE in direct | warp | warp-ru) ;; *) die "--exit: direct, warp или warp-ru" ;; esac
+case $EXIT_MODE in direct | warp | warp-ru | chain) ;; *) die "--exit: direct, warp, warp-ru или chain" ;; esac
+if [ "$EXIT_MODE" = chain ]; then
+	[ -n "$EXIT_HOST" ] && EXIT_HOST=$(norm_host "$EXIT_HOST")
+	# Первый раз (нет сохранённой цепочки) нужен IP старого сервера; повторный запуск берёт из state.
+	if [ -z "$EXIT_HOST" ] && [ -z "$CHAIN_IP" ]; then
+		die "для --exit chain укажите --exit-host IP старого сервера (и EXIT_PASS=… либо --exit-ssh-key)"
+	fi
+	if [ -n "$EXIT_HOST" ] && [ -z "$EXIT_SSH_KEY" ] && [ -z "${EXIT_PASS:-}" ]; then
+		die "нужен доступ к старому серверу: EXIT_PASS='root-пароль' либо --exit-ssh-key ПУТЬ"
+	fi
+fi
 case $WARP_CMD in
 	"") ;;
 	off | direct) TARGET_EXIT=direct ;;
@@ -565,7 +624,14 @@ local_checks() {
 	for p in $([ "$MODE" = domain ] && echo "$LISTEN_IP:443 127.0.0.1:8443") ":$WEB_PORT" "127.0.0.1:$SUB_PORT" ":$REALITY_PORT"; do
 		if wait_port "$p" 15; then ok "слушает $p"; else bad "никто не слушает $p"; fi
 	done
-	ok "выход клиентов: $(exit_label "$(exit_mode_now)") (переключить: vpn-warp off|on|ru)"
+	if [ "$(exit_mode_now)" = chain ]; then
+		ok "выход клиентов: $(exit_label chain); сейчас активно — $(active_label "$(chain_active)")"
+		if [ -f /etc/systemd/system/vpn-exit-watchdog.service ]; then
+			if systemctl is-active -q vpn-exit-watchdog; then ok "вотчдог следит за старым сервером (упадёт — WARP, вернётся — назад)"; else bad "вотчдог не работает (journalctl -u vpn-exit-watchdog)"; fi
+		fi
+	else
+		ok "выход клиентов: $(exit_label "$(exit_mode_now)") (переключить: vpn-warp off|on|ru)"
+	fi
 	if [ -f "$F2B_JAIL" ]; then
 		if s=$(fail2ban-client status sshd 2>/dev/null); then
 			ok "fail2ban охраняет SSH: сейчас в бане $(sed -n 's/.*Currently banned:[[:space:]]*//p' <<<"$s" | head -1), всего забанено $(sed -n 's/.*Total banned:[[:space:]]*//p' <<<"$s" | head -1)"
@@ -638,10 +704,11 @@ db.commit()
 PY
 }
 template_json() {  # template_json РЕЖИМ ФАЙЛ_WARP|- → шаблон Xray (проверенная схема)
-	python3 - "$1" "$2" <<'PY'
+	python3 - "$1" "$2" "${3:--}" <<'PY'
 import json, sys
-mode, warp_file = sys.argv[1], sys.argv[2]
+mode, warp_file, chain_file = sys.argv[1], sys.argv[2], sys.argv[3]
 warp = json.load(open(warp_file)) if warp_file != "-" else None
+chain = json.load(open(chain_file)) if chain_file != "-" else None
 direct = {"protocol": "freedom", "settings": {"domainStrategy": "AsIs", "finalRules": [{"action": "allow"}]}, "tag": "direct"}
 blocked = {"protocol": "blackhole", "settings": {}, "tag": "blocked"}
 rules = [{"inboundTag": ["api"], "outboundTag": "api", "type": "field"},
@@ -656,6 +723,10 @@ elif mode == "warp-ru" and warp:
     outbounds, main, dns_out = [direct, warp, blocked], "direct", "warp"
     rules += [{"type": "field", "outboundTag": "warp", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
               {"type": "field", "outboundTag": "warp", "ip": ["geoip:ru"]}]
+elif mode == "chain" and chain:
+    # Цепочка через чужой сервер первым выходом, WARP — запасным (вотчдог переключает между chain и warp).
+    outbounds = [chain] + ([warp] if warp else []) + [direct, blocked]
+    main, dns_out = "chain", "chain"
 else:
     outbounds, main, dns_out = [direct, blocked], "direct", "direct"
 rules += [{"type": "field", "inboundTag": ["dns-internal"], "outboundTag": dns_out},
@@ -694,6 +765,13 @@ SHORT_IDS='${SHORT_IDS:-}'
 REALITY_SNI='${REALITY_SNI:-}'
 S_EXIT='$EXIT_MODE'
 S_PANEL_PUBLIC='${PANEL_PUBLIC:-0}'
+CHAIN_IP='${CHAIN_IP:-}'
+CHAIN_PORT='${CHAIN_PORT:-}'
+CHAIN_UUID='${CHAIN_UUID:-}'
+CHAIN_PUB='${CHAIN_PUB:-}'
+CHAIN_PRIV='${CHAIN_PRIV:-}'
+CHAIN_SID='${CHAIN_SID:-}'
+CHAIN_SNI='${CHAIN_SNI:-}'
 EOF
 	chmod 600 "$tmp"
 	mv "$tmp" "$STATE"
@@ -722,7 +800,9 @@ t = json.loads(row[0]) if row and row[0] else {}
 rules = (t.get("routing") or {}).get("rules") or []
 main = next((r.get("outboundTag") for r in rules if r.get("network") == "tcp,udp"), None)
 main = main or ((t.get("outbounds") or [{}])[0].get("tag") or "direct")
-if main == "warp":
+if any(o.get("tag") == "chain" for o in t.get("outbounds") or []):
+    print("chain")           # цепочка настроена; активный путь (chain/warp) — отдельно, chain_active
+elif main == "warp":
     print("warp")
 elif any(r.get("outboundTag") == "warp" and (r.get("domain") or r.get("ip")) for r in rules):
     print("warp-ru")
@@ -736,8 +816,263 @@ exit_label() {
 		direct) echo "напрямую с IP сервера" ;;
 		warp) echo "всё через Cloudflare WARP" ;;
 		warp-ru) echo "российские сайты через WARP, остальное напрямую" ;;
+		chain) echo "цепочкой через сервер ${CHAIN_IP:-?}" ;;
 		*) echo "$1" ;;
 	esac
+}
+
+chain_active() {  # какой выход активен ПРЯМО сейчас в режиме цепочки: chain (старый сервер) или warp (аварийный)
+	python3 - "$DB" <<'PY'
+import json, sqlite3, sys
+row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+t = json.loads(row[0]) if row and row[0] else {}
+cat = [r for r in (t.get("routing") or {}).get("rules") or [] if r.get("network") == "tcp,udp"]
+print(cat[0].get("outboundTag", "chain") if cat else "chain")
+PY
+}
+
+active_label() {  # понятное имя активного пути цепочки
+	case $1 in
+		warp) echo "аварийный WARP" ;;
+		chain) echo "старый сервер ${CHAIN_IP:-?}" ;;
+		*) echo "$1" ;;
+	esac
+}
+
+CHAIN_SAVED=/etc/x-ui/chain/outbound.json   # копия outbound цепочки (для повторной сборки шаблона и бэкапа)
+save_chain() { install -d -m 700 /etc/x-ui/chain && install -m 600 "$1" "$CHAIN_SAVED"; }
+
+build_chain_outbound() {  # build_chain_outbound ФАЙЛ ← outbound chain из CHAIN_* (VLESS-TCP+Reality на старый сервер)
+	python3 - "$1" "$CHAIN_IP" "$CHAIN_PORT" "$CHAIN_UUID" "$CHAIN_PUB" "$CHAIN_SID" "$CHAIN_SNI" <<'PY'
+import json, sys
+out, ip, port, uuid, pub, sid, sni = sys.argv[1:8]
+json.dump({"tag": "chain", "protocol": "vless",
+           "settings": {"vnext": [{"address": ip, "port": int(port),
+                                    "users": [{"id": uuid, "encryption": "none", "flow": ""}]}]},
+           "streamSettings": {"network": "tcp", "security": "reality",
+                              "realitySettings": {"serverName": sni, "publicKey": pub, "shortId": sid,
+                                                  "fingerprint": "chrome"}}}, open(out, "w"))
+PY
+}
+
+ssh_exit() {  # ssh на старый сервер (пароль из EXIT_PASS или ключ)
+	if [ -n "$EXIT_SSH_KEY" ]; then
+		ssh -i "$EXIT_SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts" -p "$EXIT_SSH_PORT" "root@$EXIT_HOST" "$@"
+	else
+		SSHPASS="${EXIT_PASS:-}" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts" -p "$EXIT_SSH_PORT" "root@$EXIT_HOST" "$@"
+	fi
+}
+scp_exit() {  # scp файла $1 на старый сервер в $2
+	if [ -n "$EXIT_SSH_KEY" ]; then
+		scp -i "$EXIT_SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts" -P "$EXIT_SSH_PORT" "$1" "root@$EXIT_HOST:$2"
+	else
+		SSHPASS="${EXIT_PASS:-}" sshpass -e scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts" -P "$EXIT_SSH_PORT" "$1" "root@$EXIT_HOST:$2"
+	fi
+}
+
+emit_exit_setup() {  # пишет в $WORK/exit-setup.sh скрипт настройки старого сервера (запускается там)
+	cat > "$WORK/exit-setup.sh" <<'VPN_EXIT_SETUP'
+#!/bin/bash
+# Настройка сервера-выхода: Xray с одним входом VLESS-TCP+Reality, который дёргает новый сервер.
+# Секреты и параметры приходят через env: CHAIN_PRIV CHAIN_UUID CHAIN_SID ENTRY_IP EXIT_PORT XUI_VER XUI_SHA_AMD64 XUI_SHA_ARM64
+set -eu
+export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive
+command -v apt-get >/dev/null || { echo "EXIT_RESULT=FAIL нужен Ubuntu/Debian на старом сервере"; exit 1; }
+case $(uname -m) in
+	x86_64 | amd64) A=amd64; SHA=$XUI_SHA_AMD64 ;;
+	aarch64 | arm64) A=arm64; SHA=$XUI_SHA_ARM64 ;;
+	*) echo "EXIT_RESULT=FAIL архитектура $(uname -m) не поддержана"; exit 1 ;;
+esac
+for t in 1 2 3 4 5 6; do apt-get -y -q -o DPkg::Lock::Timeout=600 update >/dev/null 2>&1 && break; [ "$t" = 6 ] && { echo "EXIT_RESULT=FAIL apt update"; exit 1; }; sleep 15; done
+apt-get -y -q install curl ca-certificates python3 openssl iproute2 tar >/dev/null 2>&1 || { echo "EXIT_RESULT=FAIL пакеты"; exit 1; }
+DIR=/usr/local/vpn-exit; install -d -m 755 "$DIR"
+if [ -s /root/.vpn-exit-bin/xray ]; then
+	install -m 755 /root/.vpn-exit-bin/xray "$DIR/xray"
+	cp -a /root/.vpn-exit-bin/geoip.dat /root/.vpn-exit-bin/geosite.dat "$DIR/" 2>/dev/null || true
+	rm -rf /root/.vpn-exit-bin
+else
+	TMP=$(mktemp -d); U=https://github.com/MHSanaei/3x-ui/releases/download/v$XUI_VER/x-ui-linux-$A.tar.gz
+	curl -fL --retry 3 -s -o "$TMP/x.tgz" "$U" || { echo "EXIT_RESULT=FAIL не скачался Xray"; exit 1; }
+	echo "$SHA  $TMP/x.tgz" | sha256sum -c --quiet - >/dev/null 2>&1 || { echo "EXIT_RESULT=FAIL sha256 Xray не сошёлся"; exit 1; }
+	tar -C "$TMP" -xzf "$TMP/x.tgz"
+	install -m 755 "$TMP/x-ui/bin/xray-linux-$A" "$DIR/xray"
+	cp -a "$TMP/x-ui/bin/geoip.dat" "$TMP/x-ui/bin/geosite.dat" "$DIR/" 2>/dev/null || true
+	rm -rf "$TMP"
+fi
+# Сайт для маскировки Reality на старом сервере — реальный, доступный отсюда, TLS1.3/X25519/HTTP2, не Cloudflare.
+cf() { python3 - "$1" <<'PYC'
+import ipaddress,sys
+nets="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22".split()
+ip=ipaddress.ip_address(sys.argv[1]); sys.exit(0 if any(ip in ipaddress.ip_network(n) for n in nets) else 1)
+PYC
+}
+SNI=
+for d in ${EXIT_SNI_HINT:-} www.microsoft.com www.apple.com swdist.apple.com www.samsung.com dl.google.com www.nvidia.com www.intel.com www.amazon.com; do
+	[ -n "$d" ] || continue
+	ip=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}'); [ -n "$ip" ] || continue
+	cf "$ip" && continue
+	o=$(timeout 8 openssl s_client -connect "$ip:443" -servername "$d" -verify_hostname "$d" -verify_return_error -tls1_3 -groups X25519 -alpn h2 </dev/null 2>&1) || continue
+	grep -q 'New, TLSv1.3' <<<"$o" && grep -q 'ALPN protocol: h2' <<<"$o" && grep -q 'Server Temp Key: X25519' <<<"$o" && grep -q 'Verify return code: 0 (ok)' <<<"$o" && { SNI=$d; break; }
+done
+[ -n "$SNI" ] || { echo "EXIT_RESULT=FAIL не нашёлся сайт для маскировки (нет выхода на 443?)"; exit 1; }
+python3 - "$DIR/config.json" "$EXIT_PORT" "$CHAIN_PRIV" "$CHAIN_UUID" "$CHAIN_SID" "$SNI" <<'PYJ'
+import json,sys
+out,port,priv,uuid,sid,sni=sys.argv[1:7]
+json.dump({"log":{"loglevel":"warning"},
+ "inbounds":[{"listen":"0.0.0.0","port":int(port),"protocol":"vless",
+   "settings":{"clients":[{"id":uuid,"flow":""}],"decryption":"none"},
+   "streamSettings":{"network":"tcp","security":"reality",
+     "realitySettings":{"show":False,"dest":sni+":443","xver":0,"serverNames":[sni],"privateKey":priv,"shortIds":[sid]}},
+   "sniffing":{"enabled":False}}],
+ "outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}],
+ "routing":{"rules":[{"type":"field","ip":["geoip:private"],"outboundTag":"blocked"},
+                     {"type":"field","protocol":["bittorrent"],"outboundTag":"blocked"}]}},open(out,"w"))
+PYJ
+cat > /etc/systemd/system/vpn-exit.service <<UNIT
+[Unit]
+Description=VPN exit node (Xray VLESS-TCP+Reality inbound)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+Environment=XRAY_LOCATION_ASSET=$DIR
+ExecStart=$DIR/xray run -c $DIR/config.json
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable vpn-exit >/dev/null 2>&1 || true
+systemctl restart vpn-exit
+ok=0; for _ in $(seq 1 20); do ss -Htln "sport = :$EXIT_PORT" 2>/dev/null | grep -q . && { ok=1; break; }; sleep 1; done
+[ "$ok" = 1 ] || { echo "EXIT_RESULT=FAIL Xray не слушает порт $EXIT_PORT (journalctl -u vpn-exit)"; exit 1; }
+# Фаервол: если ufw активен — пустить новый сервер на порт цепочки (ssh не трогаем). Неактивный ufw не включаем, чтобы не запереть.
+if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
+	echo "EXIT_UFW=restricted"
+else
+	echo "EXIT_UFW=open"
+fi
+echo "EXIT_SNI=$SNI"
+echo "EXIT_RESULT=OK"
+VPN_EXIT_SETUP
+}
+
+install_watchdog() {  # вотчдог: держит выход на цепочке, при недоступности старого сервера — WARP, вернулся — назад
+	cat > /usr/local/bin/vpn-exit-watchdog.sh <<'VPN_WD'
+#!/bin/bash
+# Выход цепочкой через EXIT_IP:EXIT_PORT. При FAIL_LIMIT недоступностях подряд — на WARP; при OK_LIMIT доступностях — назад.
+set -u
+DB=/etc/x-ui/x-ui.db
+EXIT_IP=${EXIT_IP:?}
+EXIT_PORT=${EXIT_PORT:?}
+FAIL_LIMIT=${FAIL_LIMIT:-4}; OK_LIMIT=${OK_LIMIT:-3}; INTERVAL=${INTERVAL:-30}
+fails=0; oks=0
+state() { python3 - <<PY
+import sqlite3,json
+t=json.loads(sqlite3.connect("$DB").execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+cat=[r for r in t["routing"]["rules"] if r.get("network")=="tcp,udp"]
+print(cat[0].get("outboundTag","?") if cat else "?")
+PY
+}
+switch() { python3 - "$1" <<PY
+import sqlite3,json,sys
+tag=sys.argv[1]; db=sqlite3.connect("$DB")
+t=json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+obs=t["outbounds"]
+t["outbounds"]=[o for o in obs if o.get("tag")==tag]+[o for o in obs if o.get("tag")!=tag]
+for r in t["routing"]["rules"]:
+    if r.get("network")=="tcp,udp" or "dns-internal" in (r.get("inboundTag") or []):
+        r["outboundTag"]=tag; r.pop("balancerTag",None)
+db.execute("update settings set value=? where key='xrayTemplateConfig'",(json.dumps(t,ensure_ascii=False),)); db.commit()
+PY
+systemctl restart x-ui
+}
+probe() { timeout 3 bash -c "cat </dev/null >/dev/tcp/$EXIT_IP/$EXIT_PORT" 2>/dev/null; }
+logger -t vpn-watchdog "started exit=$EXIT_IP:$EXIT_PORT (fail=$FAIL_LIMIT ok=$OK_LIMIT interval=${INTERVAL}s)"
+while true; do
+  st=$(state)
+  if probe; then oks=$((oks+1)); fails=0; else fails=$((fails+1)); oks=0; fi
+  if [ "$st" = chain ] && [ "$fails" -ge "$FAIL_LIMIT" ]; then
+     logger -t vpn-watchdog "exit $EXIT_IP unreachable x$fails -> WARP"; switch warp; fails=0
+  elif [ "$st" = warp ] && [ "$oks" -ge "$OK_LIMIT" ]; then
+     logger -t vpn-watchdog "exit $EXIT_IP recovered x$oks -> chain"; switch chain; oks=0
+  fi
+  sleep "$INTERVAL"
+done
+VPN_WD
+	chmod 755 /usr/local/bin/vpn-exit-watchdog.sh
+	cat > /etc/systemd/system/vpn-exit-watchdog.service <<EOF
+[Unit]
+Description=VPN exit watchdog (chain primary, WARP on real exit-down)
+After=network-online.target x-ui.service
+[Service]
+Type=simple
+Environment=EXIT_IP=$CHAIN_IP EXIT_PORT=$CHAIN_PORT FAIL_LIMIT=4 OK_LIMIT=3 INTERVAL=30
+ExecStart=/usr/local/bin/vpn-exit-watchdog.sh
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl daemon-reload
+	systemctl enable vpn-exit-watchdog >/dev/null 2>&1 || true
+	systemctl restart vpn-exit-watchdog || warn "вотчдог не запустился (journalctl -u vpn-exit-watchdog)"
+}
+
+setup_chain_exit() {  # настроить старый сервер по SSH и собрать outbound цепочки; ошибка → CHAIN_ERR
+	CHAIN_ERR=
+	if [ -z "$EXIT_HOST" ] && [ -n "$CHAIN_IP" ]; then
+		ok "цепочка: прежние настройки выхода ($CHAIN_IP:$CHAIN_PORT), старый сервер не трогаю"
+		build_chain_outbound "$WORK/chain.json"; save_chain "$WORK/chain.json"
+		return 0
+	fi
+	CHAIN_IP=$EXIT_HOST
+	CHAIN_PORT=${EXIT_PORT_ARG:-${CHAIN_PORT:-2087}}
+	"${APT[@]}" install openssh-client >/dev/null 2>&1 || true
+	if [ -z "$EXIT_SSH_KEY" ] && ! command -v sshpass >/dev/null; then
+		"${APT[@]}" install sshpass >/dev/null 2>&1 || { CHAIN_ERR="не установился sshpass (вход по паролю к старому серверу)"; return 1; }
+	fi
+	: > "$WORK/exit_known_hosts"
+	if ! ssh_exit true >/dev/null 2>&1; then CHAIN_ERR="SSH к старому серверу $EXIT_HOST:$EXIT_SSH_PORT не прошёл (адрес/порт/пароль?)"; return 1; fi
+	# Ключи цепочки генерируем на новом сервере (у него есть xray); приватный уйдёт в вход старого по SSH.
+	if [ -z "$CHAIN_PRIV" ]; then
+		local kk
+		kk=$("$XRAY" x25519)
+		CHAIN_PRIV=$(awk -F': *' '/^Private/ {print $2; exit}' <<<"$kk")
+		CHAIN_PUB=$(awk -F': *' '/Public/ {print $2; exit}' <<<"$kk")
+		CHAIN_SID=$(openssl rand -hex 8)
+		CHAIN_UUID=$("$XRAY" uuid 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')
+		[ -n "$CHAIN_PRIV" ] && [ -n "$CHAIN_PUB" ] && [ -n "$CHAIN_UUID" ] || { CHAIN_ERR="не сгенерировались ключи цепочки"; return 1; }
+	fi
+	# Если архитектуры совпадают — отдать старому серверу тот же бинарник Xray и гео-файлы (без скачивания у него).
+	local rarch="" ra=""
+	rarch=$(ssh_exit 'uname -m' 2>/dev/null | tr -d '
+')
+	case $rarch in x86_64 | amd64) ra=amd64 ;; aarch64 | arm64) ra=arm64 ;; esac
+	if [ "$ra" = "$ARCH" ] && [ -x "$XRAY" ]; then
+		ssh_exit 'install -d -m 700 /root/.vpn-exit-bin' >/dev/null 2>&1 || true
+		scp_exit "$XRAY" /root/.vpn-exit-bin/xray >/dev/null 2>&1 || true
+		scp_exit /usr/local/x-ui/bin/geoip.dat /root/.vpn-exit-bin/geoip.dat >/dev/null 2>&1 || true
+		scp_exit /usr/local/x-ui/bin/geosite.dat /root/.vpn-exit-bin/geosite.dat >/dev/null 2>&1 || true
+	fi
+	emit_exit_setup
+	scp_exit "$WORK/exit-setup.sh" /root/.vpn-exit-setup.sh || { CHAIN_ERR="не удалось передать скрипт на старый сервер"; return 1; }
+	local out
+	out=$(ssh_exit "CHAIN_PRIV='$CHAIN_PRIV' CHAIN_UUID='$CHAIN_UUID' CHAIN_SID='$CHAIN_SID' ENTRY_IP='$PUBLIC_IP' EXIT_PORT='$CHAIN_PORT' EXIT_SNI_HINT='${REALITY_SNI:-}' XUI_VER='$XUI_VERSION' XUI_SHA_AMD64='$XUI_SHA256_AMD64' XUI_SHA_ARM64='$XUI_SHA256_ARM64' bash /root/.vpn-exit-setup.sh" 2>&1) || true
+	ssh_exit 'rm -f /root/.vpn-exit-setup.sh' >/dev/null 2>&1 || true
+	if ! grep -q '^EXIT_RESULT=OK' <<<"$out"; then
+		CHAIN_ERR=$(grep -m1 '^EXIT_RESULT=FAIL' <<<"$out" | sed 's/^EXIT_RESULT=FAIL //'); CHAIN_ERR=${CHAIN_ERR:-"настройка старого сервера не прошла"}
+		return 1
+	fi
+	CHAIN_SNI=$(sed -n 's/^EXIT_SNI=//p' <<<"$out" | tail -1)
+	[ -n "$CHAIN_SNI" ] || { CHAIN_ERR="старый сервер не выбрал сайт для маскировки"; return 1; }
+	grep -q '^EXIT_UFW=open' <<<"$out" && warn "на старом сервере ufw выключен — порт $CHAIN_PORT открыт всем; включи там ufw и оставь доступ только новому серверу"
+	ok "старый сервер $CHAIN_IP настроен: вход цепочки на :$CHAIN_PORT (маскировка под $CHAIN_SNI)"
+	build_chain_outbound "$WORK/chain.json"; save_chain "$WORK/chain.json"
+	return 0
 }
 
 api_open() {  # одноразовый API-токен панели (x-ui должен работать); api_close его удаляет
@@ -856,6 +1191,11 @@ if [ -n "$WARP_CMD" ]; then
 	# shellcheck source=/dev/null
 	. "$STATE"
 	NOW=$(exit_mode_now)
+	if [ "$NOW" = chain ]; then
+		echo "Выход цепочкой через ${CHAIN_IP:-?}, сейчас активно: $(active_label "$(chain_active)"). Переключением на WARP и обратно управляет вотчдог (journalctl -t vpn-watchdog)."
+		[ "$TARGET_EXIT" = status ] || echo "Чтобы сменить выход насовсем — переустанови: bash install-vpn.sh --exit direct (или warp)."
+		exit 0
+	fi
 	if [ "$TARGET_EXIT" = status ]; then
 		echo "Выход клиентов сейчас: $(exit_label "$NOW")"
 		if [ "$NOW" = direct ]; then echo "Включить WARP: vpn-warp on — весь трафик, vpn-warp ru — только российские сайты"; else echo "Выключить WARP: vpn-warp off"; fi
@@ -1442,20 +1782,39 @@ if [ "$EXIT_MODE" != direct ] && [ "$HAVE_WARP" = 0 ]; then
 	if warp_register "$WORK/warp.json"; then
 		HAVE_WARP=1
 		ok "Cloudflare WARP зарегистрирован (бесплатный аккаунт)"
-		systemctl stop x-ui
-		xui_set "xrayTemplateConfig=$(template_json "$EXIT_MODE" "$WORK/warp.json")"
+		if [ "$EXIT_MODE" != chain ]; then   # цепочку применим ниже, когда соберём outbound
+			systemctl stop x-ui
+			xui_set "xrayTemplateConfig=$(template_json "$EXIT_MODE" "$WORK/warp.json")"
+		fi
 	else
 		bad "WARP не зарегистрировался — выход остаётся напрямую с IP сервера. Ответ: $WARP_ERR"
 		EXIT_MODE=direct
 	fi
 fi
 api_close
+if [ "$EXIT_MODE" = chain ]; then
+	say "Выход цепочкой через другой сервер"
+	if [ "$HAVE_WARP" != 1 ]; then bad "без WARP цепочке нет аварийного выхода — оставляю прямой выход"; EXIT_MODE=direct
+	elif setup_chain_exit; then
+		install_watchdog
+		systemctl stop x-ui
+		xui_set "xrayTemplateConfig=$(template_json chain "$WORK/warp.json" "$CHAIN_SAVED")"
+		ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — вотчдог уведёт на WARP и вернёт назад"
+	else
+		bad "цепочку настроить не удалось — оставляю выход напрямую. Причина: ${CHAIN_ERR:-?}"
+		warn "проверь IP/порт/пароль старого сервера и повтори: bash install-vpn.sh --exit chain --exit-host $EXIT_HOST (EXIT_PASS=…)"
+		EXIT_MODE=direct
+		systemctl stop x-ui
+		xui_set "xrayTemplateConfig=$(template_json direct -)"
+	fi
+fi
 save_state
 systemctl restart x-ui || bad "x-ui не перезапустился (journalctl -u x-ui)"
 case $EXIT_MODE in
 	direct) ok "выход клиентов в интернет — напрямую с IP сервера $PUBLIC_IP (включить WARP потом: vpn-warp on или vpn-warp ru)" ;;
 	warp) ok "выход клиентов — через Cloudflare WARP (IP сервера сайтам не виден; выключить: vpn-warp off)" ;;
 	warp-ru) ok "выход: российские сайты — через WARP, остальное — напрямую с $PUBLIC_IP (выключить: vpn-warp off)" ;;
+	chain) ok "выход клиентов — цепочкой через $CHAIN_IP (аварийный — WARP, управляет вотчдог vpn-exit-watchdog)" ;;
 esac
 
 say "Ядро, swap, часовой пояс"
@@ -1641,7 +2000,7 @@ keep() {  # копирует существующие пути в files/ с со
 	done
 	return 0
 }
-keep /etc/x-ui/warp /etc/x-ui/panel-cert /etc/x-ui/install-result.env /etc/default/x-ui \
+keep /etc/x-ui/warp /etc/x-ui/chain /etc/x-ui/panel-cert /etc/x-ui/install-result.env /etc/default/x-ui \
 	/etc/systemd/system/x-ui.service /usr/bin/x-ui \
 	/etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/stream-enabled /etc/nginx/sites-enabled \
 	/var/www/html \
@@ -2496,6 +2855,15 @@ vpn-check
 что случилось: служба упала (перезапуск: `systemctl restart x-ui`), порт закрыт фаерволом хостера
 (открыть в панели хостера) или IP заблокирован в России (нужен другой IP — переезд ниже).
 
+## Выход через другой сервер (chain)
+
+При установке можно выбрать пункт «через другой мой сервер» (или `--exit chain --exit-host IP_СТАРОГО`,
+пароль root старого — в `EXIT_PASS=…` или спросит). Тогда новый сервер сам зайдёт на старый по SSH,
+поднимет там лёгкий вход Xray и пустит весь трафик новый → старый → интернет — сайты будут видеть IP
+старого сервера. Заодно регистрируется WARP и ставится вотчдог: упадёт старый — трафик уходит на WARP
+и возвращается, когда старый поднимется (`vpn-check` / `vpn-warp` показывают, что активно сейчас).
+Переехал новый сервер на другой IP — на старом открой ему порт: `ufw allow from НОВЫЙ_IP to any port 2087 proto tcp`.
+
 ## Выход через WARP
 
 `vpn-warp off` — напрямую с IP сервера, `vpn-warp on` — весь трафик через Cloudflare WARP,
@@ -2647,8 +3015,13 @@ chmod 700 /root/vpn-qr
 	echo
 	echo "Если VPN перестал работать — проверка одной командой (службы, туннель, доступность из России):"
 	if [ -x /usr/local/bin/vpn-check ]; then echo "  vpn-check"; else echo "  bash install-vpn.sh --check"; fi
-	echo "Выход клиентов сейчас: $(exit_label "$EXIT_MODE"). Переключить без переустановки:"
-	echo "  vpn-warp off — напрямую, vpn-warp on — всё через WARP, vpn-warp ru — российские сайты через WARP"
+	if [ "$EXIT_MODE" = chain ]; then
+		echo "Выход клиентов: цепочкой через $CHAIN_IP (его IP видят сайты). Если он упадёт — вотчдог уводит на WARP и возвращает."
+		echo "  Переехал новый сервер на другой IP — на старом открой порт новому: ufw allow from НОВЫЙ_IP to any port $CHAIN_PORT proto tcp (или переустанови с --exit-host)."
+	else
+		echo "Выход клиентов сейчас: $(exit_label "$EXIT_MODE"). Переключить без переустановки:"
+		echo "  vpn-warp off — напрямую, vpn-warp on — всё через WARP, vpn-warp ru — российские сайты через WARP"
+	fi
 	echo
 	echo "Бэкап: /root/backups/latest.tgz — каждый день в 04:17. Архив секретный: забрать к себе"
 	echo "  scp -P $SSH_PORT root@$PUBLIC_IP:/root/backups/latest.tgz ."
