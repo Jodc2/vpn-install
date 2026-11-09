@@ -15,11 +15,17 @@
 
 ## Установка
 
+На новом сервере под root — две команды:
+
 ```bash
-scp install-vpn.sh root@IP_СЕРВЕРА:
-ssh root@IP_СЕРВЕРА
+curl -fsSL -o install-vpn.sh https://raw.githubusercontent.com/Jodc2/vpn-installer/main/install-vpn.sh
 bash install-vpn.sh
 ```
+
+- Нет curl — то же через wget: `wget -O install-vpn.sh https://raw.githubusercontent.com/Jodc2/vpn-installer/main/install-vpn.sh`
+- Зашли не под root — запускать `sudo bash install-vpn.sh`.
+- Не запускайте через `curl … | bash`: скрипт должен лежать файлом — он кладёт свою копию для команд
+  `vpn-check` и `vpn-warp`.
 
 Скрипт спросит, есть ли домен. Без вопросов: `bash install-vpn.sh --domain vpn.example.com`
 или `bash install-vpn.sh --no-domain`.
