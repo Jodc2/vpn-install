@@ -1856,6 +1856,33 @@ case $EXIT_MODE in
 	chain) ok "выход клиентов — цепочкой через $CHAIN_IP (аварийный — WARP, управляет вотчдог vpn-exit-watchdog)" ;;
 esac
 
+OTHER_VPN=; OTHER_VPN_PORTS=
+detect_other_vpn() {  # уже работающий на этом сервере WireGuard/AmneziaWG/Amnezia(Docker): описание и порты
+	local found="" ports="" ifc pt name pp pr
+	if command -v wg >/dev/null 2>&1; then
+		while read -r ifc pt; do [ -n "$pt" ] && [ "$pt" != 0 ] && { found="$found WireGuard($ifc)"; ports="$ports $pt/udp"; }; done < <(wg show all listen-port 2>/dev/null)
+	fi
+	if command -v awg >/dev/null 2>&1; then
+		while read -r ifc pt; do [ -n "$pt" ] && [ "$pt" != 0 ] && { found="$found AmneziaWG($ifc)"; ports="$ports $pt/udp"; }; done < <(awg show all listen-port 2>/dev/null)
+	fi
+	if [ -z "$found" ]; then
+		for ifc in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | { grep -E '^(wg|awg)[0-9]' || true; }); do found="$found туннель($ifc)"; done
+	fi
+	if command -v docker >/dev/null 2>&1; then
+		while IFS='|' read -r name pp; do
+			case $name in
+				*amnezia* | *wireguard* | *wg-easy* | *openvpn* | *xray* | *cloak* | *shadowsocks* | *outline* | *wstunnel*)
+					found="$found Docker:$name"
+					for pr in $({ grep -oE '[0-9]+->[0-9]+/(tcp|udp)' <<<"$pp" || true; } | sed -E 's#.*->([0-9]+)/(tcp|udp)#\1/\2#'); do ports="$ports $pr"; done ;;
+			esac
+		done < <(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null || true)
+	fi
+	OTHER_VPN=$(echo $found | sed 's/^ *//; s/ /, /g')
+	OTHER_VPN_PORTS=$(echo $ports | tr ' ' '\n' | { grep -E '^[0-9]+/(tcp|udp)$' || true; } | sort -u | tr '\n' ' ')
+	return 0
+}
+detect_other_vpn
+
 say "Ядро, swap, часовой пояс"
 cat > /etc/sysctl.d/99-vpn.conf <<'EOF'
 net.core.default_qdisc=fq
@@ -1873,6 +1900,7 @@ else
 	else
 		warn "часть настроек ядра не применилась (бывает на OpenVZ/LXC-серверах) — VPN это не мешает"
 	fi
+	[ -z "$OTHER_VPN" ] || warn "рядом работает $OTHER_VPN. IPv6 на сервере выключается — если тот VPN ходит по IPv6, он может перестать работать (проверь). И один IP на два VPN рискованно: заблокируют один протокол — пострадает и другой; надёжнее держать их на разных серверах"
 fi
 if [ -n "$(swapon --show --noheadings 2>/dev/null)" ]; then
 	ok "swap уже есть"
@@ -1967,8 +1995,10 @@ if [ "$DO_UFW" = 1 ]; then
 		if [ "$MODE" = domain ]; then echo 80/tcp; echo 443/tcp; fi
 		if [ "$PANEL_PUBLIC" = 1 ]; then echo "$WEB_PORT/tcp"; fi
 		echo "$REALITY_PORT/tcp"
+		for pp in $OTHER_VPN_PORTS; do echo "$pp"; done
 	} | sort -u -t/ -k1,1n)
 	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
+	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
 	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
 	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
 	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился (ufw status)"; fi
