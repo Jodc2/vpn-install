@@ -45,7 +45,8 @@
 #                     off — напрямую, on — всё через WARP, ru — российские сайты через WARP
 #   --exit-host IP    (с --exit chain) IP старого сервера, через который выходить; его настроит скрипт по SSH
 #   --exit-ssh-port N порт SSH старого сервера (по умолчанию 22); пароль root — в EXIT_PASS или спросит
-#   --exit-ssh-key Ф  вместо пароля — SSH-ключ к старому серверу
+#   --exit-ssh-key Ф  вместо пароля — файл SSH-ключа к старому серверу (OpenSSH, PEM, PKCS#8 или
+#                     PuTTY .ppk; парольная фраза — в EXIT_KEY_PASS). На вопросе ключ можно вставить целиком
 #   --exit-port N     порт цепочки на старом сервере (по умолчанию 2087)
 #   --exit-stop-xui   выключить 3x-ui на старом сервере (если он теперь только выход); --exit-keep-xui — оставить
 # Повторный запуск безопасен: ключи, пароли, клиенты и выбранный выход сохраняются (/etc/vpn-install.env).
@@ -90,6 +91,7 @@ WARP_CMD=
 EXIT_HOST=
 EXIT_SSH_PORT=22
 EXIT_SSH_KEY=
+EXIT_KEY_TEXT=
 EXIT_PORT_ARG=
 EXIT_STOP_XUI=
 TEST_SELFSIGNED=0   # только для проверки самого скрипта: самоподписанный сертификат вместо Let's Encrypt
@@ -238,6 +240,56 @@ else
 	REALITY_PORT=${OLD_REALITY_PORT:-${S_REALITY_PORT:-2083}}
 fi
 [[ $CLIENTS =~ ^[0-9]+$ ]] && [ "$CLIENTS" -ge 1 ] && [ "$CLIENTS" -le 100 ] || die "--clients: число от 1 до 100"
+key_line() {  # строка вставленного ключа без \r, маркеров вставки терминала и пробелов по краям
+	local l=${1//$'\r'/}
+	l=${l//$'\e[200~'/}
+	l=${l//$'\e[201~'/}
+	l=${l#"${l%%[![:space:]]*}"}
+	printf '%s' "${l%"${l##*[![:space:]]}"}"
+}
+normalize_key() {  # пустые строки убрать (вставка с \r\n их удваивает), кроме одной после заголовков зашифрованного PEM
+	awk 'NF == 0 {next} {print} /^DEK-Info:/ {print ""}'
+}
+read_key_rest() {  # $1 — первая строка вставленного ключа; дочитать до -----END … PRIVATE KEY----- (PuTTY — до Private-MAC)
+	local line n=1 end='-----END*PRIVATE KEY-----' what='-----END … PRIVATE KEY-----'
+	[[ $1 == PuTTY-User-Key-File* ]] && { end='Private-MAC:*'; what='Private-MAC: …'; }
+	EXIT_KEY_TEXT=$1
+	while [ "$n" -lt 300 ] && IFS= read -rs line < /dev/tty; do
+		line=$(key_line "$line")
+		n=$((n + 1))
+		EXIT_KEY_TEXT+=$'\n'"$line"
+		# shellcheck disable=SC2053
+		[[ $line == $end ]] && break
+	done
+	# Хвост вставки (лишний перевод строки после \r\n) дочитать, иначе его получит следующий вопрос.
+	while IFS= read -rs -t 0.3 _ < /dev/tty; do :; done
+	echo > /dev/tty
+	# shellcheck disable=SC2053
+	[[ ${EXIT_KEY_TEXT##*$'\n'} == $end ]] || die "ключ вставлен не целиком: нет последней строки «$what»"
+	EXIT_KEY_TEXT=$(normalize_key <<<"$EXIT_KEY_TEXT")
+	printf '  ключ получен (%s строк)\n' "$(grep -c . <<<"$EXIT_KEY_TEXT")" > /dev/tty
+}
+ask_exit_auth() {  # доступ к старому серверу: пароль root или SSH-ключ (вставить целиком / путь к файлу)
+	local ans first clean
+	printf 'Вход на старый сервер: 1) по паролю root, 2) по SSH-ключу [1]: ' > /dev/tty
+	read -r ans < /dev/tty || ans=
+	if [ "$ans" = 2 ]; then
+		printf 'Вставьте приватный ключ целиком (от -----BEGIN до -----END, на экране не отобразится)\nили путь к файлу ключа на этом сервере: ' > /dev/tty
+	else
+		printf 'root-пароль старого сервера (не отобразится; можно вставить и SSH-ключ целиком): ' > /dev/tty
+	fi
+	IFS= read -rs first < /dev/tty || first=
+	echo > /dev/tty
+	clean=$(key_line "$first")
+	if [[ $clean == -----BEGIN*PRIVATE\ KEY----- || $clean == PuTTY-User-Key-File* ]]; then
+		read_key_rest "$clean"
+	elif [ "$ans" = 2 ]; then
+		[ -f "$clean" ] || die "файл ключа не найден: $clean"
+		EXIT_SSH_KEY=$clean
+	else
+		EXIT_PASS=${first%$'\r'}
+	fi
+}
 # Первая установка без --exit и без терминала-ответа — спросить, куда выходить (как спрашивали про домен).
 if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ] && [ -z "$EXIT_MODE" ] && [ -z "$S_EXIT" ] && { : > /dev/tty; } 2>/dev/null; then
 	cat > /dev/tty <<'EOF'
@@ -261,10 +313,7 @@ EOF
 	if [ "$EXIT_MODE" = chain ]; then
 		printf 'IP старого сервера-выхода: ' > /dev/tty; read -r EXIT_HOST < /dev/tty || true
 		printf 'SSH-порт старого сервера [22]: ' > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_PORT=$a
-		if [ -z "$EXIT_SSH_KEY" ]; then
-			printf 'root-пароль старого сервера (не отобразится): ' > /dev/tty
-			read -rs EXIT_PASS < /dev/tty || true; echo > /dev/tty
-		fi
+		if [ -z "$EXIT_SSH_KEY" ] && [ -z "${EXIT_PASS:-}" ]; then ask_exit_auth; fi
 	fi
 fi
 EXIT_MODE=${EXIT_MODE:-${S_EXIT:-direct}}   # не указан — как в прошлый раз
@@ -275,10 +324,19 @@ if [ "$EXIT_MODE" = chain ]; then
 	if [ -z "$EXIT_HOST" ] && [ -z "$CHAIN_IP" ]; then
 		die "для --exit chain укажите --exit-host IP старого сервера (и EXIT_PASS=… либо --exit-ssh-key)"
 	fi
-	if [ -n "$EXIT_HOST" ] && [ -z "$EXIT_SSH_KEY" ] && [ -z "${EXIT_PASS:-}" ]; then
-		die "нужен доступ к старому серверу: EXIT_PASS='root-пароль' либо --exit-ssh-key ПУТЬ"
+	[ -z "$EXIT_SSH_KEY" ] || [ -f "$EXIT_SSH_KEY" ] || die "--exit-ssh-key: файл не найден: $EXIT_SSH_KEY"
+	if [ -n "$EXIT_HOST" ] && [ -z "$EXIT_SSH_KEY" ] && [ -z "$EXIT_KEY_TEXT" ] && [ -z "${EXIT_PASS:-}" ]; then
+		if { : > /dev/tty; } 2>/dev/null; then
+			ask_exit_auth
+		else
+			die "нужен доступ к старому серверу: EXIT_PASS='root-пароль' либо --exit-ssh-key ПУТЬ (EXIT_KEY_PASS — если у ключа парольная фраза)"
+		fi
 	fi
 fi
+# Дальше на вопросы отвечают только через /dev/tty. Служебные программы (openssl s_client, apt, ssh…)
+# терминал не читают — иначе съели бы клавиши, нажатые во время установки, или ответ на следующий вопрос.
+# Запуск через конвейер (stdin — не терминал) не трогаем: тогда bash читает из stdin сам скрипт.
+if [ -t 0 ]; then exec < /dev/null; fi
 case $WARP_CMD in
 	"") ;;
 	off | direct) TARGET_EXIT=direct ;;
@@ -893,19 +951,74 @@ json.dump({"tag": "chain", "protocol": "vless",
 PY
 }
 
-ssh_exit() {  # ssh на старый сервер (пароль из EXIT_PASS или ключ)
+exit_ssh_opts() {  # общие опции ssh/scp к старому серверу; ключ — только он и без вопросов, пароль — без попыток ключей
+	EXIT_SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts")
 	if [ -n "$EXIT_SSH_KEY" ]; then
-		ssh -i "$EXIT_SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts" -p "$EXIT_SSH_PORT" "root@$EXIT_HOST" "$@"
+		EXIT_SSH_OPTS+=(-i "$EXIT_SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o PasswordAuthentication=no)
 	else
-		SSHPASS="${EXIT_PASS:-}" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts" -p "$EXIT_SSH_PORT" "root@$EXIT_HOST" "$@"
+		EXIT_SSH_OPTS+=(-o PubkeyAuthentication=no)
+	fi
+}
+ssh_exit() {  # ssh на старый сервер (ключ EXIT_SSH_KEY, иначе пароль из EXIT_PASS); -n — не трогать терминал
+	exit_ssh_opts
+	if [ -n "$EXIT_SSH_KEY" ]; then
+		ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "root@$EXIT_HOST" "$@"
+	else
+		SSHPASS="${EXIT_PASS:-}" sshpass -e ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "root@$EXIT_HOST" "$@"
 	fi
 }
 scp_exit() {  # scp файла $1 на старый сервер в $2
+	exit_ssh_opts
 	if [ -n "$EXIT_SSH_KEY" ]; then
-		scp -i "$EXIT_SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts" -P "$EXIT_SSH_PORT" "$1" "root@$EXIT_HOST:$2"
+		scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "root@$EXIT_HOST:$2"
 	else
-		SSHPASS="${EXIT_PASS:-}" sshpass -e scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o "UserKnownHostsFile=$WORK/exit_known_hosts" -P "$EXIT_SSH_PORT" "$1" "root@$EXIT_HOST:$2"
+		SSHPASS="${EXIT_PASS:-}" sshpass -e scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "root@$EXIT_HOST:$2"
 	fi
+}
+
+prepare_exit_key() {  # ключ (вставленный или файл) → $WORK/exit_key: OpenSSH, права 600, без \r, без парольной фразы
+	local k=$WORK/exit_key src=$WORK/exit_key.src ppf=$WORK/exit_key.pp err pp=${EXIT_KEY_PASS:-}
+	if [ -n "$EXIT_KEY_TEXT" ]; then
+		(umask 077 && printf '%s\n' "$EXIT_KEY_TEXT" | tr -d '\r' | normalize_key > "$src") || { CHAIN_ERR="не удалось сохранить ключ"; return 1; }
+	else
+		(umask 077 && tr -d '\r' < "$EXIT_SSH_KEY" | normalize_key > "$src") || { CHAIN_ERR="не удалось прочитать ключ $EXIT_SSH_KEY"; return 1; }
+	fi
+	EXIT_KEY_TEXT=
+	if grep -q '^PuTTY-User-Key-File' "$src"; then   # ключ PuTTY (.ppk) — в формат OpenSSH
+		command -v puttygen >/dev/null || "${APT[@]}" install putty-tools >/dev/null 2>&1 ||
+			{ CHAIN_ERR="это ключ PuTTY (.ppk), а putty-tools не установился — сохраните ключ в PuTTYgen: Conversions → Export OpenSSH key"; return 1; }
+		(umask 077 && : > "$ppf")
+		if ! grep -q '^Encryption: none' "$src"; then
+			if [ -z "$pp" ] && { : > /dev/tty; } 2>/dev/null; then
+				printf 'Ключ защищён парольной фразой — введите её (не отобразится): ' > /dev/tty
+				IFS= read -rs pp < /dev/tty || true; echo > /dev/tty
+			fi
+			[ -n "$pp" ] || { CHAIN_ERR="ключ PuTTY защищён парольной фразой — передайте её в EXIT_KEY_PASS"; return 1; }
+			printf '%s' "$pp" > "$ppf"
+		fi
+		if ! puttygen "$src" --old-passphrase "$ppf" -O private-openssh -o "$k" >/dev/null 2>&1; then
+			rm -f "$ppf" "$src"; CHAIN_ERR="ключ PuTTY не перевёлся в OpenSSH (неверная парольная фраза?)"; return 1
+		fi
+		rm -f "$ppf" "$src"
+	else
+		mv -f "$src" "$k"
+	fi
+	chmod 600 "$k"
+	if ! err=$(ssh-keygen -y -P "" -f "$k" 2>&1 >/dev/null); then
+		if grep -qi passphrase <<<"$err"; then
+			if [ -z "$pp" ] && { : > /dev/tty; } 2>/dev/null; then
+				printf 'Ключ защищён парольной фразой — введите её (не отобразится): ' > /dev/tty
+				IFS= read -rs pp < /dev/tty || true; echo > /dev/tty
+			fi
+			[ -n "$pp" ] || { CHAIN_ERR="ключ защищён парольной фразой — передайте её в EXIT_KEY_PASS"; return 1; }
+			ssh-keygen -p -P "$pp" -N "" -f "$k" >/dev/null 2>&1 || { CHAIN_ERR="парольная фраза к ключу не подошла"; return 1; }
+		else
+			CHAIN_ERR="ключ не читается — нужен приватный ключ целиком, от -----BEGIN до -----END ($(tr '\n' ' ' <<<"$err" | head -c 120))"
+			return 1
+		fi
+	fi
+	EXIT_SSH_KEY=$k
+	ok "SSH-ключ к старому серверу прочитан ($(ssh-keygen -l -f "$k" 2>/dev/null | awk '{print $NF}' | tr -d '()'))"
 }
 
 emit_exit_setup() {  # пишет в $WORK/exit-setup.sh скрипт настройки старого сервера (запускается там)
@@ -1086,11 +1199,21 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 	CHAIN_IP=$EXIT_HOST
 	CHAIN_PORT=${EXIT_PORT_ARG:-${CHAIN_PORT:-2087}}
 	"${APT[@]}" install openssh-client >/dev/null 2>&1 || true
+	if [ -n "$EXIT_KEY_TEXT" ] || [ -n "$EXIT_SSH_KEY" ]; then prepare_exit_key || return 1; fi
 	if [ -z "$EXIT_SSH_KEY" ] && ! command -v sshpass >/dev/null; then
 		"${APT[@]}" install sshpass >/dev/null 2>&1 || { CHAIN_ERR="не установился sshpass (вход по паролю к старому серверу)"; return 1; }
 	fi
 	: > "$WORK/exit_known_hosts"
-	if ! ssh_exit true >/dev/null 2>&1; then CHAIN_ERR="SSH к старому серверу $EXIT_HOST:$EXIT_SSH_PORT не прошёл (адрес/порт/пароль?)"; return 1; fi
+	local sshe
+	if ! sshe=$(ssh_exit true 2>&1 >/dev/null); then
+		sshe=$(grep -v '^Warning: Permanently added' <<<"$sshe" | tail -1)
+		if [ -n "$EXIT_SSH_KEY" ]; then
+			CHAIN_ERR="SSH к старому серверу $EXIT_HOST:$EXIT_SSH_PORT по ключу не прошёл (${sshe:-нет ответа}) — публичная часть ключа должна быть в /root/.ssh/authorized_keys старого сервера"
+		else
+			CHAIN_ERR="SSH к старому серверу $EXIT_HOST:$EXIT_SSH_PORT по паролю не прошёл (${sshe:-нет ответа}) — проверь адрес, порт и пароль; если root там входит только по ключу — выбери вход по ключу"
+		fi
+		return 1
+	fi
 	# Ключи цепочки генерируем на новом сервере (у него есть xray); приватный уйдёт в вход старого по SSH.
 	if [ -z "$CHAIN_PRIV" ]; then
 		local kk
@@ -1903,6 +2026,12 @@ if [ "$EXIT_MODE" = chain ]; then
 		systemctl stop x-ui
 		xui_set "xrayTemplateConfig=$(template_json direct -)"
 	fi
+fi
+if [ "$EXIT_MODE" != chain ] && grep -qs 'EXIT_IP=' /etc/systemd/system/vpn-exit-watchdog.service; then
+	systemctl disable --now vpn-exit-watchdog >/dev/null 2>&1 || true
+	rm -f /etc/systemd/system/vpn-exit-watchdog.service /usr/local/bin/vpn-exit-watchdog.sh
+	systemctl daemon-reload 2>/dev/null || true
+	ok "вотчдог цепочки снят — выход больше не через другой сервер"
 fi
 save_state
 systemctl restart x-ui || bad "x-ui не перезапустился (journalctl -u x-ui)"
@@ -2987,8 +3116,9 @@ vpn-check
 
 ## Выход через другой сервер (chain)
 
-При установке можно выбрать пункт «через другой мой сервер» (или `--exit chain --exit-host IP_СТАРОГО`,
-пароль root старого — в `EXIT_PASS=…` или спросит). Тогда новый сервер сам зайдёт на старый по SSH,
+При установке можно выбрать пункт «через другой мой сервер» (или `--exit chain --exit-host IP_СТАРОГО`).
+Вход на старый — по паролю root или по SSH-ключу: ключ можно вставить целиком (OpenSSH, PEM, PKCS#8,
+PuTTY .ppk) или указать файл (`--exit-ssh-key`, парольная фраза — `EXIT_KEY_PASS`). Тогда новый сервер сам зайдёт на старый по SSH,
 поднимет там лёгкий вход Xray и пустит весь трафик новый → старый → интернет — сайты будут видеть IP
 старого сервера. Заодно регистрируется WARP и ставится вотчдог: упадёт старый — трафик уходит на WARP
 и возвращается, когда старый поднимется (`vpn-check` / `vpn-warp` показывают, что активно сейчас).
