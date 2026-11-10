@@ -475,6 +475,11 @@ test_decide_nodomain_never_asks() {
 	bot_decide
 	t_eq 0 "$BOT_DO" "без домена не ставить"; t_eq 0 "$BOT_ASK" "без домена не спрашивать"
 }
+test_decide_domain_not_in_cloudflare_never_asks() {  # «домен не в Cloudflare» — бот невозможен, не предлагать
+	decide_env; DNS_NOT_CF=1; answers y
+	bot_decide
+	t_eq 0 "$BOT_ASK" "не спрашивать"; t_eq 0 "$BOT_DO" "не ставить"
+}
 test_rerun_without_tokens_keeps_bot() {
 	decide_env; S_BOT=1
 	bot_decide
@@ -782,6 +787,231 @@ test_ssh_key_only_ignores_bot_key() {  # I5: ключ бота — не ключ
 }
 test_hints_never_put_tokens_in_history() {  # I7: токен в командной строке — это /root/.bash_history
 	! grep -nE '(CF_API_TOKEN|VPN_BOT_TOKEN)=…' "$ROOT/src/install-vpn.sh.in" "$ROOT/README.md" || t_fail "подсказка с токеном в командной строке"
+}
+
+# ——— домен из Cloudflare (10.11): выбор на вопросах, запись — на шаге DNS ———
+test_template_url_without_python() {  # ссылка нужна на первом же вопросе, а python3 там может не быть
+	local out
+	out=$(PATH=/nonexistent bot_template_url)
+	t_eq "$(bot_template_url)" "$out" "без python3 та же ссылка"
+	t_has 'permissionGroupKeys=' "$out" "права в ссылке"
+}
+zones_env() {  # токен уже введён; в аккаунте два домена; IP сервера 1.2.3.4
+	base_env; DOMAIN=
+	bot_public_ip() { echo 1.2.3.4; }
+	cf_set "GET /zones?per_page=50" '{"success":true,"result":[{"id":"Z1","name":"example.com","status":"active"},{"id":"Z2","name":"other.org","status":"active"}]}'
+}
+one_zone() { cf_set "GET /zones?per_page=50" '{"success":true,"result":[{"id":"Z1","name":"example.com","status":"active"}]}'; }
+recs() {  # recs ЗОНА ИМЯ 'записи JSON' — что Cloudflare знает об имени
+	cf_set "GET /zones/$1/dns_records?name=$2&per_page=100" "{\"success\":true,\"result\":$3}"
+}
+test_cf_zones_lists_active() {
+	zones_env
+	cf_set "GET /zones?per_page=50" '{"success":true,"result":[{"id":"Z1","name":"example.com","status":"active"},{"id":"Z3","name":"pending.net","status":"pending"}]}'
+	cf_zones || t_fail "не прочитал: $BOT_ERR"
+	t_eq "$(printf 'Z1\texample.com')" "$DNS_ZONES" "только активные"
+}
+test_cf_zones_bad_token() {
+	zones_env
+	cf_set "GET /zones?per_page=50" '{"success":false,"errors":[{"code":1000,"message":"Invalid API Token"}]}'
+	! cf_zones > /dev/null || t_fail "плохой токен прошёл"
+	t_has "не принял токен" "$BOT_ERR" "понятная причина"
+}
+test_dns_pick_single_zone_apex() {
+	zones_env; one_zone; recs Z1 example.com '[]'
+	answers ''
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq example.com "$DOMAIN" "сам домен"; t_eq Z1 "$DNS_ZONE_ID" "зона"; t_eq 0 "$DNS_REPOINT" "перенаправлять нечего"
+	! grep -q 'Какой взять' "$WORK/tty.out" || t_fail "спросил, какой из одного"
+}
+test_dns_pick_zone_and_subdomain() {
+	zones_env; recs Z2 vpn.other.org '[]'
+	answers 2 vpn
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq vpn.other.org "$DOMAIN" "поддомен второго домена"; t_eq Z2 "$DNS_ZONE_ID" "зона"
+	grep -q '2) other.org' "$WORK/tty.out" || t_fail "нет списка доменов"
+}
+test_dns_pick_full_name() {
+	zones_env; recs Z1 vpn.example.com '[]'
+	answers 1 VPN.Example.com
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq vpn.example.com "$DOMAIN" "полное имя принято"
+}
+test_dns_pick_bad_choice_reasks() {
+	zones_env; recs Z1 example.com '[]'
+	answers 7 1 ''
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq example.com "$DOMAIN" "со второй попытки"
+}
+test_dns_pick_other_ip_declined_asks_name_again() {  # запись указывает на чужой IP: по умолчанию не трогаем
+	zones_env; one_zone
+	recs Z1 example.com '[{"id":"R1","type":"A","name":"example.com","content":"9.9.9.9","proxied":false}]'
+	recs Z1 vpn.example.com '[]'
+	answers '' n vpn
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq vpn.example.com "$DOMAIN" "взял другое имя"; t_eq 0 "$DNS_REPOINT" "без перенаправления"
+	t_has "9.9.9.9" "$(cat "$WORK/tty.out")" "вопрос называет нынешний адрес"
+	grep -q '\[y/N\]' "$WORK/tty.out" || t_fail "вопрос не [y/N]"
+}
+test_dns_pick_other_ip_consented() {
+	zones_env; one_zone
+	recs Z1 example.com '[{"id":"R1","type":"A","name":"example.com","content":"9.9.9.9","proxied":true}]'
+	answers '' y
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq example.com "$DOMAIN" "домен"; t_eq 1 "$DNS_REPOINT" "согласие запомнено"
+}
+test_dns_pick_points_here_no_question() {
+	zones_env; one_zone
+	recs Z1 example.com '[{"id":"R1","type":"A","name":"example.com","content":"1.2.3.4","proxied":true}]'
+	answers ''
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	! grep -q '\[y/N\]' "$WORK/tty.out" || t_fail "лишний вопрос: запись уже указывает сюда"
+	t_eq 0 "$DNS_REPOINT" "перенаправлять нечего"
+}
+test_dns_pick_aaaa_needs_consent() {
+	zones_env; one_zone
+	recs Z1 example.com '[{"id":"R2","type":"AAAA","name":"example.com","content":"2001:db8::1","proxied":false}]'
+	answers '' n example.com y
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_has "2001:db8::1" "$(cat "$WORK/tty.out")" "вопрос называет AAAA"
+	t_eq 1 "$DNS_REPOINT" "согласие со второго раза"
+}
+test_dns_pick_no_zones() {
+	zones_env; cf_set "GET /zones?per_page=50" '{"success":true,"result":[]}'
+	answers ''
+	! dns_pick || t_fail "выбрал из пустого списка"
+	t_has "нет доменов" "$BOT_ERR" "причина"
+}
+dns_env() {  # шаг DNS: известен IP сервера, зона и имя
+	base_env; good_cf; cf_stub_capture
+	DOMAIN=vpn.example.com PUBLIC_IP=1.2.3.4 DNS_ZONE_ID=Z1 DNS_REPOINT=0
+}
+cf_writes() { grep -E '^(POST|PATCH|PUT|DELETE) /zones/' "$WORK/cf.calls" || true; }
+body_of() {  # body_of 'МЕТОД ПУТЬ' → тело этого запроса
+	local n; n=$(grep -nxF "$1" "$WORK/cf.calls" | head -1 | cut -d: -f1)
+	[ -n "$n" ] && cat "$WORK/cap.$n.req.json"
+}
+test_dns_apply_creates_record() {
+	dns_env; recs Z1 vpn.example.com '[]'
+	dns_apply || t_fail "не создал: $BOT_ERR"
+	local b; b=$(body_of "POST /zones/Z1/dns_records")
+	t_has '"type": "A"' "$b" "тип"; t_has '"name": "vpn.example.com"' "$b" "имя"
+	t_has '"content": "1.2.3.4"' "$b" "адрес"; t_has '"proxied": false' "$b" "без облака"
+	t_has "vpn.example.com" "$DNS_REPORT" "в отчёте"
+}
+test_dns_apply_points_here_untouched() {
+	dns_env; recs Z1 vpn.example.com '[{"id":"R1","type":"A","name":"vpn.example.com","content":"1.2.3.4","proxied":false}]'
+	dns_apply || t_fail "упал: $BOT_ERR"
+	t_eq "" "$(cf_writes)" "ничего не писал"
+}
+test_dns_apply_turns_off_proxy_here() {
+	dns_env; recs Z1 vpn.example.com '[{"id":"R1","type":"A","name":"vpn.example.com","content":"1.2.3.4","proxied":true}]'
+	dns_apply || t_fail "упал: $BOT_ERR"
+	t_eq "PATCH /zones/Z1/dns_records/R1" "$(cf_writes)" "только облако"
+	t_has '"proxied": false' "$(body_of "PATCH /zones/Z1/dns_records/R1")" "облако выключено"
+}
+test_dns_apply_other_ip_needs_consent() {
+	dns_env; recs Z1 vpn.example.com '[{"id":"R1","type":"A","name":"vpn.example.com","content":"9.9.9.9","proxied":false}]'
+	answers ''   # Enter — «нет»
+	! dns_apply || t_fail "перенаправил без согласия"
+	t_eq "" "$(cf_writes)" "ничего не писал"
+	t_has "9.9.9.9" "$BOT_ERR" "причина называет адрес"
+}
+test_dns_apply_asks_in_terminal() {  # --domain в терминале: выбора из списка не было — спросить на шаге DNS
+	dns_env; recs Z1 vpn.example.com '[{"id":"R1","type":"A","name":"vpn.example.com","content":"9.9.9.9","proxied":false}]'
+	answers y
+	dns_apply || t_fail "не перенаправил с согласием: $BOT_ERR"
+	t_has '"content": "1.2.3.4"' "$(body_of "PATCH /zones/Z1/dns_records/R1")" "перенаправлено"
+	t_has "9.9.9.9" "$(cat "$WORK/tty.out")" "вопрос называет нынешний адрес"
+	grep -q '\[y/N\]' "$WORK/tty.out" || t_fail "вопрос не [y/N]"
+}
+test_dns_apply_repoint_with_consent() {
+	dns_env; DNS_REPOINT=1
+	recs Z1 vpn.example.com '[{"id":"R1","type":"A","name":"vpn.example.com","content":"9.9.9.9","proxied":true},{"id":"R2","type":"AAAA","name":"vpn.example.com","content":"2001:db8::1","proxied":false},{"id":"R3","type":"A","name":"vpn.example.com","content":"8.8.8.8","proxied":false}]'
+	dns_apply || t_fail "не перенаправил: $BOT_ERR"
+	local b; b=$(body_of "PATCH /zones/Z1/dns_records/R1")
+	t_has '"content": "1.2.3.4"' "$b" "адрес"; t_has '"proxied": false' "$b" "без облака"
+	grep -qx 'DELETE /zones/Z1/dns_records/R2' "$WORK/cf.calls" || t_fail "AAAA не удалена"
+	grep -qx 'DELETE /zones/Z1/dns_records/R3' "$WORK/cf.calls" || t_fail "лишняя A не удалена"
+}
+test_dns_apply_cname_replaced_with_consent() {
+	dns_env; DNS_REPOINT=1
+	recs Z1 vpn.example.com '[{"id":"C1","type":"CNAME","name":"vpn.example.com","content":"x.herokudns.com","proxied":false}]'
+	dns_apply || t_fail "не заменил: $BOT_ERR"
+	grep -qx 'DELETE /zones/Z1/dns_records/C1' "$WORK/cf.calls" || t_fail "CNAME не удалён"
+	t_has '"content": "1.2.3.4"' "$(body_of "POST /zones/Z1/dns_records")" "A-запись создана"
+	local d p; d=$(grep -nx 'DELETE /zones/Z1/dns_records/C1' "$WORK/cf.calls" | cut -d: -f1); p=$(grep -nx 'POST /zones/Z1/dns_records' "$WORK/cf.calls" | cut -d: -f1)
+	[ "$d" -lt "$p" ] || t_fail "A создаётся раньше, чем ушёл CNAME (Cloudflare не даст)"
+}
+test_dns_apply_cname_needs_consent() {
+	dns_env; recs Z1 vpn.example.com '[{"id":"C1","type":"CNAME","name":"vpn.example.com","content":"x.herokudns.com","proxied":false}]'
+	answers ''
+	! dns_apply || t_fail "заменил CNAME без согласия"
+	t_eq "" "$(cf_writes)" "ничего не писал"
+	t_has "x.herokudns.com" "$BOT_ERR" "причина называет, куда ведёт CNAME"
+}
+test_dns_apply_write_refused() {
+	dns_env; recs Z1 vpn.example.com '[]'
+	cf_set "POST /zones/Z1/dns_records" '{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}'
+	! dns_apply || t_fail "сделал вид, что создал"
+	t_has "Authentication error" "$BOT_ERR" "причина от Cloudflare"
+}
+test_dns_find_zone_from_parent() {  # без терминала (--domain): зона — по имени
+	base_env; good_cf; DNS_ZONE_ID=
+	dns_find_zone || t_fail "не нашёл: $BOT_ERR"
+	t_eq Z1 "$DNS_ZONE_ID" "зона родителя"
+}
+test_dns_ask_token_retries() {  # первый токен не подошёл — спросить ещё раз, второй берётся
+	base_env; rm -f "$BOT_DIR/cf.hdr" "$BOT_DIR/cf.token"
+	cf_api() {
+		printf '%s\n' "$1 $2" >> "$WORK/cf.calls"
+		if grep -q good "$BOT_DIR/cf.hdr"; then echo '{"success":true,"result":[{"id":"Z1","name":"example.com","status":"active"}]}'
+		else echo '{"success":false,"errors":[{"code":1000,"message":"Invalid API Token"}]}'; fi
+	}
+	answers bad good
+	dns_ask_token || t_fail "не принял второй токен: $BOT_ERR"
+	t_eq 2 "$(grep -o 'Токен Cloudflare (не отобразится)' "$WORK/tty.out" | wc -l)" "спросил дважды"
+	grep -q 'Invalid API Token' "$WORK/tty.out" || t_fail "не сказал, почему первый не подошёл"
+	grep -q 'permissionGroupKeys' "$WORK/tty.out" || t_fail "нет ссылки на токен"
+}
+test_dns_ask_token_from_env() {  # токен дан окружением (CF_API_TOKEN) — не спрашивать
+	base_env
+	cf_set "GET /zones?per_page=50" '{"success":true,"result":[{"id":"Z1","name":"example.com","status":"active"}]}'
+	answers never-asked
+	dns_ask_token || t_fail "не принял токен из окружения: $BOT_ERR"
+	! grep -q 'не отобразится' "$WORK/tty.out" 2> /dev/null || t_fail "спросил токен, хотя он дан"
+	t_has example.com "$DNS_ZONES" "домены прочитаны"
+}
+test_dns_wait_until_visible() {
+	base_env; DOMAIN=vpn.example.com PUBLIC_IP=1.2.3.4 DNS_WAIT_SLEEP=0
+	resolve() { local n; n=$(($(cat "$WORK/rs.n" 2> /dev/null || echo 0) + 1)); echo "$n" > "$WORK/rs.n"; [ "$n" -lt 3 ] || echo 1.2.3.4; }
+	dns_wait || t_fail "не дождался"
+	t_eq 3 "$(cat "$WORK/rs.n")" "опросов DNS"
+}
+test_dns_wait_gives_up() {
+	base_env; DOMAIN=vpn.example.com PUBLIC_IP=1.2.3.4 DNS_WAIT_SLEEP=0 DNS_WAIT_TRIES=2
+	resolve() { echo 9.9.9.9; }
+	! dns_wait || t_fail "дождался чужого адреса"
+}
+test_need_python_no_apt_when_present() {
+	base_env; mkdir -p "$WORK/bin"
+	printf '#!/bin/bash\necho "$@" >> "$WORK/apt.calls"\n' > "$WORK/bin/apt-get"; chmod +x "$WORK/bin/apt-get"
+	PATH="$WORK/bin:$PATH" bot_need_python || t_fail "упала при python3 на месте"
+	[ ! -e "$WORK/apt.calls" ] || t_fail "звала apt, хотя python3 и curl есть"
+}
+test_have_cf_token_from_file() {  # токен ввели на выборе домена — второй раз его не спрашивать
+	base_env
+	BOT_CF_TOKEN=''
+	bot_have_cf_token || t_fail "токен в файле не увиден"
+	rm -f "$BOT_DIR/cf.hdr"
+	! bot_have_cf_token || t_fail "токена нет, а он «есть»"
+}
+test_read_tokens_skips_cf_when_in_file() {
+	base_env; BOT_CF_TOKEN='' BOT_TG_TOKEN='' S_BOT=''
+	answers TGTOKEN
+	bot_read_tokens
+	! grep -q 'Токен Cloudflare' "$WORK/tty.out" || t_fail "токен Cloudflare спрошен второй раз"
+	t_eq TGTOKEN "$BOT_TG_TOKEN" "токен бота"
 }
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———

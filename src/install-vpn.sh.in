@@ -20,7 +20,8 @@
 #   bash install-vpn.sh --check                   — проверить уже установленный VPN (ничего не меняет)
 #
 # Опции:
-#   --domain ДОМЕН    свой домен, A-запись которого уже указывает на этот сервер
+#   --domain ДОМЕН    свой домен: A-запись на этот сервер (с токеном Cloudflare в CF_API_TOKEN скрипт
+#                     поставит её сам, если её нет; без флага в терминале — выбор домена из Cloudflare)
 #   --no-domain       без домена: Reality на 2083 под крупный чужой сайт
 #   --sni САЙТ        (без домена) под какой сайт маскироваться вместо автовыбора, например www.samsung.com
 #   --panel-local     (без домена) панель только на 127.0.0.1 — заходить через SSH-туннель, снаружи не видна
@@ -201,6 +202,12 @@ exit_ssh_defaults() {  # пользователь и порт SSH старого
 __EMBED_BOT_FUNCS__
 __EMBED_BOT_BUNDLE__
 
+# Токены — сразу из окружения: токен Cloudflare нужен уже на первом вопросе (домен выбирается из списка).
+BOT_CF_TOKEN=${CF_API_TOKEN:-}
+BOT_TG_TOKEN=${VPN_BOT_TOKEN:-}
+unset CF_API_TOKEN VPN_BOT_TOKEN   # дальше токены — только в переменных скрипта и файлах 600
+DNS_FROM_CF=0 DNS_NOT_CF=0 DNS_ZONES='' DNS_ZONE_ID='' DNS_REPOINT=0 DNS_REPORT=''
+
 MODE=
 S_MODE=$(state_val S_MODE || true)
 S_DOMAIN_OLD=$(state_val S_DOMAIN || true)
@@ -240,20 +247,32 @@ else
 		cat > /dev/tty <<'EOF'
 
 Есть ли у вас свой домен для этого сервера?
-  1) Да  — лучше: маскировка под свой сайт, подписки в приложениях обновляются сами,
-           панель открывается по адресу домена. Нужна A-запись домена на IP этого сервера.
-  2) Нет — маскировка под крупный чужой сайт. Ссылки привязаны к IP сервера
+  1) Да, в Cloudflare — лучше всего: скрипт сам направит домен на этот сервер (нужен токен
+           Cloudflare), маскировка под свой сайт, подписки в приложениях обновляются сами,
+           панель — по адресу домена; можно поставить Телеграм-бота.
+  2) Да, но не в Cloudflare — то же, но A-запись домена на IP сервера сделаете сами (без бота).
+  3) Нет — маскировка под крупный чужой сайт. Ссылки привязаны к IP сервера
            (переедете на другой сервер — ссылки раздать заново), панель — по IP сервера.
 EOF
 		while [ -z "$MODE" ]; do
-			printf 'Ваш выбор [1/2]: ' > /dev/tty
+			printf 'Ваш выбор [1/2/3]: ' > /dev/tty
 			read -r ans < /dev/tty || die "не удалось прочитать ответ"
 			case $ans in
-				1 | да | Да | ДА | y | Y | yes) MODE=domain ;;
-				2 | нет | Нет | НЕТ | n | N | no) MODE=nodomain ;;
+				1) MODE=domain DNS_FROM_CF=1 ;;
+				2) MODE=domain DNS_NOT_CF=1 ;;
+				3 | нет | Нет | НЕТ | n | N | no) MODE=nodomain ;;
 			esac
 		done
-		if [ "$MODE" = domain ]; then
+		if [ "$DNS_FROM_CF" = 1 ]; then
+			# Сначала токен, потом домен — из тех, что в Cloudflare; запись поставит шаг DNS (там уже известен IP).
+			bot_need_python || die "не установились python3 и curl (apt занят или нет сети) — запустите скрипт ещё раз"
+			if ! { dns_ask_token && dns_pick; }; then
+				warn "домен из Cloudflare выбрать не вышло: $BOT_ERR"
+				printf 'Тогда впишите домен вручную, а A-запись на IP сервера сделайте сами.\n' > /dev/tty
+				DNS_FROM_CF=0 DNS_NOT_CF=1
+			fi
+		fi
+		if [ "$MODE" = domain ] && [ -z "$DOMAIN" ]; then
 			printf 'Домен (например vpn.example.com): ' > /dev/tty
 			read -r DOMAIN < /dev/tty || true
 		fi
@@ -449,9 +468,6 @@ if [ "$EXIT_MODE" = chain ]; then
 	fi
 fi
 # --- Телеграм-бот: решить и спросить токены сейчас, проверить — после установки пакетов ---
-BOT_CF_TOKEN=${CF_API_TOKEN:-}
-BOT_TG_TOKEN=${VPN_BOT_TOKEN:-}
-unset CF_API_TOKEN VPN_BOT_TOKEN   # дальше токены — только в переменных скрипта и файлах 600
 S_BOT=$(state_val S_BOT || true)
 S_BOT_USER=$(state_val S_BOT_USER || true)
 S_BOT_ORIGIN=$(state_val S_BOT_ORIGIN || true)
@@ -2038,6 +2054,7 @@ on_exit() {
 		if [ "$WD_WAS_ACTIVE" = 1 ]; then systemctl start vpn-exit-watchdog >/dev/null 2>&1 || true; fi
 	fi
 	rm -rf "$WORK" "$CHK_OUT"
+	[ -z "${BOT_DIR:-}" ] || rm -rf "$BOT_DIR"   # каталог токенов с вопросов (вне $WORK)
 }
 trap on_exit EXIT
 
@@ -2159,6 +2176,22 @@ if [ "$MODE" = domain ]; then ok "порты 80, 443 и $REALITY_PORT свобо
 detect_ips
 if [ "$PUBLIC_IP" = "$LISTEN_IP" ]; then ok "IP сервера $PUBLIC_IP"; else ok "IP сервера $PUBLIC_IP (на интерфейсе $LISTEN_IP — сервер за NAT, так тоже работает)"; fi
 ip_precheck
+
+# Есть токен Cloudflare — A-запись ставит сам скрипт: создаёт, выключает облако; запись на чужой IP — только
+# с согласием, данным на вопросах (без терминала — останавливается). Дальше — обычная проверка через DNS.
+if [ "$MODE" = domain ] && [ "$SKIP_DNS" = 0 ] && [ "$DNS_NOT_CF" = 0 ] && bot_have_cf_token; then
+	bot_init_secrets
+	if [ -n "$DNS_ZONE_ID" ] || dns_find_zone; then
+		dns_apply || die "$BOT_ERR"
+		if [ -n "$DNS_REPORT" ]; then
+			while IFS= read -r l; do [ -z "$l" ] || ok "$l"; done <<< "$DNS_REPORT"
+			dns_wait || warn "DNS ещё не отдаёт $DOMAIN → $PUBLIC_IP — проверяю как обычно"
+		fi
+	else
+		warn "${BOT_ERR:-токен Cloudflare не видит домен $DOMAIN} — A-запись проверяю как обычно"
+	fi
+	[ "$BOT_DO" = 1 ] || bot_wipe   # без бота токен был нужен только для DNS
+fi
 
 if [ "$MODE" = nodomain ]; then
 	:

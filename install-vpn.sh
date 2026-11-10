@@ -20,7 +20,8 @@
 #   bash install-vpn.sh --check                   — проверить уже установленный VPN (ничего не меняет)
 #
 # Опции:
-#   --domain ДОМЕН    свой домен, A-запись которого уже указывает на этот сервер
+#   --domain ДОМЕН    свой домен: A-запись на этот сервер (с токеном Cloudflare в CF_API_TOKEN скрипт
+#                     поставит её сам, если её нет; без флага в терминале — выбор домена из Cloudflare)
 #   --no-domain       без домена: Reality на 2083 под крупный чужой сайт
 #   --sni САЙТ        (без домена) под какой сайт маскироваться вместо автовыбора, например www.samsung.com
 #   --panel-local     (без домена) панель только на 127.0.0.1 — заходить через SSH-туннель, снаружи не видна
@@ -251,8 +252,15 @@ except Exception:
 print("%s (код %s)" % (e.get("message") or "нет ответа", e.get("code", "-")))'
 }
 
-bot_init_secrets() {  # BOT_CF_TOKEN / BOT_TG_TOKEN → файлы в $WORK/bot (600), переменные стираются
-	BOT_DIR=$WORK/bot
+bot_init_secrets() {  # BOT_CF_TOKEN / BOT_TG_TOKEN → файлы в $BOT_DIR (600), переменные стираются
+	if [ -z "${BOT_DIR:-}" ]; then
+		if [ -n "${WORK:-}" ]; then
+			BOT_DIR=$WORK/bot
+		else   # вопросы установщика идут раньше, чем появляется $WORK: свой каталог (его убирает и on_exit)
+			BOT_DIR=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/vpn-bot.XXXXXX")
+			trap 'rm -rf "$BOT_DIR"' EXIT
+		fi
+	fi
 	(umask 077 && mkdir -p "$BOT_DIR")
 	if [ -n "${BOT_CF_TOKEN:-}" ]; then
 		(umask 077 && printf 'Authorization: Bearer %s\n' "$BOT_CF_TOKEN" > "$BOT_DIR/cf.hdr" && printf '%s' "$BOT_CF_TOKEN" > "$BOT_DIR/cf.token")
@@ -260,6 +268,7 @@ bot_init_secrets() {  # BOT_CF_TOKEN / BOT_TG_TOKEN → файлы в $WORK/bot 
 	if [ -n "${BOT_TG_TOKEN:-}" ]; then (umask 077 && printf '%s' "$BOT_TG_TOKEN" > "$BOT_DIR/tg.token"); fi
 	unset BOT_CF_TOKEN BOT_TG_TOKEN
 }
+bot_have_cf_token() { [ -n "${BOT_CF_TOKEN:-}" ] || { [ -n "${BOT_DIR:-}" ] && [ -s "$BOT_DIR/cf.hdr" ]; }; }
 
 cf_api() {  # cf_api МЕТОД ПУТЬ [аргументы curl…] → тело ответа; код ≠ 0 — нет ответа
 	local m=$1 p=$2
@@ -280,13 +289,9 @@ tg_api() {  # tg_api МЕТОД [JSON_ФАЙЛ] → тело ответа; то�
 	return "$rc"
 }
 
-bot_template_url() {  # ссылка на создание токена Cloudflare с уже отмеченными правами
-	python3 -I -c '
-import json, urllib.parse as u
-p = [{"key": "workers_scripts", "type": "edit"}, {"key": "workers_kv_storage", "type": "edit"},
-     {"key": "account_settings", "type": "read"}, {"key": "zone", "type": "read"}, {"key": "dns", "type": "edit"}]
-print("https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys="
-      + u.quote(json.dumps(p, separators=(",", ":")), safe="") + "&accountId=%2A&zoneId=all&name=vpn-bot")'
+bot_template_url() {  # ссылка на создание токена Cloudflare с уже отмеченными правами — строкой: на первом вопросе
+	# python3 может ещё не быть. В ней: workers_scripts edit, workers_kv_storage edit, account_settings read, zone read, dns edit
+	printf '%s\n' 'https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22zone%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22dns%22%2C%22type%22%3A%22edit%22%7D%5D&accountId=%2A&zoneId=all&name=vpn-bot'
 }
 
 bot_zone_candidates() {  # ИМЯ → само имя и родительские вплоть до двух меток, по строке
@@ -305,6 +310,212 @@ try:
     print(((json.load(sys.stdin).get("errors") or [{}])[0]).get("code", ""))
 except Exception:
     print("")'; }
+
+# ——— домен из Cloudflare: выбор на вопросах (dns_ask_token, dns_pick), запись — на шаге DNS (dns_apply) ———
+bot_need_python() {  # python3 и curl нужны уже на вопросах (ответы Cloudflare); нет — поставить
+	command -v python3 > /dev/null && command -v curl > /dev/null && return 0
+	bot_say "Ставлю python3 и curl — без них не спросить Cloudflare о доменах…"
+	apt-get -y -q -o DPkg::Lock::Timeout=600 update > /dev/null 2>&1 || true
+	apt-get -y -q -o DPkg::Lock::Timeout=600 install python3 curl ca-certificates > /dev/null 2>&1
+}
+
+bot_public_ip() {  # внешний IPv4 — на вопросах (detect_ips установщика определена ниже); не узнать — пусто
+	local u ip
+	for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+		ip=$(curl -4 -fsS --max-time 8 "$u" 2> /dev/null | tr -d '[:space:]') || true
+		if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then printf '%s' "$ip"; return 0; fi
+	done
+}
+
+cf_zones() {  # активные домены, которые видит токен → DNS_ZONES («ID<TAB>ИМЯ» по строке); 1 и BOT_ERR
+	local body   # не в $(…): BOT_ERR из подоболочки не вернулся бы
+	BOT_ERR='' DNS_ZONES=''
+	body=$(cf_api GET "/zones?per_page=50") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	cf_ok <<< "$body" || { BOT_ERR="Cloudflare не принял токен ($(cf_err <<< "$body")) — скопирован целиком и с правами из ссылки?"; return 1; }
+	DNS_ZONES=$(python3 -I -c 'import json, sys
+for z in json.load(sys.stdin).get("result") or []:
+    if z.get("status") == "active" and z.get("id") and z.get("name"):
+        print(z["id"] + "\t" + z["name"])' <<< "$body")
+}
+
+dns_ask_token() {  # токен Cloudflare (из окружения или спросить, с ссылкой) и проверка списком доменов → DNS_ZONES
+	local try
+	if bot_have_cf_token; then
+		bot_init_secrets
+		if cf_zones; then return 0; fi
+		bot_say "  ✗ токен из окружения: $BOT_ERR"
+	fi
+	bot_tty_ok || { BOT_ERR=${BOT_ERR:-"спросить токен Cloudflare некого (нет терминала)"}; return 1; }
+	bot_say "Токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
+	bot_say "  $(bot_template_url)"
+	for try in 1 2 3; do
+		bot_ask_secret "Токен Cloudflare (не отобразится): " || return 1
+		if [ -z "$BOT_ANSWER" ]; then BOT_ERR="токен Cloudflare не введён"; continue; fi
+		BOT_CF_TOKEN=$BOT_ANSWER
+		bot_init_secrets
+		if cf_zones; then return 0; fi
+		bot_say "  ✗ $BOT_ERR"
+	done
+	return 1
+}
+
+dns_records() {  # dns_records ЗОНА ИМЯ → DNS_RECS: «ТИП<TAB>ID<TAB>ЗНАЧЕНИЕ<TAB>ОБЛАКО(0|1)» для A, AAAA, CNAME имени
+	local body
+	DNS_RECS=''
+	body=$(cf_api GET "/zones/$1/dns_records?name=$2&per_page=100") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	cf_ok <<< "$body" || { BOT_ERR="не прочитать DNS-записи $2 — $(cf_err <<< "$body")"; return 1; }
+	DNS_RECS=$(python3 -I -c 'import json, sys
+for r in json.load(sys.stdin).get("result") or []:
+    if r.get("name") == sys.argv[1] and r.get("type") in ("A", "AAAA", "CNAME"):
+        print("\t".join([r["type"], r.get("id", ""), str(r.get("content", "")), "1" if r.get("proxied") else "0"]))' "$2" <<< "$body")
+}
+
+dns_conflicts() {  # dns_conflicts ЗАПИСИ IP → что мешает направить имя на этот сервер без спроса; пусто — ничего
+	local t id c p out=''
+	while IFS=$'\t' read -r t id c p; do
+		case $t in
+			A) [ -n "$2" ] && [ "$c" = "$2" ] || out+="${out:+, }A-запись указывает на $c" ;;
+			AAAA) out+="${out:+, }AAAA-запись $c (IPv6 на сервере выключается)" ;;
+			CNAME) out+="${out:+, }CNAME на $c" ;;
+		esac
+	done <<< "$1"
+	printf '%s' "$out"
+}
+
+dns_pick() {  # выбрать домен из Cloudflare и адрес VPN на нём → DOMAIN DNS_ZONE_ID DNS_REPOINT; 1 и BOT_ERR
+	local zones n i=1 ans zid zname name myip recs conflicts
+	DNS_REPOINT=0 BOT_ERR=
+	[ -n "${DNS_ZONES:-}" ] || cf_zones || return 1
+	zones=$DNS_ZONES
+	n=$(grep -c . <<< "$zones" || true)
+	if [ "$n" = 0 ]; then
+		BOT_ERR="в аккаунте Cloudflare нет доменов (или токен их не видит) — добавь домен в Cloudflare или ставь без домена"
+		return 1
+	fi
+	if [ "$n" = 1 ]; then
+		bot_say "Домен в Cloudflare: $(cut -f2 <<< "$zones")"
+	else
+		bot_say "Домены в Cloudflare:"
+		while IFS=$'\t' read -r zid zname; do bot_say "  $i) $zname"; i=$((i + 1)); done <<< "$zones"
+		while :; do
+			bot_ask "Какой взять [1-$n]: " || return 1
+			if [[ $BOT_ANSWER =~ ^[0-9]+$ ]] && [ "$BOT_ANSWER" -ge 1 ] && [ "$BOT_ANSWER" -le "$n" ]; then i=$BOT_ANSWER; break; fi
+		done
+	fi
+	zid=$(sed -n "${i}p" <<< "$zones" | cut -f1)
+	zname=$(sed -n "${i}p" <<< "$zones" | cut -f2)
+	myip=$(bot_public_ip)
+	while :; do
+		bot_ask "Адрес VPN — Enter: сам $zname, или впиши поддомен (например, vpn): " || return 1
+		ans=$(printf '%s' "$BOT_ANSWER" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+		ans=${ans%.}
+		case $ans in
+			"" | "$zname") name=$zname ;;
+			*".$zname") name=$ans ;;
+			*) name=$ans.$zname ;;
+		esac
+		if ! [[ $name =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]+$ ]]; then
+			bot_say "  ✗ «$name» — не имя домена"
+			continue
+		fi
+		dns_records "$zid" "$name" || return 1
+		recs=$DNS_RECS
+		conflicts=$(dns_conflicts "$recs" "$myip")
+		[ -n "$conflicts" ] || break
+		bot_say "Сейчас в Cloudflare у $name: $conflicts."
+		# Там может работать сайт или другой VPN — по умолчанию не трогаем.
+		if bot_consent "Перенаправить $name на этот сервер${myip:+ ($myip)}? Если там сайт или другой VPN, они перестанут открываться"; then
+			DNS_REPOINT=1
+			break
+		fi
+		bot_say "Тогда другое имя — например, поддомен."
+	done
+	DOMAIN=$name DNS_ZONE_ID=$zid
+	bot_say "Адрес VPN: $DOMAIN"
+}
+
+dns_find_zone() {  # зона домена по имени (--domain без выбора из списка) → DNS_ZONE_ID; 1 и BOT_ERR
+	local z body
+	DNS_ZONE_ID=
+	for z in $(bot_zone_candidates "$DOMAIN"); do
+		body=$(cf_api GET "/zones?name=$z") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+		cf_ok <<< "$body" || { BOT_ERR="Cloudflare не принял токен ($(cf_err <<< "$body"))"; return 1; }
+		DNS_ZONE_ID=$(jget result.0.id <<< "$body")
+		[ -z "$DNS_ZONE_ID" ] || return 0
+	done
+	BOT_ERR="токен Cloudflare не видит домен $DOMAIN"
+	return 1
+}
+
+dns_req() {  # dns_req МЕТОД [ID [JSON]] → запрос к записям зоны DNS_ZONE_ID; 1 и BOT_ERR
+	local body
+	if [ "$1" = DELETE ]; then
+		body=$(cf_api DELETE "/zones/$DNS_ZONE_ID/dns_records/$2") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	else
+		printf '%s' "$3" > "$BOT_DIR/req.json"
+		body=$(cf_api "$1" "/zones/$DNS_ZONE_ID/dns_records${2:+/$2}" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") ||
+			{ BOT_ERR="Cloudflare не отвечает"; return 1; }
+	fi
+	cf_ok <<< "$body" || { BOT_ERR="Cloudflare не принял изменение DNS $DOMAIN — $(cf_err <<< "$body")"; return 1; }
+}
+
+dns_apply() {  # шаг DNS (IP известен): одна A-запись $DOMAIN → $PUBLIC_IP без облака → DNS_REPORT; 1 и BOT_ERR
+	local recs conflicts t id c p keep='' keep_c='' keep_p='' json
+	DNS_REPORT='' BOT_ERR=''
+	dns_records "$DNS_ZONE_ID" "$DOMAIN" || return 1
+	recs=$DNS_RECS
+	conflicts=$(dns_conflicts "$recs" "$PUBLIC_IP")
+	if [ -n "$conflicts" ] && [ "${DNS_REPOINT:-0}" != 1 ]; then
+		# Домен задан флагом (выбора из списка не было) — спросить здесь, если есть кого; по умолчанию «нет».
+		if bot_tty_ok; then
+			bot_say "Сейчас в Cloudflare у $DOMAIN: $conflicts."
+			if bot_consent "Перенаправить $DOMAIN на этот сервер ($PUBLIC_IP)? Если там сайт или другой VPN, они перестанут открываться"; then
+				DNS_REPOINT=1
+			else
+				BOT_ERR="у $DOMAIN в Cloudflare $conflicts — не перенаправляю: выберите другое имя (поддомен) и запустите снова"
+				return 1
+			fi
+		else
+			BOT_ERR="у $DOMAIN в Cloudflare $conflicts — без согласия не перенаправляю: запустите установку в терминале (спросит) или выберите другое имя"
+			return 1
+		fi
+	fi
+	# Оставить A-запись, что уже указывает сюда, иначе первую; мешающее убрать ДО записи (CNAME не уживается с A).
+	while IFS=$'\t' read -r t id c p; do
+		if [ "$t" = A ] && [ "$c" = "$PUBLIC_IP" ] && [ -z "$keep" ]; then keep=$id keep_c=$c keep_p=$p; fi
+	done <<< "$recs"
+	if [ -z "$keep" ]; then
+		while IFS=$'\t' read -r t id c p; do
+			if [ "$t" = A ] && [ -z "$keep" ]; then keep=$id keep_c=$c keep_p=$p; fi
+		done <<< "$recs"
+	fi
+	while IFS=$'\t' read -r t id c p; do
+		[ -n "$t" ] && [ "$id" != "$keep" ] || continue
+		dns_req DELETE "$id" || return 1
+		DNS_REPORT+="удалена $t-запись $DOMAIN ($c)"$'\n'
+	done <<< "$recs"
+	json=$(python3 -I -c 'import json, sys; print(json.dumps({"type": "A", "name": sys.argv[1], "content": sys.argv[2], "proxied": False, "ttl": 1}))' "$DOMAIN" "$PUBLIC_IP")
+	if [ -z "$keep" ]; then
+		dns_req POST "" "$json" || return 1
+		DNS_REPORT+="A-запись $DOMAIN → $PUBLIC_IP создана в Cloudflare"$'\n'
+	elif [ "$keep_c" != "$PUBLIC_IP" ]; then
+		dns_req PATCH "$keep" "$json" || return 1
+		DNS_REPORT+="A-запись $DOMAIN перенаправлена с $keep_c на этот сервер ($PUBLIC_IP)"$'\n'
+	elif [ "$keep_p" = 1 ]; then
+		dns_req PATCH "$keep" "$json" || return 1
+		DNS_REPORT+="у A-записи $DOMAIN выключено облако Cloudflare (с ним VPN не работает)"$'\n'
+	fi
+}
+
+dns_wait() {  # запись только что поставлена: ждать, пока DNS отдаёт $DOMAIN → $PUBLIC_IP (до ~2 мин)
+	local i a
+	for i in $(seq 1 "${DNS_WAIT_TRIES:-24}"); do
+		a=$(resolve "$DOMAIN" A 2> /dev/null || true)
+		case " $a " in *" $PUBLIC_IP "*) return 0 ;; esac
+		[ "$i" = "${DNS_WAIT_TRIES:-24}" ] || sleep "${DNS_WAIT_SLEEP:-5}"
+	done
+	return 1
+}
 
 bot_cf_check() {  # → BOT_ZONE BOT_ACC BOT_KV_ID BOT_SUBDOMAIN BOT_EXISTING(none|ours|foreign); 1 и BOT_ERR
 	local z body n
@@ -816,6 +1027,7 @@ print("RESULT " + ("; ".join(bad) if bad else "ok"))' "$(bot_http '/selftest?par
 bot_decide() {  # → BOT_DO (разворачивать сейчас), BOT_KEEP (бот есть — не трогать), BOT_STALE, BOT_ASK (спросить [y/N])
 	BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_ASK=0
 	[ "${MODE:-}" = domain ] || return 0
+	[ "${DNS_NOT_CF:-0}" != 1 ] || return 0   # домен не в Cloudflare — боту не на чем работать
 	[ "${BOT_ARG:-}" != 0 ] || return 0
 	if [ "${S_BOT:-}" = 1 ]; then
 		# Повтор меняет то, на что бот опирается, — без обновления он открыл бы при переезде порт не там.
@@ -857,7 +1069,7 @@ bot_read_tokens() {  # спросить недостающие токены; б�
 		BOT_CF_TOKEN=$BOT_ANSWER BOT_DO=1 BOT_KEEP=0
 		return 0
 	fi
-	if [ -z "${BOT_CF_TOKEN:-}" ] && bot_tty_ok; then
+	if ! bot_have_cf_token && bot_tty_ok; then
 		bot_say "1) Токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
 		bot_say "   $(bot_template_url)"
 		bot_ask_secret "   Токен Cloudflare (не отобразится): " || true
@@ -872,7 +1084,7 @@ bot_read_tokens() {  # спросить недостающие токены; б�
 		fi
 		BOT_TG_TOKEN=$BOT_ANSWER
 	fi
-	if [ -z "${BOT_CF_TOKEN:-}" ]; then
+	if ! bot_have_cf_token; then
 		BOT_DO=0
 		BOT_SKIP="не дан токен Cloudflare"
 	fi
@@ -1797,6 +2009,12 @@ VPN_BOT_BUNDLE_EOF
 }
 BOT_SOURCE=acf1836
 
+# Токены — сразу из окружения: токен Cloudflare нужен уже на первом вопросе (домен выбирается из списка).
+BOT_CF_TOKEN=${CF_API_TOKEN:-}
+BOT_TG_TOKEN=${VPN_BOT_TOKEN:-}
+unset CF_API_TOKEN VPN_BOT_TOKEN   # дальше токены — только в переменных скрипта и файлах 600
+DNS_FROM_CF=0 DNS_NOT_CF=0 DNS_ZONES='' DNS_ZONE_ID='' DNS_REPOINT=0 DNS_REPORT=''
+
 MODE=
 S_MODE=$(state_val S_MODE || true)
 S_DOMAIN_OLD=$(state_val S_DOMAIN || true)
@@ -1836,20 +2054,32 @@ else
 		cat > /dev/tty <<'EOF'
 
 Есть ли у вас свой домен для этого сервера?
-  1) Да  — лучше: маскировка под свой сайт, подписки в приложениях обновляются сами,
-           панель открывается по адресу домена. Нужна A-запись домена на IP этого сервера.
-  2) Нет — маскировка под крупный чужой сайт. Ссылки привязаны к IP сервера
+  1) Да, в Cloudflare — лучше всего: скрипт сам направит домен на этот сервер (нужен токен
+           Cloudflare), маскировка под свой сайт, подписки в приложениях обновляются сами,
+           панель — по адресу домена; можно поставить Телеграм-бота.
+  2) Да, но не в Cloudflare — то же, но A-запись домена на IP сервера сделаете сами (без бота).
+  3) Нет — маскировка под крупный чужой сайт. Ссылки привязаны к IP сервера
            (переедете на другой сервер — ссылки раздать заново), панель — по IP сервера.
 EOF
 		while [ -z "$MODE" ]; do
-			printf 'Ваш выбор [1/2]: ' > /dev/tty
+			printf 'Ваш выбор [1/2/3]: ' > /dev/tty
 			read -r ans < /dev/tty || die "не удалось прочитать ответ"
 			case $ans in
-				1 | да | Да | ДА | y | Y | yes) MODE=domain ;;
-				2 | нет | Нет | НЕТ | n | N | no) MODE=nodomain ;;
+				1) MODE=domain DNS_FROM_CF=1 ;;
+				2) MODE=domain DNS_NOT_CF=1 ;;
+				3 | нет | Нет | НЕТ | n | N | no) MODE=nodomain ;;
 			esac
 		done
-		if [ "$MODE" = domain ]; then
+		if [ "$DNS_FROM_CF" = 1 ]; then
+			# Сначала токен, потом домен — из тех, что в Cloudflare; запись поставит шаг DNS (там уже известен IP).
+			bot_need_python || die "не установились python3 и curl (apt занят или нет сети) — запустите скрипт ещё раз"
+			if ! { dns_ask_token && dns_pick; }; then
+				warn "домен из Cloudflare выбрать не вышло: $BOT_ERR"
+				printf 'Тогда впишите домен вручную, а A-запись на IP сервера сделайте сами.\n' > /dev/tty
+				DNS_FROM_CF=0 DNS_NOT_CF=1
+			fi
+		fi
+		if [ "$MODE" = domain ] && [ -z "$DOMAIN" ]; then
 			printf 'Домен (например vpn.example.com): ' > /dev/tty
 			read -r DOMAIN < /dev/tty || true
 		fi
@@ -2045,9 +2275,6 @@ if [ "$EXIT_MODE" = chain ]; then
 	fi
 fi
 # --- Телеграм-бот: решить и спросить токены сейчас, проверить — после установки пакетов ---
-BOT_CF_TOKEN=${CF_API_TOKEN:-}
-BOT_TG_TOKEN=${VPN_BOT_TOKEN:-}
-unset CF_API_TOKEN VPN_BOT_TOKEN   # дальше токены — только в переменных скрипта и файлах 600
 S_BOT=$(state_val S_BOT || true)
 S_BOT_USER=$(state_val S_BOT_USER || true)
 S_BOT_ORIGIN=$(state_val S_BOT_ORIGIN || true)
@@ -3634,6 +3861,7 @@ on_exit() {
 		if [ "$WD_WAS_ACTIVE" = 1 ]; then systemctl start vpn-exit-watchdog >/dev/null 2>&1 || true; fi
 	fi
 	rm -rf "$WORK" "$CHK_OUT"
+	[ -z "${BOT_DIR:-}" ] || rm -rf "$BOT_DIR"   # каталог токенов с вопросов (вне $WORK)
 }
 trap on_exit EXIT
 
@@ -3755,6 +3983,22 @@ if [ "$MODE" = domain ]; then ok "порты 80, 443 и $REALITY_PORT свобо
 detect_ips
 if [ "$PUBLIC_IP" = "$LISTEN_IP" ]; then ok "IP сервера $PUBLIC_IP"; else ok "IP сервера $PUBLIC_IP (на интерфейсе $LISTEN_IP — сервер за NAT, так тоже работает)"; fi
 ip_precheck
+
+# Есть токен Cloudflare — A-запись ставит сам скрипт: создаёт, выключает облако; запись на чужой IP — только
+# с согласием, данным на вопросах (без терминала — останавливается). Дальше — обычная проверка через DNS.
+if [ "$MODE" = domain ] && [ "$SKIP_DNS" = 0 ] && [ "$DNS_NOT_CF" = 0 ] && bot_have_cf_token; then
+	bot_init_secrets
+	if [ -n "$DNS_ZONE_ID" ] || dns_find_zone; then
+		dns_apply || die "$BOT_ERR"
+		if [ -n "$DNS_REPORT" ]; then
+			while IFS= read -r l; do [ -z "$l" ] || ok "$l"; done <<< "$DNS_REPORT"
+			dns_wait || warn "DNS ещё не отдаёт $DOMAIN → $PUBLIC_IP — проверяю как обычно"
+		fi
+	else
+		warn "${BOT_ERR:-токен Cloudflare не видит домен $DOMAIN} — A-запись проверяю как обычно"
+	fi
+	[ "$BOT_DO" = 1 ] || bot_wipe   # без бота токен был нужен только для DNS
+fi
 
 if [ "$MODE" = nodomain ]; then
 	:
