@@ -150,6 +150,7 @@ test_tg_check_bad_token() {
 }
 test_pair_takes_confirmed_sender() {
 	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":true,"result":[]}'   # старая очередь пуста
 	tg_push getUpdates "{\"ok\":true,\"result\":[$(msg 10 42 Ann ann)]}"
 	answers y
 	bot_pair 30 || t_fail "не привязал: $BOT_ERR"
@@ -159,6 +160,7 @@ test_pair_takes_confirmed_sender() {
 }
 test_pair_skips_rejected() {
 	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":true,"result":[]}'
 	tg_push getUpdates "{\"ok\":true,\"result\":[$(msg 10 42 Ann ann),$(msg 11 77 Bob bob)]}"
 	answers n y
 	bot_pair 30 || t_fail "не привязал: $BOT_ERR"
@@ -169,14 +171,6 @@ test_pair_timeout() {
 	answers y
 	! bot_pair 1 || t_fail "привязал без сообщений"
 	t_has "не дождался" "$BOT_ERR" "причина"
-}
-test_pair_foreign_webhook_needs_consent() {
-	base_env; BOT_USERNAME=my_vpn_bot; BOT_SUBDOMAIN=sub1; BOT_HOOK_URL=https://other.example/tg
-	answers n
-	! bot_pair 30 || t_fail "привязал без согласия"
-	grep -q "other.example" "$WORK/tty.out" || t_fail "не спросил про чужой вебхук"
-	t_has "other.example" "$BOT_ERR" "причина называет адрес"
-	! grep -q '^deleteWebhook' "$WORK/tg.calls" 2> /dev/null || t_fail "вебхук снят без согласия"
 }
 test_validate_foreign_worker_declined() {
 	base_env; good_cf
@@ -224,12 +218,12 @@ test_keys_replace_line() {
 }
 test_keys_inherit() {
 	keys_env
-	printf '%s\n' 'ssh-ed25519 AAAAold vpn-bot' >> "$BOT_AUTH_KEYS"
-	settings '[{"type":"secret_text","name":"ENTRY_SSH_KEY"}]'
+	local line; line=$(realkey old); printf '%s\n' "$line" >> "$BOT_AUTH_KEYS"
+	settings "[{\"type\":\"secret_text\",\"name\":\"ENTRY_SSH_KEY\"},$(fpr_binding old)]"
 	bot_keys 0
 	t_eq 0 "$BOT_KEY_NEW" "ключ унаследован"
 	[ ! -e "$BOT_DIR/id" ] || t_fail "лишний новый ключ"
-	grep -qx 'ssh-ed25519 AAAAold vpn-bot' "$BOT_AUTH_KEYS" || t_fail "прежняя строка тронута"
+	grep -qxF "$line" "$BOT_AUTH_KEYS" || t_fail "прежняя строка тронута"
 }
 panel_env() {
 	base_env
@@ -570,6 +564,224 @@ test_cover_sites_exclude_broken() {  # проверено живьём 2026-11-1
 	[ -n "$nodomain_list" ] && [ -n "$exit_list" ] || t_fail "списки прикрытий не найдены в шаблоне"
 	case "$nodomain_list $exit_list" in *www.microsoft.com*) t_fail "www.microsoft.com в списке прикрытий" ;; esac
 	t_has "www.apple.com" "$exit_list" "у выхода остались рабочие кандидаты"
+}
+
+# ——— финальное ревью (10.11): чужой вебхук, бот другого сервера, ручной бот, привязка, ключи ———
+validate_env() {  # нового воркера нет, токен бота дан
+	base_env; good_cf
+	tg_push getMe '{"ok":true,"result":{"username":"my_vpn_bot"}}'
+}
+test_validate_foreign_webhook_needs_consent() {  # Review Focus 1 — и когда привязки владельца нет
+	validate_env; VPN_BOT_ADMIN_ID=42
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://other.example/bot123:SECRETtok/hook"}}'
+	answers n
+	! bot_validate || t_fail "прошла с чужим вебхуком без согласия"
+	grep -q "https://other.example" "$WORK/tty.out" || t_fail "не спросил про чужой вебхук"
+	t_has "https://other.example" "$BOT_ERR" "причина называет адрес"
+	case "$BOT_ERR $(cat "$WORK/tty.out")" in *SECRETtok*) t_fail "путь вебхука (в нём бывает токен) попал в текст" ;; esac
+	! grep -qE '^(deleteWebhook|setWebhook)' "$WORK/tg.calls" || t_fail "вебхук тронут без согласия"
+}
+test_validate_foreign_webhook_rerun_inherited_owner() {  # повтор: вставили не тот токен, владелец унаследован
+	validate_env
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot/settings" '{"success":true,"result":{"bindings":[{"type":"plain_text","name":"VPN_BOT_INSTALLER","text":"1"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.example.com"}]}}'
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://other.example/hook"}}'
+	answers n
+	! bot_validate || t_fail "чужой бот перехвачен без согласия"
+}
+test_validate_foreign_webhook_enter_is_no() {
+	validate_env; VPN_BOT_ADMIN_ID=42
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://other.example/hook"}}'
+	answers ''
+	! bot_validate || t_fail "Enter сошёл за согласие"
+}
+test_validate_foreign_webhook_consented() {
+	validate_env; VPN_BOT_ADMIN_ID=42
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://other.example/hook"}}'
+	answers y
+	bot_validate || t_fail "не прошла с согласием: $BOT_ERR"
+	t_eq 42 "$BOT_ADMIN_ID" "владелец"
+}
+test_deploy_keeps_queue_of_previous_webhook() {  # перенастроили чужой вебхук — его очередь не стираем
+	deploy_env; BOT_HOOK_URL=https://other.example/hook
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_has '"drop_pending_updates": false' "$(grep '^setWebhook' "$WORK/tg.calls")" "очередь сохранена"
+}
+other_server_env() {  # наш воркер, но управляет он VPN на другом домене
+	validate_env
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot/settings" '{"success":true,"result":{"bindings":[{"type":"plain_text","name":"VPN_BOT_INSTALLER","text":"1"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.other.org"},{"type":"plain_text","name":"CF_ZONE_ID","text":"Z2"}]}}'
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://vpn-bot.sub1.workers.dev/tg"}}'
+}
+test_validate_bot_of_other_server_needs_consent() {  # C2: второй сервер в том же аккаунте
+	other_server_env
+	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.other.org" '{"success":true,"result":[{"id":"R2","content":"9.9.9.9","proxied":false}]}'
+	answers n
+	! bot_validate || t_fail "забрал бота другого сервера без вопроса"
+	t_has "vpn.other.org" "$(cat "$WORK/tty.out")" "вопрос называет тот домен"
+	t_has "vpn.other.org" "$BOT_ERR" "причина называет тот домен"
+}
+test_validate_bot_of_other_server_enter_is_no() {
+	other_server_env
+	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.other.org" '{"success":true,"result":[{"id":"R2","content":"9.9.9.9","proxied":false}]}'
+	answers ''
+	! bot_validate || t_fail "Enter сошёл за согласие"
+}
+test_validate_bot_of_unknown_server_asks() {  # A-запись того домена не прочитать — считаем, что сервер другой
+	other_server_env
+	answers n
+	! bot_validate || t_fail "без проверки решил, что сервер тот же"
+}
+test_validate_same_server_new_domain_no_question() {  # домен сменился, а сервер тот же — бот его
+	other_server_env
+	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.other.org" '{"success":true,"result":[{"id":"R2","content":"1.2.3.4","proxied":false}]}'
+	answers n
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	[ ! -s "$WORK/tty.out" ] || t_fail "лишний вопрос: $(cat "$WORK/tty.out")"
+}
+manual_bot_env() {  # бот, поставленный руками: наш по KV, владелец — в KV admin:id, секрета ADMIN_ID нет
+	base_env; good_cf
+	cf_set "GET /accounts/A1/storage/kv/namespaces?per_page=100" '{"success":true,"result":[{"id":"K1","title":"vpn-bot-state"}]}'
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot/settings" '{"success":true,"result":{"bindings":[{"type":"kv_namespace","name":"STATE","namespace_id":"K1"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.example.com"}]}}'
+	rm -f "$BOT_DIR/tg.token"
+}
+test_validate_manual_bot_owner_from_kv() {  # I4: владелец ручного бота сохраняется, установка не падает
+	manual_bot_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admin%3Aid" '123456789'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq ours "$BOT_EXISTING" "бот наш"
+	t_eq 123456789 "$BOT_ADMIN_ID" "владелец из KV"
+	! grep -q '^getUpdates' "$WORK/tg.calls" 2> /dev/null || t_fail "привязывал заново"
+}
+test_validate_manual_bot_no_owner_no_token() {
+	manual_bot_env; answers y   # терминал есть — путь человека, а не «без терминала»
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admin%3Aid" '{"success":false,"errors":[{"code":10009,"message":"key not found"}]}'
+	! bot_validate || t_fail "прошла без владельца и без токена бота"
+	t_has "токен бота" "$BOT_ERR" "понятная причина"
+}
+test_validate_admin_id_must_be_number() {  # I6: @имя вместо id дало бы немого бота при «✓»
+	validate_env; VPN_BOT_ADMIN_ID=@ann
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
+	! bot_validate || t_fail "принял @имя вместо id"
+	t_has "числовой" "$BOT_ERR" "причина"
+}
+test_pair_skips_backlog() {  # I3: старые сообщения из очереди — не повод спрашивать «это ты?»
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates "{\"ok\":true,\"result\":[$(msg 5 77 Bob bob)]}"
+	tg_push getUpdates "{\"ok\":true,\"result\":[$(msg 6 42 Ann ann)]}"
+	answers y
+	bot_pair 30 || t_fail "не привязал: $BOT_ERR"
+	t_eq 42 "$BOT_ADMIN_ID" "владелец — из новых сообщений"
+	! grep -q Bob "$WORK/tty.out" || t_fail "спросил про старое сообщение"
+	t_has '"offset":-1' "$(sed -n 1p "$WORK/tg.calls")" "сперва выбрана старая очередь"
+	t_has '"offset":6' "$(sed -n 2p "$WORK/tg.calls")" "дальше — после неё"
+	! grep -q allowed_updates "$WORK/tg.calls" || t_fail "опрос меняет боту allowed_updates"
+}
+test_pair_enter_is_no() {  # I3: «это ты?» — по умолчанию «нет»
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":true,"result":[]}'
+	tg_push getUpdates "{\"ok\":true,\"result\":[$(msg 10 42 Ann ann)]}"
+	answers ''
+	! bot_pair 2 || t_fail "Enter сошёл за «это я»"
+	grep -q '\[y/N\]' "$WORK/tty.out" || t_fail "вопрос не [y/N]"
+}
+test_pair_conflict_stops() {  # I3: бота читает другая программа — останавливаемся, а не крутимся
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request"}'
+	answers y
+	! bot_pair 30 || t_fail "привязал при чужом опросе"
+	t_has "другая программа" "$BOT_ERR" "причина"
+	t_eq 1 "$(grep -c '^getUpdates' "$WORK/tg.calls")" "запросов к Телеграму"
+}
+test_pair_transient_error_pauses() {  # I3: 429 и прочие сбои — пауза, а не 40 запросов в секунду
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":true,"result":[]}'
+	tg_push getUpdates '{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 1"}'
+	tg_push getUpdates "{\"ok\":true,\"result\":[$(msg 10 42 Ann ann)]}"
+	answers y
+	sleep() { echo "sleep $*" >> "$WORK/sleeps"; }
+	bot_pair 30 || t_fail "не привязал после 429: $BOT_ERR"
+	grep -q '^sleep' "$WORK/sleeps" 2> /dev/null || t_fail "без паузы после ошибки"
+}
+test_pair_delete_webhook_failure() {  # I3: вебхук не снялся — опрос не начинаем
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_SUBDOMAIN=sub1; BOT_HOOK_URL=https://vpn-bot.sub1.workers.dev/tg
+	tg_push deleteWebhook '{"ok":false,"error_code":400,"description":"Bad Request"}'
+	answers y
+	! bot_pair 30 || t_fail "пошёл дальше, не сняв вебхук"
+	! grep -q '^getUpdates' "$WORK/tg.calls" || t_fail "опрос при стоящем вебхуке"
+}
+realkey() {  # realkey ИМЯ → строка настоящего ключа «ssh-ed25519 … vpn-bot»; отпечаток — в $WORK/ИМЯ.fpr
+	ssh-keygen -q -t ed25519 -N '' -C vpn-bot -f "$WORK/$1" > /dev/null
+	ssh-keygen -lf "$WORK/$1.pub" | awk '{print $2}' > "$WORK/$1.fpr"
+	cat "$WORK/$1.pub"
+}
+fpr_binding() { printf '{"type":"plain_text","name":"ENTRY_SSH_KEY_FPR","text":"%s"}' "$(cat "$WORK/$1.fpr")"; }
+test_keys_new_when_worker_holds_other_key() {  # I1: строка от оборванного запуска, у воркера другой ключ
+	keys_env
+	realkey cut >> "$BOT_AUTH_KEYS"   # её приватную часть стёр оборванный запуск
+	realkey old > /dev/null           # этот ключ на самом деле в воркере
+	settings "[{\"type\":\"secret_text\",\"name\":\"ENTRY_SSH_KEY\"},$(fpr_binding old)]"
+	bot_keys 0
+	t_eq 1 "$BOT_KEY_NEW" "ключ выпущен заново"
+	t_eq 1 "$(grep -c ' vpn-bot$' "$BOT_AUTH_KEYS")" "строк vpn-bot"
+}
+test_keys_new_when_worker_has_no_fingerprint() {  # бот прежней версии или ручной: сверить не с чем
+	keys_env; realkey old >> "$BOT_AUTH_KEYS"
+	settings '[{"type":"secret_text","name":"ENTRY_SSH_KEY"}]'
+	bot_keys 0
+	t_eq 1 "$BOT_KEY_NEW" "без отпечатка — новый ключ"
+}
+test_keys_new_when_exit_dropped() {  # I2: ключ входа = ключ выхода; ушли с выхода — ключ меняется
+	keys_env; realkey old >> "$BOT_AUTH_KEYS"
+	settings "[{\"type\":\"secret_text\",\"name\":\"ENTRY_SSH_KEY\"},$(fpr_binding old),{\"type\":\"secret_text\",\"name\":\"EXIT_SSH_KEY\"}]"
+	EXIT_MODE=direct
+	bot_keys 0
+	t_eq 1 "$BOT_KEY_NEW" "старый выход прежний ключ больше не пустит"
+}
+test_keys_inherit_when_chain_kept() {
+	keys_env; realkey old >> "$BOT_AUTH_KEYS"
+	settings "[{\"type\":\"secret_text\",\"name\":\"ENTRY_SSH_KEY\"},$(fpr_binding old),{\"type\":\"secret_text\",\"name\":\"EXIT_SSH_KEY\"}]"
+	EXIT_MODE=chain
+	bot_keys 0
+	t_eq 0 "$BOT_KEY_NEW" "выход тот же — ключ прежний"
+}
+test_deploy_uploads_key_fingerprint() {  # отпечаток рядом с ключом, в той же загрузке
+	deploy_env
+	local want; want=$(grep ' vpn-bot$' "$BOT_AUTH_KEYS" | ssh-keygen -lf - | awk '{print $2}')
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_eq "plain_text|$want" "$(mb ENTRY_SSH_KEY_FPR)" "отпечаток ключа"
+}
+test_deploy_new_subdomain_waits_before_webhook() {  # I8: новый адрес workers.dev заводится около минуты
+	deploy_env; BOT_SUBDOMAIN=; BOT_HEALTH_SLEEP=0
+	cf_set "PUT /accounts/A1/workers/subdomain" '{"success":true,"result":{"subdomain":"vpnbot-abc123"}}'
+	bot_http() {
+		local n
+		case $1 in
+			/healthz)
+				n=$(($(cat "$WORK/hz.n" 2> /dev/null || echo 0) + 1)); echo "$n" > "$WORK/hz.n"
+				if [ "$n" -gt 20 ]; then echo "healthz ok" >> "$WORK/tg.calls"; echo ok; fi ;;
+			"/selftest?part="*) cat "$WORK/st.${1#*part=}" ;;
+		esac
+	}
+	bot_deploy || t_fail "не дождался нового адреса: $BOT_ERR"
+	t_eq "https://vpn-bot.vpnbot-abc123.workers.dev" "$BOT_ORIGIN" "адрес"
+	local hz wh
+	hz=$(grep -n '^healthz ok' "$WORK/tg.calls" | head -1 | cut -d: -f1)
+	wh=$(grep -n '^setWebhook' "$WORK/tg.calls" | head -1 | cut -d: -f1)
+	[ -n "$hz" ] && [ -n "$wh" ] && [ "$hz" -lt "$wh" ] || t_fail "вебхук поставлен раньше, чем адрес заработал (healthz $hz, setWebhook $wh)"
+}
+test_ssh_key_only_ignores_bot_key() {  # I5: ключ бота — не ключ человека, с ним одним пароль не выключать
+	eval "$(awk '/^root_has_own_key\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	local f=$WORK/ak
+	printf '%s\n' 'ssh-ed25519 AAAAbot vpn-bot' > "$f"
+	! root_has_own_key "$f" || t_fail "ключ бота сошёл за ключ человека"
+	printf '%s\n' '# комментарий' '' 'ssh-ed25519 AAAAbot vpn-bot' > "$f"
+	! root_has_own_key "$f" || t_fail "комментарий сошёл за ключ"
+	printf '%s\n' 'ssh-ed25519 AAAAbot vpn-bot' 'ssh-rsa AAAAuser user@laptop' > "$f"
+	root_has_own_key "$f" || t_fail "ключ человека не увиден"
+	! root_has_own_key "$WORK/нет-файла" || t_fail "нет файла — нет ключа"
+	grep -q 'elif root_has_own_key; then' "$ROOT/src/install-vpn.sh.in" || t_fail "--ssh-key-only проверяет не этой функцией"
+}
+test_hints_never_put_tokens_in_history() {  # I7: токен в командной строке — это /root/.bash_history
+	! grep -nE '(CF_API_TOKEN|VPN_BOT_TOKEN)=…' "$ROOT/src/install-vpn.sh.in" "$ROOT/README.md" || t_fail "подсказка с токеном в командной строке"
 }
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———

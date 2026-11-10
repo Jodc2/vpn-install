@@ -141,7 +141,11 @@ bash install-vpn.sh
 2. Токен бота — в Телеграме @BotFather → `/newbot`.
 3. Когда скрипт попросит, написать своему боту любое сообщение: так он узнаёт владельца — бот слушается только его.
 
-Без вопросов: `CF_API_TOKEN=… VPN_BOT_TOKEN=… VPN_BOT_ADMIN_ID=<ваш id в Телеграме> bash install-vpn.sh --bot`.
+Без вопросов — токены вставить в скрытый ввод, а не в саму команду (иначе они останутся в истории команд):
+`read -rs CF_API_TOKEN; read -rs VPN_BOT_TOKEN; export CF_API_TOKEN VPN_BOT_TOKEN`, затем
+`VPN_BOT_ADMIN_ID=<ваш числовой id в Телеграме> bash install-vpn.sh --bot`.
+Второй сервер в том же аккаунте Cloudflare — со своим ботом: другой токен от @BotFather и `VPN_BOT_WORKER=vpn-bot2`
+(без этого скрипт не отдаст ему бота первого сервера, не спросив).
 Не ставить и не спрашивать: `--no-bot`.
 
 - Токены и ключ бота на сервере не остаются — только в секретах воркера в Cloudflare. Токен Cloudflare

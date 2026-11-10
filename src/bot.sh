@@ -4,7 +4,7 @@
 # файл в install-vpn.sh (__EMBED_BOT_FUNCS__); здесь только функции и значения по умолчанию.
 # Секреты — только в файлах $BOT_DIR (600), в argv процессов их нет: curl берёт заголовок с токеном
 # Cloudflare из файла (-H @файл), адрес с токеном бота — из своего конфига (-K файл).
-BOT_WORKER=${VPN_BOT_WORKER:-vpn-bot}   # другое имя — только для проверки самого скрипта
+BOT_WORKER=${VPN_BOT_WORKER:-vpn-bot}   # другое имя — второй бот в том же аккаунте Cloudflare (и проверка скрипта)
 BOT_CRON='0 */3 * * *'
 CF_API_BASE=${CF_API_BASE:-https://api.cloudflare.com/client/v4}
 TG_API_BASE=${TG_API_BASE:-https://api.telegram.org}
@@ -181,6 +181,19 @@ bot_tg_check() {  # → BOT_USERNAME BOT_HOOK_URL; 1 и BOT_ERR
 }
 
 bot_hook_is_ours() { [ -z "${BOT_HOOK_URL:-}" ] || [ "$BOT_HOOK_URL" = "https://$BOT_WORKER.${BOT_SUBDOMAIN:-}.workers.dev/tg" ]; }
+bot_hook_host() {  # адрес вебхука без пути и логина: в пути у многих лежит сам токен бота — его не печатаем
+	local h=${BOT_HOOK_URL#*://}
+	h=${h%%[/?#]*}
+	h=${h##*@}
+	printf '%s://%s' "${BOT_HOOK_URL%%://*}" "$h"
+}
+bot_tg_fatal() {  # bot_tg_fatal ОТВЕТ → 0 и BOT_ERR, если ждать бессмысленно (бота читает другая программа, токен отозван)
+	case $(jget error_code <<< "$1") in
+		409) BOT_ERR="бота @$BOT_USERNAME уже читает другая программа (Телеграм: «$(jget description <<< "$1" | cut -c1-60)») — останови её или возьми для VPN отдельного бота у @BotFather" ;;
+		401 | 404) BOT_ERR="Телеграм больше не принимает токен бота @$BOT_USERNAME" ;;
+		*) return 1 ;;
+	esac
+}
 
 # Вопросы человеку — через терминал (в тестах — дескриптор BOT_TTY_FD с ответами, вопросы в $WORK/tty.out).
 bot_tty_ok() { [ -n "${BOT_TTY_FD:-}" ] || { : > /dev/tty; } 2> /dev/null; }
@@ -203,27 +216,44 @@ bot_consent() {  # bot_consent ВОПРОС → 0 только на явное �
 
 # shellcheck disable=SC2120  # срок ожидания — необязательный аргумент (в тестах — короткий)
 bot_pair() {  # bot_pair [СЕКУНД=300] → BOT_ADMIN_ID BOT_ADMIN_NAME: кто написал боту и подтвердил «это я»
-	local secs=${1:-300} deadline left offset=0 body uid fid fname uname ctype
+	local secs=${1:-300} deadline left offset=0 body uid fid fname uname ctype try
 	BOT_ADMIN_ID='' BOT_ADMIN_NAME='' BOT_ERR=''
 	bot_tty_ok || { BOT_ERR="привязать владельца можно только в терминале (или задайте VPN_BOT_ADMIN_ID)"; return 1; }
-	if [ -n "${BOT_HOOK_URL:-}" ]; then
-		if ! bot_hook_is_ours && ! bot_consent "Бот @$BOT_USERNAME сейчас подключён к $BOT_HOOK_URL — перенастроить его на этот сервер?"; then
-			BOT_ERR="бот @$BOT_USERNAME подключён к другому адресу ($BOT_HOOK_URL) — его не трогаю"
-			return 1
-		fi
+	if [ -n "${BOT_HOOK_URL:-}" ]; then   # чужой вебхук доходит сюда только с явного «да» (bot_validate)
 		echo '{"drop_pending_updates":false}' > "$BOT_DIR/req.json"
 		body=$(tg_api deleteWebhook "$BOT_DIR/req.json") || { BOT_ERR="Телеграм не отвечает"; return 1; }
+		[ "$(jget ok <<< "$body")" = true ] || { BOT_ERR="Телеграм не снял вебхук бота @$BOT_USERNAME — $(jget description <<< "$body")"; return 1; }
 	fi
+	# Что уже лежит в очереди (сообщения друзей, если ботом пользовались), — не повод спрашивать «это ты?»:
+	# offset −1 отдаёт последнее обновление и забывает прежние, ждём следующих. allowed_updates не задаём —
+	# Телеграм запомнил бы его за ботом.
+	for try in 1 2 3; do
+		echo '{"offset":-1,"timeout":0}' > "$BOT_DIR/req.json"
+		body=$(tg_api getUpdates "$BOT_DIR/req.json") || body=''
+		if [ "$(jget ok <<< "$body")" = true ]; then
+			uid=$(jget result.0.update_id <<< "$body")
+			[ -z "$uid" ] || offset=$((uid + 1))
+			break
+		fi
+		! bot_tg_fatal "$body" || return 1
+		[ "$try" = 3 ] || sleep "${BOT_TG_PAUSE:-3}"
+	done
 	bot_say "Открой https://t.me/$BOT_USERNAME и отправь боту любое сообщение — так я узнаю, что это ты (жду до $(((secs + 59) / 60)) мин)…"
 	deadline=$(($(date +%s) + secs))
 	while left=$((deadline - $(date +%s))) && [ "$left" -gt 0 ]; do
-		printf '{"offset":%s,"timeout":%s,"allowed_updates":["message"]}' "$offset" "$((left < 25 ? left : 25))" > "$BOT_DIR/req.json"
-		body=$(tg_api getUpdates "$BOT_DIR/req.json") || { sleep 2; continue; }
+		printf '{"offset":%s,"timeout":%s}' "$offset" "$((left < 25 ? left : 25))" > "$BOT_DIR/req.json"
+		body=$(tg_api getUpdates "$BOT_DIR/req.json") || body=''
+		if [ "$(jget ok <<< "$body")" != true ]; then   # 409/401 — конец; 429, 5xx, обрыв — пауза, не долбить Телеграм
+			! bot_tg_fatal "$body" || return 1
+			sleep "${BOT_TG_PAUSE:-3}"
+			continue
+		fi
 		while IFS=$'\t' read -r uid fid fname uname ctype; do
 			offset=$((uid + 1))
 			[ "$ctype" = private ] || continue
-			bot_ask "Это ты: $fname${uname:+ (@$uname)}, id $fid? [Y/n]: " || continue
-			case $BOT_ANSWER in n | N | no | No | н | Н | нет | Нет | НЕТ) continue ;; esac
+			# Ответ отдаёт полное управление VPN — только явное «да» (Enter — «нет»).
+			bot_ask "Это ты: $fname${uname:+ (@$uname)}, id $fid? [y/N]: " || continue
+			case $BOT_ANSWER in y | Y | yes | Yes | д | Д | да | Да | ДА) ;; *) continue ;; esac
 			BOT_ADMIN_ID=$fid
 			BOT_ADMIN_NAME=$fname
 			printf '{"offset":%s,"timeout":0}' "$offset" > "$BOT_DIR/req.json"
@@ -246,21 +276,61 @@ b = (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or []
 sys.exit(0 if any(x.get("name") == sys.argv[2] for x in b) else 1)' "$BOT_DIR/settings.json" "$1"
 }
 
-bot_validate() {  # всё, что проверяется до установки: токены, чужой воркер, владелец; 0 — можно разворачивать
+bot_other_server_ok() {  # наш воркер управляет VPN другого сервера (второй сервер в том же аккаунте)? — только с «да»
+	local dn zone ip='' body
+	[ "${BOT_EXISTING:-}" = ours ] || return 0
+	dn=$(bot_plain DNS_NAME)
+	[ -n "$dn" ] && [ "$dn" != "$DOMAIN" ] || return 0
+	zone=$(bot_plain CF_ZONE_ID)
+	if body=$(cf_api GET "/zones/${zone:-$BOT_ZONE}/dns_records?type=A&name=$dn") && cf_ok <<< "$body"; then
+		ip=$(jget result.0.content <<< "$body")
+	fi
+	[ "$ip" != "$PUBLIC_IP" ] || return 0   # тот же сервер, сменился только домен
+	bot_consent "Воркер $BOT_WORKER в этом аккаунте Cloudflare управляет VPN на $dn${ip:+ ($ip)} — перенастроить его на этот сервер? Тот VPN останется без бота, а его бэкап в Cloudflare заменится бэкапом этого" && return 0
+	BOT_ERR="воркер $BOT_WORKER уже управляет VPN на $dn — не трогаю. Второму серверу нужен свой бот: другой токен от @BotFather и VPN_BOT_WORKER=другое-имя"
+	return 1
+}
+
+bot_kv_admin() {  # владелец из KV нашего воркера (admin:id — так его хранит бот, поставленный руками) → id или пусто
+	local v
+	[ "${BOT_EXISTING:-}" = ours ] && [ -n "${BOT_KV_ID:-}" ] || return 0
+	v=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admin%3Aid" 2> /dev/null) || return 0
+	if [[ $v =~ ^[0-9]+$ ]]; then printf '%s' "$v"; fi
+}
+
+bot_validate() {  # всё, что проверяется до установки: токены, чужой воркер и вебхук, бот другого сервера, владелец
+	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ADMIN_ID='' BOT_ADMIN_NAME=''
 	bot_cf_check || return 1
 	if [ "$BOT_EXISTING" = foreign ] && ! bot_consent "Воркер $BOT_WORKER в аккаунте Cloudflare уже есть, и он не от установщика — перезаписать?"; then
 		BOT_ERR="воркер $BOT_WORKER в аккаунте Cloudflare не от установщика — не трогаю"
 		return 1
 	fi
+	bot_other_server_ok || return 1
 	if [ -s "$BOT_DIR/tg.token" ]; then
 		bot_tg_check || return 1
+		# Чужой вебхук (вставили токен рабочего бота) — только с явного «да», будет привязка или нет.
+		if ! bot_hook_is_ours && ! bot_consent "Бот @$BOT_USERNAME сейчас подключён к $(bot_hook_host) — перенастроить его на этот сервер?"; then
+			BOT_ERR="бот @$BOT_USERNAME подключён к другому адресу ($(bot_hook_host)) — его не трогаю"
+			return 1
+		fi
 	elif [ "$BOT_EXISTING" != ours ]; then
 		BOT_ERR="нужен токен бота от @BotFather"
 		return 1
 	fi
 	if [ -n "${VPN_BOT_ADMIN_ID:-}" ]; then
+		if ! [[ $VPN_BOT_ADMIN_ID =~ ^[0-9]+$ ]]; then
+			BOT_ERR="VPN_BOT_ADMIN_ID — числовой id в Телеграме (вида 123456789), а не @имя"
+			return 1
+		fi
 		BOT_ADMIN_ID=$VPN_BOT_ADMIN_ID
-	elif ! bot_has_binding ADMIN_ID; then
+	elif bot_has_binding ADMIN_ID; then
+		:   # владелец прежний
+	elif BOT_ADMIN_ID=$(bot_kv_admin) && [ -n "$BOT_ADMIN_ID" ]; then
+		:   # бот, поставленный руками: владелец записан в его KV — сохраняется
+	elif [ ! -s "$BOT_DIR/tg.token" ]; then
+		BOT_ERR="у бота нет владельца, а привязать его можно только по токену бота — дай токен бота (или VPN_BOT_ADMIN_ID)"
+		return 1
+	else
 		bot_pair || return 1
 	fi
 }
@@ -272,11 +342,20 @@ b = (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or []
 print(next((x.get("text", "") for x in b if x.get("name") == sys.argv[2] and x.get("type") == "plain_text"), ""))' "$BOT_DIR/settings.json" "$1"
 }
 
+bot_key_fpr() { grep -E ' vpn-bot$' "$BOT_AUTH_KEYS" 2> /dev/null | head -1 | ssh-keygen -lf - 2> /dev/null | awk '{print $2}' || true; }
+
 bot_keys() {  # bot_keys НУЖЕН_ВЫХОД(0|1) → BOT_KEY_NEW; в authorized_keys ровно одна строка «… vpn-bot»
-	local need_exit=${1:-0} f=$BOT_AUTH_KEYS tmp
-	if [ "$need_exit" = 0 ] && [ "${BOT_EXISTING:-}" = ours ] && grep -qE ' vpn-bot$' "$f" 2> /dev/null && bot_has_binding ENTRY_SSH_KEY; then
-		BOT_KEY_NEW=0
-		return 0
+	local need_exit=${1:-0} f=$BOT_AUTH_KEYS tmp have
+	# Прежний ключ — только если воркер держит именно его (отпечаток лежит рядом с ключом, в той же загрузке:
+	# оборванный запуск мог заменить строку, не успев отдать новый ключ воркеру) и выход остаётся (ключ входа —
+	# он же ключ выхода: ушли с выхода — ключ новый, и старый выход прежний больше не пустит).
+	if [ "$need_exit" = 0 ] && [ "${BOT_EXISTING:-}" = ours ] && bot_has_binding ENTRY_SSH_KEY; then
+		have=$(bot_key_fpr)
+		if [ -n "$have" ] && [ "$have" = "$(bot_plain ENTRY_SSH_KEY_FPR)" ] &&
+			! { bot_has_binding EXIT_SSH_KEY && [ "${EXIT_MODE:-}" != chain ]; }; then
+			BOT_KEY_NEW=0
+			return 0
+		fi
 	fi
 	rm -f "$BOT_DIR/id" "$BOT_DIR/id.pub"
 	ssh-keygen -q -t ed25519 -N '' -C vpn-bot -f "$BOT_DIR/id" > /dev/null
@@ -331,12 +410,12 @@ bot_exit_bindings() {  # → $BOT_DIR/exit.list: «plain|secret|inherit ИМЯ [
 # Имена привязок, которыми распоряжается установщик. Прочие привязки нашего воркера (например,
 # GLOBALPING_TOKEN, заданный владельцем руками) при обновлении наследуются как есть.
 BOT_MANAGED="STATE PANEL_ORIGIN PANEL_BASE SUB_PREFIX CF_ZONE_ID DNS_NAME ENTRY_USER ENTRY_SSH_PORT SELF_ORIGIN
-VPN_BOT_INSTALLER CF_API_TOKEN SELFTEST_SECRET BOT_TOKEN WEBHOOK_SECRET ADMIN_ID PANEL_TOKEN ENTRY_SSH_KEY
+VPN_BOT_INSTALLER CF_API_TOKEN SELFTEST_SECRET BOT_TOKEN WEBHOOK_SECRET ADMIN_ID PANEL_TOKEN ENTRY_SSH_KEY ENTRY_SSH_KEY_FPR
 EXIT_HOST EXIT_PORT EXIT_USER CHAIN_PORT EXIT_FW EXIT_SSH_KEY EXIT_HOSTKEY_FPR EXIT_SSH_PASS"
 
 bot_rand() { python3 -I -c 'import secrets; print(secrets.token_urlsafe(24))'; }
 bot_put_secret() { (umask 077 && printf '%s' "$2" > "$BOT_DIR/$1"); }   # bot_put_secret ФАЙЛ ЗНАЧЕНИЕ
-bot_http() { curl -sS --max-time 40 -H @"$BOT_DIR/selftest.hdr" "$BOT_ORIGIN$1"; }   # запрос к самому воркеру
+bot_http() { curl -sS --max-time "${2:-40}" -H @"$BOT_DIR/selftest.hdr" "$BOT_ORIGIN$1"; }   # bot_http ПУТЬ [СЕКУНД] — к самому воркеру
 bot_alive() { [ "$(curl -sS --max-time 15 "$1/healthz" 2> /dev/null)" = ok ]; }   # bot_alive АДРЕС_ВОРКЕРА
 
 bot_wipe() {  # стереть секреты из $BOT_DIR (они уже в воркере или больше не нужны)
@@ -366,7 +445,7 @@ bot_deploy() {  # → BOT_ORIGIN BOT_REPORT; 1 и BOT_ERR. Секреты из $
 }
 
 bot_deploy_steps() {
-	local body sub f p kb res
+	local body sub f p kb res kfpr subnew=0 tries=15
 	BOT_ERR='' BOT_REPORT=''
 	if [ -z "${BOT_KV_ID:-}" ]; then
 		printf '{"title":"%s-state"}' "$BOT_WORKER" > "$BOT_DIR/req.json"
@@ -384,6 +463,7 @@ bot_deploy_steps() {
 		fi
 		BOT_SUBDOMAIN=$(jget result.subdomain <<< "$body")
 		BOT_SUBDOMAIN=${BOT_SUBDOMAIN:-$sub}
+		subnew=1
 	fi
 	BOT_ORIGIN=https://$BOT_WORKER.$BOT_SUBDOMAIN.workers.dev
 	# Секреты этого развёртывания: самопроверка — всегда новый; вебхук — новый, если есть токен бота.
@@ -395,6 +475,8 @@ bot_deploy_steps() {
 		printf 'plain %s %s\n' PANEL_ORIGIN "https://$DOMAIN" PANEL_BASE "$WEB_PATH" SUB_PREFIX "https://$DOMAIN$SUB_PATH" \
 			CF_ZONE_ID "$BOT_ZONE" DNS_NAME "$DOMAIN" ENTRY_USER root ENTRY_SSH_PORT "$SSH_PORT" SELF_ORIGIN "$BOT_ORIGIN" \
 			VPN_BOT_INSTALLER 1
+		kfpr=$(bot_key_fpr)   # отпечаток ключа, который воркер получит в этой же загрузке (см. bot_keys)
+		[ -z "$kfpr" ] || printf 'plain ENTRY_SSH_KEY_FPR %s\n' "$kfpr"
 		printf 'secret CF_API_TOKEN @%s\nsecret SELFTEST_SECRET @%s\n' "$BOT_DIR/cf.token" "$BOT_DIR/selftest.secret"
 		bot_secret_or_inherit BOT_TOKEN tg.token
 		bot_secret_or_inherit WEBHOOK_SECRET webhook.secret
@@ -475,18 +557,26 @@ for x in (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or [
 			BOT_REPORT+="⚠ первый бэкап в хранилище не лёг — бот снимет его сам ночью или по кнопке «Бэкап»"$'\n'
 		fi
 	fi
+	# Воркер отвечает? Только что заведённый адрес workers.dev Cloudflare включает около минуты (до того — 523),
+	# поэтому ждём дольше — и до вебхука, иначе Телеграм получит ошибку на первом же обновлении.
+	if [ "$subnew" = 1 ]; then
+		tries=90
+		printf '  …     адрес %s заведён только что — Cloudflare включает такой около минуты, жду до 3 мин\n' "$BOT_ORIGIN"
+	fi
+	for f in $(seq 1 "$tries"); do
+		[ "$(bot_http /healthz 10 2> /dev/null)" = ok ] && break
+		[ "$f" = "$tries" ] && { BOT_ERR="воркер не отвечает на $BOT_ORIGIN/healthz"; return 1; }
+		sleep "${BOT_HEALTH_SLEEP:-2}"
+	done
 	if [ -s "$BOT_DIR/tg.token" ]; then
+		# Очередь стираем только у бота без прежнего вебхука: чужой (перенастроенный с согласия) и наш её хранят.
 		(umask 077 && python3 -I -c 'import json, sys
 print(json.dumps({"url": sys.argv[1] + "/tg", "secret_token": open(sys.argv[2]).read(), "allowed_updates": ["message", "callback_query"],
-                  "drop_pending_updates": sys.argv[3] == "none"}))' "$BOT_ORIGIN" "$BOT_DIR/webhook.secret" "${BOT_EXISTING:-none}" > "$BOT_DIR/hook.json")
+                  "drop_pending_updates": sys.argv[3] == "1"}))' "$BOT_ORIGIN" "$BOT_DIR/webhook.secret" \
+			"$([ -z "${BOT_HOOK_URL:-}" ] && [ "${BOT_EXISTING:-none}" = none ] && echo 1 || echo 0)" > "$BOT_DIR/hook.json")
 		body=$(tg_api setWebhook "$BOT_DIR/hook.json") || { BOT_ERR="Телеграм не отвечает"; return 1; }
 		[ "$(jget ok <<< "$body")" = true ] || { BOT_ERR="Телеграм не принял вебхук — $(jget description <<< "$body")"; return 1; }
 	fi
-	for f in $(seq 1 15); do
-		[ "$(bot_http /healthz 2> /dev/null)" = ok ] && break
-		[ "$f" = 15 ] && { BOT_ERR="воркер не отвечает на $BOT_ORIGIN/healthz"; return 1; }
-		sleep 2
-	done
 	res=$(python3 -I -c '
 import json, sys
 def load(s):

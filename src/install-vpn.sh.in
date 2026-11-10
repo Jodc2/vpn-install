@@ -586,6 +586,11 @@ detect_ips() {  # LISTEN_IP — адрес на интерфейсе, PUBLIC_IP 
 	fi
 }
 
+root_has_own_key() {  # у root в authorized_keys есть ключ человека; ключ бота («… vpn-bot») не в счёт
+	local f=${1:-/root/.ssh/authorized_keys}
+	[ -f "$f" ] && grep -qvE -e ' vpn-bot$' -e '^[[:space:]]*(#|$)' "$f"
+}
+
 ssh_login_method() {  # как вошли в эту SSH-сессию: publickey | password | keyboard-interactive | пусто (не узнать)
 	local cip cport rest
 	read -r cip cport rest <<<"${SSH_CONNECTION:-}" || true
@@ -2192,7 +2197,7 @@ if [ "$BOT_DO" = 1 ]; then
 		bot_keys "$([ "$EXIT_MODE" = chain ] && [ -n "$EXIT_HOST" ] && echo 1 || echo 0)"
 		if [ "$BOT_KEY_NEW" = 1 ]; then BOT_PUBKEY=$(cat "$BOT_DIR/id.pub"); fi
 	else
-		warn "ставлю без бота (VPN работает и без него). Повторить: CF_API_TOKEN=… VPN_BOT_TOKEN=… bash $0 --bot"
+		warn "ставлю без бота (VPN работает и без него). Повторить: bash $0 --bot — токены скрипт спросит сам"
 		bot_wipe
 	fi
 fi
@@ -2879,7 +2884,7 @@ elif [ "$SSH_KEY_ONLY" = 1 ]; then
 	SSH_HOW=$(ssh_login_method)
 	if [ "$SSH_HOW" = password ] || [ "$SSH_HOW" = keyboard-interactive ]; then
 		bad "вы сами вошли сейчас по паролю — выключать его нельзя, иначе после выхода не войдёте. Войдите по ключу и запустите скрипт ещё раз с --ssh-key-only"
-	elif [ -s /root/.ssh/authorized_keys ]; then
+	elif root_has_own_key; then
 		mkdir -p /etc/ssh/sshd_config.d
 		cat > /etc/ssh/sshd_config.d/00-disable-password.conf <<'EOF'
 PasswordAuthentication no
@@ -2894,7 +2899,7 @@ EOF
 			bad "sshd -t не прошёл — вход по паролю оставлен"
 		fi
 	else
-		warn "у root нет ключа в /root/.ssh/authorized_keys — вход по паролю оставлен, иначе вы потеряете доступ"
+		warn "у root нет своего ключа в /root/.ssh/authorized_keys (ключ бота не в счёт) — вход по паролю оставлен, иначе вы потеряете доступ"
 	fi
 else
 	warn "вход по паролю не трогали. Безопаснее: добавить свой SSH-ключ и запустить скрипт с --ssh-key-only"
@@ -3036,12 +3041,12 @@ if [ "$BOT_DO" = 1 ]; then
 		bot_wipe
 		BOT_RESULT=fail
 		warn "бот не поставился: $BOT_ERR"
-		warn "VPN работает и без бота. Повторить: CF_API_TOKEN=… bash $0 --bot"
+		warn "VPN работает и без бота. Повторить: bash $0 --bot"
 	fi
 	save_state
 elif [ "$BOT_KEEP" = 1 ]; then
 	if bot_alive "$S_BOT_ORIGIN"; then ok "Телеграм-бот @$S_BOT_USER работает — не трогал"; else warn "Телеграм-бот @$S_BOT_USER не отвечает ($S_BOT_ORIGIN/healthz)"; fi
-	[ "$BOT_STALE" = 0 ] || warn "бот знает прежние настройки (домен, выход или порт SSH) — обнови его: CF_API_TOKEN=… bash $0 --bot"
+	[ "$BOT_STALE" = 0 ] || warn "бот знает прежние настройки (домен, выход или порт SSH) — обнови его: bash $0 --bot (спросит токен Cloudflare)"
 fi
 
 K=
@@ -3141,11 +3146,11 @@ rm -f /root/vpn-qr/*.png   # прежние QR (удалённых клиент�
 		echo
 		echo "Телеграм-бот для управления VPN: @${S_BOT_USER:-?} — https://t.me/${S_BOT_USER:-}"
 		echo "  клиенты, статистика, проверка блокировки раз в 3 часа, бэкапы, переезд на новый сервер кнопкой"
-		[ "${BOT_RESULT:-}" != fail ] || echo "  ⚠ в этот раз бот не обновился: ${BOT_ERR:-} (повторить: CF_API_TOKEN=… bash install-vpn.sh --bot)"
+		[ "${BOT_RESULT:-}" != fail ] || echo "  ⚠ в этот раз бот не обновился: ${BOT_ERR:-} (повторить: bash install-vpn.sh --bot)"
 	elif [ -n "${BOT_SKIP:-}" ] || [ "${BOT_RESULT:-}" = fail ]; then
 		echo
 		echo "Телеграм-бот не поставлен: ${BOT_ERR:-$BOT_SKIP}"
-		echo "  повторить: CF_API_TOKEN=… VPN_BOT_TOKEN=… bash install-vpn.sh --bot"
+		echo "  повторить: bash install-vpn.sh --bot — токены скрипт спросит сам"
 	fi
 } > "$INFO"
 chmod 600 "$INFO"
