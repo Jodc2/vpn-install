@@ -445,6 +445,102 @@ test_deploy_selftest_entry_fail() {
 	t_has "permission denied" "$BOT_ERR" "причина"
 }
 
+# ——— Task 8: решение «ставить / обновить / не трогать» ———
+decide_env() {
+	MODE=domain BOT_ARG= S_BOT= BOT_CF_TOKEN= DOMAIN=vpn.example.com S_DOMAIN_OLD=vpn.example.com
+	EXIT_MODE=direct S_EXIT=direct EXIT_HOST= CHAIN_IP= EXIT_PORT_ARG= CHAIN_PORT= S_BOT_SSH_PORT= SSH_PORT_NOW=22
+}
+test_decide_no_bot_flag() {
+	decide_env; BOT_ARG=0; answers y
+	bot_decide
+	t_eq 0 "$BOT_DO" "не ставить"; t_eq 0 "$BOT_ASK" "не спрашивать"
+}
+test_decide_nodomain_never_asks() {
+	decide_env; MODE=nodomain; answers y
+	bot_decide
+	t_eq 0 "$BOT_DO" "без домена не ставить"; t_eq 0 "$BOT_ASK" "без домена не спрашивать"
+}
+test_rerun_without_tokens_keeps_bot() {
+	decide_env; S_BOT=1
+	bot_decide
+	t_eq 0 "$BOT_DO" "без токена не разворачивать"; t_eq 1 "$BOT_KEEP" "бот есть — не трогать"
+}
+test_decide_rerun_with_token_updates() {
+	decide_env; S_BOT=1; BOT_CF_TOKEN=c
+	bot_decide
+	t_eq 1 "$BOT_DO" "с токеном — обновить"; t_eq 0 "$BOT_KEEP" "не «не трогать»"
+}
+test_decide_said_no_before() {
+	decide_env; S_BOT=0; answers y
+	bot_decide
+	t_eq 0 "$BOT_DO" "отказались раньше"; t_eq 0 "$BOT_ASK" "не переспрашивать"
+}
+test_decide_stale_on_exit_change() {
+	decide_env; S_BOT=1; S_EXIT=chain; EXIT_MODE=direct
+	bot_decide
+	t_eq 1 "$BOT_STALE" "выход сменился"
+}
+test_decide_stale_on_ssh_port() {
+	decide_env; S_BOT=1; S_BOT_SSH_PORT=22; SSH_PORT_NOW=2222
+	bot_decide
+	t_eq 1 "$BOT_STALE" "порт SSH сменился"
+}
+test_decide_first_time_asks() {
+	decide_env; answers y
+	bot_decide
+	t_eq 1 "$BOT_ASK" "первый раз — спросить"; t_eq 0 "$BOT_DO" "до ответа не ставить"
+}
+test_cf_check_bad_token() {
+	base_env
+	cf_set "GET /zones?name=vpn.example.com" '{"success":false,"errors":[{"code":6003,"message":"Invalid request headers"}]}'
+	! bot_cf_check || t_fail "прошла с плохим токеном"
+	t_has "не принял токен" "$BOT_ERR" "причина — токен, не домен"
+}
+
+test_read_tokens_prompts_missing() {
+	decide_env; BOT_DO=1 BOT_KEEP=0 BOT_TG_TOKEN=
+	answers cfX tgY
+	bot_read_tokens
+	t_eq cfX "$BOT_CF_TOKEN" "токен Cloudflare"; t_eq tgY "$BOT_TG_TOKEN" "токен бота"; t_eq 1 "$BOT_DO" "ставим"
+	grep -q 'dash.cloudflare.com/profile/api-tokens' "$WORK/tty.out" || t_fail "нет ссылки на токен"
+	grep -q '@BotFather' "$WORK/tty.out" || t_fail "нет подсказки про @BotFather"
+}
+test_read_tokens_without_cf_token_skips() {
+	decide_env; BOT_DO=1 BOT_KEEP=0 BOT_TG_TOKEN=
+	answers "" tgY
+	bot_read_tokens
+	t_eq 0 "$BOT_DO" "без токена Cloudflare — без бота"
+}
+test_read_tokens_keep_offers_update() {
+	decide_env; S_BOT=1 BOT_DO=0 BOT_KEEP=1 BOT_STALE=1
+	answers ""
+	bot_read_tokens
+	t_eq 0 "$BOT_DO" "Enter — оставить как есть"
+	answers cfZ
+	bot_read_tokens
+	t_eq 1 "$BOT_DO" "дали токен — обновить"; t_eq cfZ "$BOT_CF_TOKEN" "токен"; t_eq 0 "$BOT_KEEP" "уже не «не трогать»"
+}
+test_retry_keeps_same_tokens() {
+	base_env
+	answers y "" ""
+	bot_retry || t_fail "отказался повторять"
+	t_eq "Authorization: Bearer c" "$(cat "$BOT_DIR/cf.hdr")" "тот же токен Cloudflare"
+	t_eq t "$(cat "$BOT_DIR/tg.token")" "тот же токен бота"
+}
+test_retry_new_cf_token() {
+	base_env
+	answers y cf2 ""
+	bot_retry
+	t_eq "Authorization: Bearer cf2" "$(cat "$BOT_DIR/cf.hdr")" "новый токен Cloudflare"
+	t_eq t "$(cat "$BOT_DIR/tg.token")" "токен бота прежний"
+}
+test_retry_declined() {
+	base_env
+	answers n
+	! bot_retry || t_fail "повторил после «нет»"
+	grep -q "ещё раз" "$WORK/tty.out" || t_fail "не спросил «ещё раз?»"
+}
+
 # ——— прогон ———
 PASS=0
 FAILN=0

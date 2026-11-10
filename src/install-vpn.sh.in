@@ -55,6 +55,10 @@
 #                     PuTTY .ppk; парольная фраза — в EXIT_KEY_PASS). На вопросе ключ можно вставить целиком
 #   --exit-port N     порт цепочки на старом сервере (по умолчанию 2087)
 #   --exit-stop-xui   выключить 3x-ui на старом сервере (если он теперь только выход); --exit-keep-xui — оставить
+#   --bot             (с доменом в Cloudflare) поставить или обновить Телеграм-бота для управления VPN: клиенты,
+#                     статистика, проверка блокировки, бэкапы, переезд. Токены — CF_API_TOKEN и VPN_BOT_TOKEN в
+#                     окружении или спросит; владелец — VPN_BOT_ADMIN_ID или привязка в терминале (написать боту)
+#   --no-bot          не ставить бота и не спрашивать про него (запоминается)
 # Повторный запуск безопасен: ключи, пароли, клиенты и выбранный выход сохраняются (/etc/vpn-install.env).
 set -euo pipefail
 umask 022
@@ -105,6 +109,7 @@ EXIT_SSH_KEY=
 EXIT_KEY_TEXT=
 EXIT_PORT_ARG=
 EXIT_STOP_XUI=
+BOT_ARG=     # --bot / --no-bot; пусто — как в прошлый раз или спросить
 TEST_SELFSIGNED=0   # только для проверки самого скрипта: самоподписанный сертификат вместо Let's Encrypt
 ACME_STAGING=0      # только для проверки: тестовый сервер Let's Encrypt
 while [ $# -gt 0 ]; do
@@ -130,6 +135,8 @@ while [ $# -gt 0 ]; do
 		--exit-port) EXIT_PORT_ARG=${2:-}; shift 2 ;;
 		--exit-stop-xui) EXIT_STOP_XUI=1; shift ;;
 		--exit-keep-xui) EXIT_STOP_XUI=0; shift ;;
+		--bot) BOT_ARG=1; shift ;;
+		--no-bot) BOT_ARG=0; shift ;;
 		--ssh-key-only) SSH_KEY_ONLY=1; shift ;;
 		--no-fail2ban) DO_F2B=0; shift ;;
 		--fail2ban) DO_F2B=1; shift ;;
@@ -188,6 +195,10 @@ exit_ssh_defaults() {  # пользователь и порт SSH старого
 		EXIT_SSH_PORT=${EXIT_SSH_PORT_ARG:-${CHAIN_SSH_PORT:-22}}
 	fi
 }
+# --- Телеграм-бот vpn-bot: функции (src/bot.sh) и его код (src/bot/worker.js) ---
+__EMBED_BOT_FUNCS__
+__EMBED_BOT_BUNDLE__
+
 MODE=
 S_MODE=$(state_val S_MODE || true)
 S_DOMAIN_OLD=$(state_val S_DOMAIN || true)
@@ -434,6 +445,32 @@ if [ "$EXIT_MODE" = chain ]; then
 			die "нужен доступ к старому серверу: EXIT_PASS='root-пароль' либо --exit-ssh-key ПУТЬ (EXIT_KEY_PASS — если у ключа парольная фраза)"
 		fi
 	fi
+fi
+# --- Телеграм-бот: решить и спросить токены сейчас, проверить — после установки пакетов ---
+BOT_CF_TOKEN=${CF_API_TOKEN:-}
+BOT_TG_TOKEN=${VPN_BOT_TOKEN:-}
+unset CF_API_TOKEN VPN_BOT_TOKEN   # дальше токены — только в переменных скрипта и файлах 600
+S_BOT=$(state_val S_BOT || true)
+S_BOT_USER=$(state_val S_BOT_USER || true)
+S_BOT_ORIGIN=$(state_val S_BOT_ORIGIN || true)
+S_BOT_WORKER=$(state_val S_BOT_WORKER || true)
+S_BOT_SSH_PORT=$(state_val S_BOT_SSH_PORT || true)
+[ -n "${VPN_BOT_WORKER:-}" ] || BOT_WORKER=${S_BOT_WORKER:-vpn-bot}
+SSH_PORT_NOW=$(sshd -T 2> /dev/null | awk '$1 == "port" {print $2; exit}' || true)
+BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_SKIP='' BOT_RESULT=''
+if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
+	bot_decide
+	[ "$BOT_ARG" != 0 ] || S_BOT=0   # --no-bot запоминается
+	if [ "$BOT_ASK" = 1 ]; then
+		cat > /dev/tty <<'EOF'
+
+Телеграм-бот для управления VPN: клиенты (создать — ссылка на подписку, выключить, удалить),
+статистика, проверка блокировки в России раз в 3 часа, бэкапы и переезд на новый сервер кнопкой.
+Бесплатно, на вашем аккаунте Cloudflare. Нужны домен в Cloudflare и бот от @BotFather.
+EOF
+		if bot_consent "Поставить бота?"; then BOT_DO=1; else S_BOT=0; fi
+	fi
+	if [ "$BOT_DO" = 1 ] || { [ "$BOT_KEEP" = 1 ] && [ "$BOT_STALE" = 1 ]; }; then bot_read_tokens; fi
 fi
 # Дальше на вопросы отвечают только через /dev/tty. Служебные программы (openssl s_client, apt, ssh…)
 # терминал не читают — иначе съели бы клавиши, нажатые во время установки, или ответ на следующий вопрос.
@@ -1052,6 +1089,11 @@ CHAIN_SNI='${CHAIN_SNI:-}'
 CHAIN_SSH_USER='${CHAIN_SSH_USER:-}'
 CHAIN_SSH_PORT='${CHAIN_SSH_PORT:-}'
 CHAIN_FW='${CHAIN_FW:-}'
+S_BOT='${S_BOT:-}'
+S_BOT_USER='${S_BOT_USER:-}'
+S_BOT_ORIGIN='${S_BOT_ORIGIN:-}'
+S_BOT_WORKER='${S_BOT_WORKER:-}'
+S_BOT_SSH_PORT='${S_BOT_SSH_PORT:-}'
 EOF
 	# Файл потом читается через «.»: значение с кавычкой исполнилось бы как команда — такой не сохранять.
 	if grep -v '^#' "$tmp" | grep -q "^[A-Z_0-9]*='.*'.*'"; then rm -f "$tmp"; die "в настройках оказалась кавычка — $STATE не записан"; fi
@@ -2108,6 +2150,25 @@ else
 	[ -z "$AAAA" ] || die "у $DOMAIN есть AAAA-запись ($AAAA): IPv6 на сервере выключается, а Let's Encrypt и клиенты пойдут по IPv6. Удалите AAAA-запись и запустите снова"
 fi
 
+if [ "$BOT_DO" = 1 ]; then
+	say "Телеграм-бот: проверка токенов"
+	bot_init_secrets
+	BOT_TRY=1
+	until bot_validate; do
+		warn "бот: $BOT_ERR"
+		if [ "$BOT_TRY" -ge 3 ] || ! bot_retry; then BOT_DO=0; BOT_SKIP=$BOT_ERR; break; fi
+		BOT_TRY=$((BOT_TRY + 1))
+	done
+	if [ "$BOT_DO" = 1 ]; then
+		ok "бот${BOT_USERNAME:+ @$BOT_USERNAME}: домен $DOMAIN в Cloudflare${BOT_ADMIN_NAME:+, владелец — $BOT_ADMIN_NAME}"
+		bot_keys "$([ "$EXIT_MODE" = chain ] && [ -n "$EXIT_HOST" ] && echo 1 || echo 0)"
+		if [ "$BOT_KEY_NEW" = 1 ]; then BOT_PUBKEY=$(cat "$BOT_DIR/id.pub"); fi
+	else
+		warn "ставлю без бота (VPN работает и без него). Повторить: CF_API_TOKEN=… VPN_BOT_TOKEN=… bash $0 --bot"
+		bot_wipe
+	fi
+fi
+
 say "Пакеты"
 PKGS=(sqlite3 ufw cron openssl tar tzdata qrencode procps coreutils)
 [ "$MODE" = domain ] && PKGS+=(nginx libnginx-mod-stream socat)
@@ -2934,6 +2995,27 @@ INSTALL_DONE=1   # дальше — проверки и итог: ловушка
 S_DONE=1
 save_state
 
+if [ "$BOT_DO" = 1 ]; then
+	say "Телеграм-бот"
+	if bot_panel_token && bot_exit_bindings && bot_deploy; then
+		S_BOT=1 S_BOT_ORIGIN=$BOT_ORIGIN S_BOT_WORKER=$BOT_WORKER S_BOT_SSH_PORT=$SSH_PORT
+		S_BOT_USER=${BOT_USERNAME:-$S_BOT_USER}
+		while IFS= read -r l; do
+			case $l in "⚠"*) warn "${l#⚠ }" ;; ?*) ok "$l" ;; esac
+		done <<< "$BOT_REPORT"
+		BOT_RESULT=ok
+	else
+		bot_wipe
+		BOT_RESULT=fail
+		warn "бот не поставился: $BOT_ERR"
+		warn "VPN работает и без бота. Повторить: CF_API_TOKEN=… bash $0 --bot"
+	fi
+	save_state
+elif [ "$BOT_KEEP" = 1 ]; then
+	if bot_alive "$S_BOT_ORIGIN"; then ok "Телеграм-бот @$S_BOT_USER работает — не трогал"; else warn "Телеграм-бот @$S_BOT_USER не отвечает ($S_BOT_ORIGIN/healthz)"; fi
+	[ "$BOT_STALE" = 0 ] || warn "бот знает прежние настройки (домен, выход или порт SSH) — обнови его: CF_API_TOKEN=… bash $0 --bot"
+fi
+
 K=
 [ "$TEST_SELFSIGNED" = 1 ] && K=-k
 local_checks
@@ -3027,6 +3109,16 @@ rm -f /root/vpn-qr/*.png   # прежние QR (удалённых клиент�
 		echo "  (секретный; забрать: ssh -p $SSH_PORT $SSH_LOGIN@$PUBLIC_IP 'sudo cat /root/backups/latest.tgz' > latest.tgz), дальше — README.md"
 	fi
 	echo "  в архиве (restore.sh$([ "$MODE" = domain ] && echo ", потом смена A-записи")). Сам бэкап не запускается."
+	if [ "${S_BOT:-}" = 1 ]; then
+		echo
+		echo "Телеграм-бот для управления VPN: @${S_BOT_USER:-?} — https://t.me/${S_BOT_USER:-}"
+		echo "  клиенты, статистика, проверка блокировки раз в 3 часа, бэкапы, переезд на новый сервер кнопкой"
+		[ "${BOT_RESULT:-}" != fail ] || echo "  ⚠ в этот раз бот не обновился: ${BOT_ERR:-} (повторить: CF_API_TOKEN=… bash install-vpn.sh --bot)"
+	elif [ -n "${BOT_SKIP:-}" ] || [ "${BOT_RESULT:-}" = fail ]; then
+		echo
+		echo "Телеграм-бот не поставлен: ${BOT_ERR:-$BOT_SKIP}"
+		echo "  повторить: CF_API_TOKEN=… VPN_BOT_TOKEN=… bash install-vpn.sh --bot"
+	fi
 } > "$INFO"
 chmod 600 "$INFO"
 cat "$INFO"
@@ -3040,6 +3132,10 @@ while IFS='|' read -r c l; do
 done < "$WORK/qr"
 echo "То же самое — в $INFO, QR-картинки — в /root/vpn-qr/. Журнал установки: $LOG"
 echo "Заняло $(($(date +%s) - START)) с."
+if [ "${S_BOT:-}" = 1 ] && [ -n "${S_BOT_USER:-}" ]; then
+	printf '\n\033[1;36m═══ Телеграм-бот ═══\033[0m\n'
+	printf '  \033[1mhttps://t.me/%s\033[0m — управление VPN из Телеграма\n' "$S_BOT_USER"
+fi
 # Панель — последним блоком: QR-коды выше длинные, и начало вывода уезжает за экран.
 printf '\n\033[1;36m═══ Панель 3x-ui ═══\033[0m\n'
 if [ "$MODE" = domain ]; then

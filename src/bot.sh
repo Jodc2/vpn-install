@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034  # переменные BOT_* читает install-vpn.sh, куда этот файл вшит
 # Телеграм-бот vpn-bot в установщике: всё, что ходит в Cloudflare и Телеграм. build.py вшивает этот
 # файл в install-vpn.sh (__EMBED_BOT_FUNCS__); здесь только функции и значения по умолчанию.
 # Секреты — только в файлах $BOT_DIR (600), в argv процессов их нет: curl берёт заголовок с токеном
@@ -107,9 +108,13 @@ except Exception:
 
 bot_cf_check() {  # → BOT_ZONE BOT_ACC BOT_KV_ID BOT_SUBDOMAIN BOT_EXISTING(none|ours|foreign); 1 и BOT_ERR
 	local z body n
-	BOT_ZONE= BOT_ACC= BOT_KV_ID= BOT_SUBDOMAIN= BOT_EXISTING= BOT_ERR=
+	BOT_ZONE='' BOT_ACC='' BOT_KV_ID='' BOT_SUBDOMAIN='' BOT_EXISTING='' BOT_ERR=''
 	for z in $(bot_zone_candidates "$DOMAIN"); do
 		body=$(cf_api GET "/zones?name=$z") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+		if ! cf_ok <<< "$body"; then
+			BOT_ERR="Cloudflare не принял токен ($(cf_err <<< "$body")) — скопирован целиком и с правами из ссылки?"
+			return 1
+		fi
 		BOT_ZONE=$(jget result.0.id <<< "$body")
 		[ -z "$BOT_ZONE" ] || { BOT_ACC=$(jget result.0.account.id <<< "$body"); break; }
 	done
@@ -164,7 +169,7 @@ sys.exit(0 if ours else 1)' "$BOT_KV_ID" <<< "$body"; then BOT_EXISTING=ours; el
 
 bot_tg_check() {  # → BOT_USERNAME BOT_HOOK_URL; 1 и BOT_ERR
 	local body
-	BOT_USERNAME= BOT_HOOK_URL= BOT_ERR=
+	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ERR=''
 	body=$(tg_api getMe) || { BOT_ERR="Телеграм не отвечает"; return 1; }
 	BOT_USERNAME=$(jget result.username <<< "$body")
 	if [ "$(jget ok <<< "$body")" != true ] || [ -z "$BOT_USERNAME" ]; then
@@ -196,9 +201,10 @@ bot_consent() {  # bot_consent ВОПРОС → 0 только на явное �
 	case $BOT_ANSWER in y | Y | yes | Yes | д | Д | да | Да | ДА) return 0 ;; *) return 1 ;; esac
 }
 
+# shellcheck disable=SC2120  # срок ожидания — необязательный аргумент (в тестах — короткий)
 bot_pair() {  # bot_pair [СЕКУНД=300] → BOT_ADMIN_ID BOT_ADMIN_NAME: кто написал боту и подтвердил «это я»
 	local secs=${1:-300} deadline left offset=0 body uid fid fname uname ctype
-	BOT_ADMIN_ID= BOT_ADMIN_NAME= BOT_ERR=
+	BOT_ADMIN_ID='' BOT_ADMIN_NAME='' BOT_ERR=''
 	bot_tty_ok || { BOT_ERR="привязать владельца можно только в терминале (или задайте VPN_BOT_ADMIN_ID)"; return 1; }
 	if [ -n "${BOT_HOOK_URL:-}" ]; then
 		if ! bot_hook_is_ours && ! bot_consent "Бот @$BOT_USERNAME сейчас подключён к $BOT_HOOK_URL — перенастроить его на этот сервер?"; then
@@ -361,7 +367,7 @@ bot_deploy() {  # → BOT_ORIGIN BOT_REPORT; 1 и BOT_ERR. Секреты из $
 
 bot_deploy_steps() {
 	local body sub f p kb res
-	BOT_ERR= BOT_REPORT=
+	BOT_ERR='' BOT_REPORT=''
 	if [ -z "${BOT_KV_ID:-}" ]; then
 		printf '{"title":"%s-state"}' "$BOT_WORKER" > "$BOT_DIR/req.json"
 		body=$(cf_api POST "/accounts/$BOT_ACC/storage/kv/namespaces" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
@@ -499,4 +505,79 @@ print("RESULT " + ("; ".join(bad) if bad else "ok"))' "$(bot_http '/selftest?par
 	BOT_REPORT+=$(grep -v '^RESULT ' <<< "$res")
 	res=$(sed -n 's/^RESULT //p' <<< "$res")
 	[ "$res" = ok ] || { BOT_ERR=$res; return 1; }
+}
+
+bot_decide() {  # → BOT_DO (разворачивать сейчас), BOT_KEEP (бот есть — не трогать), BOT_STALE, BOT_ASK (спросить [y/N])
+	BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_ASK=0
+	[ "${MODE:-}" = domain ] || return 0
+	[ "${BOT_ARG:-}" != 0 ] || return 0
+	if [ "${S_BOT:-}" = 1 ]; then
+		# Повтор меняет то, на что бот опирается, — без обновления он открыл бы при переезде порт не там.
+		if [ "${DOMAIN:-}" != "${S_DOMAIN_OLD:-}" ] || [ "${EXIT_MODE:-}" != "${S_EXIT:-}" ] ||
+			{ [ -n "${EXIT_HOST:-}" ] && [ "$EXIT_HOST" != "${CHAIN_IP:-}" ]; } ||
+			{ [ -n "${EXIT_PORT_ARG:-}" ] && [ "$EXIT_PORT_ARG" != "${CHAIN_PORT:-}" ]; } ||
+			{ [ -n "${S_BOT_SSH_PORT:-}" ] && [ -n "${SSH_PORT_NOW:-}" ] && [ "$S_BOT_SSH_PORT" != "$SSH_PORT_NOW" ]; }; then
+			BOT_STALE=1
+		fi
+		if [ -n "${BOT_CF_TOKEN:-}" ] || [ "${BOT_ARG:-}" = 1 ]; then BOT_DO=1; else BOT_KEEP=1; fi
+	elif [ "${BOT_ARG:-}" = 1 ]; then
+		BOT_DO=1
+	elif [ -z "${S_BOT:-}" ] && bot_tty_ok; then
+		BOT_ASK=1
+	fi
+}
+
+bot_ask_secret() {  # bot_ask_secret ВОПРОС → BOT_ANSWER (ввод не отображается); 1 — спросить некого
+	BOT_ANSWER=
+	bot_tty_ok || return 1
+	if [ -n "${BOT_TTY_FD:-}" ]; then
+		printf '%s' "$1" >> "$WORK/tty.out"
+		IFS= read -rs BOT_ANSWER <&"$BOT_TTY_FD" || BOT_ANSWER=
+	else
+		printf '%s' "$1" > /dev/tty
+		IFS= read -rs BOT_ANSWER < /dev/tty || BOT_ANSWER=
+		echo > /dev/tty
+	fi
+	BOT_ANSWER=$(printf '%s' "$BOT_ANSWER" | tr -d '[:space:]')   # вставка из буфера несёт пробелы и \r
+}
+
+bot_read_tokens() {  # спросить недостающие токены; без терминала — что дано окружением
+	if [ "${BOT_KEEP:-0}" = 1 ]; then   # бот есть, но знает прежние настройки — предложить обновить
+		bot_tty_ok || return 0
+		bot_say "Бот @${S_BOT_USER:-?} знает прежние настройки (домен, выход или порт SSH) — чтобы обновить его, нужен токен Cloudflare:"
+		bot_say "  $(bot_template_url)"
+		bot_ask_secret "Токен Cloudflare (Enter — оставить бота как есть): " || return 0
+		[ -n "$BOT_ANSWER" ] || return 0
+		BOT_CF_TOKEN=$BOT_ANSWER BOT_DO=1 BOT_KEEP=0
+		return 0
+	fi
+	if [ -z "${BOT_CF_TOKEN:-}" ] && bot_tty_ok; then
+		bot_say "1) Токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
+		bot_say "   $(bot_template_url)"
+		bot_ask_secret "   Токен Cloudflare (не отобразится): " || true
+		BOT_CF_TOKEN=$BOT_ANSWER
+	fi
+	if [ -z "${BOT_TG_TOKEN:-}" ] && bot_tty_ok; then
+		if [ "${S_BOT:-}" = 1 ]; then
+			bot_ask_secret "2) Токен бота (Enter — прежний бот): " || true
+		else
+			bot_say "2) Токен бота: в Телеграме открой @BotFather → /newbot → придумай имя → скопируй токен вида 123456789:AAE…"
+			bot_ask_secret "   Токен бота (не отобразится): " || true
+		fi
+		BOT_TG_TOKEN=$BOT_ANSWER
+	fi
+	if [ -z "${BOT_CF_TOKEN:-}" ]; then
+		BOT_DO=0
+		BOT_SKIP="не дан токен Cloudflare"
+	fi
+}
+
+bot_retry() {  # после неудачной проверки: «ещё раз?» и, если надо, другие токены (Enter — те же)
+	bot_ask "Попробовать ещё раз? [Y/n]: " || return 1
+	case $BOT_ANSWER in n | N | no | No | н | Н | нет | Нет | НЕТ) return 1 ;; esac
+	bot_ask_secret "Токен Cloudflare (Enter — тот же): " || true
+	[ -z "$BOT_ANSWER" ] || BOT_CF_TOKEN=$BOT_ANSWER
+	bot_ask_secret "Токен бота (Enter — тот же): " || true
+	[ -z "$BOT_ANSWER" ] || BOT_TG_TOKEN=$BOT_ANSWER
+	bot_init_secrets
 }
