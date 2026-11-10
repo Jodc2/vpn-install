@@ -572,6 +572,77 @@ test_cover_sites_exclude_broken() {  # проверено живьём 2026-11-1
 	t_has "www.apple.com" "$exit_list" "у выхода остались рабочие кандидаты"
 }
 
+# ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
+# Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
+# («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.
+exit_fns() {
+	eval "$(awk '/^(exit_ssh_opts|exit_conn_failed|exit_retry|ssh_exit|scp_exit|ssh_exit_in)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	EXIT_SSH_KEY='' EXIT_PASS=pw EXIT_SSH_PORT=22 EXIT_SSH_USER=root EXIT_HOST=5.6.7.8 EXIT_SSH_RETRY_SLEEP=0
+	mkdir -p "$WORK/bin"
+	cat > "$WORK/bin/ssh" <<'SSH'
+#!/bin/bash
+n=$(($(cat "$WORK/ssh.n" 2> /dev/null || echo 0) + 1)); echo "$n" > "$WORK/ssh.n"
+in=; [ -t 0 ] || in=$(timeout 1 cat 2> /dev/null | tr '\n' '/')
+echo "$(basename "$0") in=$in" >> "$WORK/ssh.calls"
+IFS='|' read -r code err out < <(sed -n "${n}p" "$WORK/ssh.plan")
+[ -z "$err" ] || echo "$err" >&2
+[ -z "$out" ] || echo "$out"
+exit "${code:-0}"
+SSH
+	chmod +x "$WORK/bin/ssh"; cp "$WORK/bin/ssh" "$WORK/bin/scp"
+	printf '#!/bin/bash\n[ "$1" = -e ] && shift\nexec "$@"\n' > "$WORK/bin/sshpass"; chmod +x "$WORK/bin/sshpass"
+	PATH="$WORK/bin:$PATH"
+}
+test_exit_ssh_retries_lost_connection() {
+	exit_fns
+	printf '%s\n' '255|Connection to 5.6.7.8 port 22 timed out|' '0||/root' > "$WORK/ssh.plan"
+	local out rc=0
+	out=$(ssh_exit 'printf %s "$HOME"' 2> "$WORK/err") || rc=$?
+	t_eq 0 "$rc" "код после повтора"
+	t_eq /root "$out" "ответ второй попытки"
+	t_eq 2 "$(wc -l < "$WORK/ssh.calls")" "попыток"
+}
+test_exit_ssh_retries_banner_and_kex_drops() {
+	exit_fns
+	printf '%s\n' '255|kex_exchange_identification: read: Connection reset by peer|' '255|Connection closed by 5.6.7.8 port 22|' '0||ok' > "$WORK/ssh.plan"
+	t_eq ok "$(ssh_exit true 2> /dev/null)" "третья попытка"
+	t_eq 3 "$(wc -l < "$WORK/ssh.calls")" "попыток"
+}
+test_exit_ssh_no_retry_once_session_started() {  # команда могла уже выполниться — повторять нельзя
+	exit_fns
+	local e rc
+	for e in 'Connection to 5.6.7.8 closed by remote host.' 'client_loop: send disconnect: Connection reset by peer' 'Permission denied, please try again.'; do
+		rm -f "$WORK/ssh.n" "$WORK/ssh.calls"
+		printf '%s\n' "255|$e|" '0||второй раз' > "$WORK/ssh.plan"
+		rc=0; ssh_exit 'rm -rf /x' > /dev/null 2> "$WORK/err" || rc=$?
+		t_eq 255 "$rc" "код при «$e»"
+		t_eq 1 "$(wc -l < "$WORK/ssh.calls")" "попыток при «$e»"
+		t_has "$e" "$(cat "$WORK/err")" "сообщение ssh не потерялось"
+	done
+}
+test_exit_ssh_gives_up() {
+	exit_fns
+	printf '%s\n' '255|Connection to 5.6.7.8 port 22 timed out|' '255|Connection to 5.6.7.8 port 22 timed out|' '255|Connection to 5.6.7.8 port 22 timed out|' '0||поздно' > "$WORK/ssh.plan"
+	local rc=0
+	ssh_exit true > /dev/null 2> "$WORK/err" || rc=$?
+	t_eq 255 "$rc" "код"
+	t_eq 3 "$(wc -l < "$WORK/ssh.calls")" "попыток"
+	t_has "timed out" "$(cat "$WORK/err")" "причина видна"
+}
+test_exit_ssh_in_replays_stdin() {
+	exit_fns
+	printf '%s\n' '255|Connection to 5.6.7.8 port 22 timed out|' '0||ok' > "$WORK/ssh.plan"
+	t_eq ok "$(printf '%s\n' 'sudo-pw' | ssh_exit_in "sudo -S true" 2> /dev/null)" "ответ"
+	t_eq "ssh in=sudo-pw/" "$(sed -n 2p "$WORK/ssh.calls")" "пароль sudo дошёл и до повтора"
+}
+test_scp_exit_retries() {
+	exit_fns
+	printf '%s\n' '255|ssh: connect to host 5.6.7.8 port 22: Connection timed out|' '0||' > "$WORK/ssh.plan"
+	echo x > "$WORK/f"
+	scp_exit "$WORK/f" /tmp/f 2> /dev/null || t_fail "scp не повторился"
+	t_eq 2 "$(grep -c '^scp ' "$WORK/ssh.calls")" "попыток scp"
+}
+
 # ——— прогон ———
 PASS=0
 FAILN=0

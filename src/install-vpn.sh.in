@@ -1244,29 +1244,55 @@ exit_ssh_opts() {  # общие опции ssh/scp к старому серве�
 		EXIT_SSH_OPTS+=(-o PubkeyAuthentication=no)
 	fi
 }
+# Соединение не установилось (потерянный SYN, обрыв на приветствии или обмене ключами — бывает у хостеров
+# с фильтрами от DDoS): команда на старом сервере не начиналась, и повтор безопасен. Обрыв посреди сеанса
+# («closed by remote host», «client_loop: …») и отказ в пароле не повторяются — команда могла уже пройти.
+exit_conn_failed() {  # exit_conn_failed КОД ФАЙЛ_STDERR
+	[ "$1" = 255 ] && grep -qE '^(ssh: connect to host [^ ]+ port [0-9]+: Connection timed out|Connection to [^ ]+ port [0-9]+ timed out|Connection timed out during banner exchange|kex_exchange_identification: .*|Connection (closed|reset) by [^ ]+ port [0-9]+)$' "$2"
+}
+exit_retry() {  # exit_retry [--in СТРОКА] КОМАНДА… — до 3 попыток, пока соединение не установилось; stderr — последней
+	local feed=0 in='' try=1 rc err=$WORK/exit_ssh.err
+	if [ "$1" = --in ]; then feed=1 in=$2; shift 2; fi
+	while :; do
+		rc=0
+		if [ "$feed" = 1 ]; then "$@" <<< "$in" 2> "$err" || rc=$?; else "$@" 2> "$err" || rc=$?; fi
+		if [ "$try" -lt "${EXIT_SSH_TRIES:-3}" ] && exit_conn_failed "$rc" "$err"; then
+			try=$((try + 1))
+			sleep "${EXIT_SSH_RETRY_SLEEP:-3}"
+			continue
+		fi
+		cat "$err" >&2
+		rm -f "$err"
+		return "$rc"
+	done
+}
 ssh_exit() {  # ssh на старый сервер (ключ EXIT_SSH_KEY, иначе пароль из EXIT_PASS); -n — не трогать терминал
 	exit_ssh_opts
 	if [ -n "$EXIT_SSH_KEY" ]; then
-		ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
+		exit_retry ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
 	else
-		SSHPASS="${EXIT_PASS:-}" sshpass -e ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
+		SSHPASS="${EXIT_PASS:-}" exit_retry sshpass -e ssh -n "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
 	fi
 }
 scp_exit() {  # scp файла $1 на старый сервер в $2
 	exit_ssh_opts
 	if [ -n "$EXIT_SSH_KEY" ]; then
-		scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "$EXIT_SSH_USER@$EXIT_HOST:$2"
+		exit_retry scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "$EXIT_SSH_USER@$EXIT_HOST:$2"
 	else
-		SSHPASS="${EXIT_PASS:-}" sshpass -e scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "$EXIT_SSH_USER@$EXIT_HOST:$2"
+		SSHPASS="${EXIT_PASS:-}" exit_retry sshpass -e scp "${EXIT_SSH_OPTS[@]}" -P "$EXIT_SSH_PORT" "$1" "$EXIT_SSH_USER@$EXIT_HOST:$2"
 	fi
 }
 
-ssh_exit_in() {  # как ssh_exit, но stdin уходит удалённой команде (пароль для sudo -S)
+ssh_exit_in() {  # как ssh_exit, но stdin уходит удалённой команде (пароль для sudo -S); при повторе — тот же
+	local in
+	in=$(cat; echo .)
+	in=${in%.}
+	in=${in%$'\n'}   # <<< вернёт перевод строки сам
 	exit_ssh_opts
 	if [ -n "$EXIT_SSH_KEY" ]; then
-		ssh "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
+		exit_retry --in "$in" ssh "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
 	else
-		SSHPASS="${EXIT_PASS:-}" sshpass -e ssh "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
+		SSHPASS="${EXIT_PASS:-}" exit_retry --in "$in" sshpass -e ssh "${EXIT_SSH_OPTS[@]}" -p "$EXIT_SSH_PORT" "$EXIT_SSH_USER@$EXIT_HOST" "$@"
 	fi
 }
 
