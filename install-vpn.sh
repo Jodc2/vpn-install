@@ -382,8 +382,19 @@ dns_conflicts() {  # dns_conflicts ЗАПИСИ IP → что мешает на�
 	printf '%s' "$out"
 }
 
+dns_zone_of() {  # dns_zone_of ИМЯ → домен аккаунта (из DNS_ZONES), в котором лежит имя: «ID<TAB>ДОМЕН»; самый длинный
+	local id z best='' bl=0
+	while IFS=$'\t' read -r id z; do
+		[ -n "$z" ] || continue
+		if [ "$1" = "$z" ] || [[ $1 == *".$z" ]]; then
+			if [ "${#z}" -gt "$bl" ]; then best="$id"$'\t'"$z" bl=${#z}; fi
+		fi
+	done <<< "$DNS_ZONES"
+	printf '%s' "$best"
+}
+
 dns_pick() {  # выбрать домен из Cloudflare и адрес VPN на нём → DOMAIN DNS_ZONE_ID DNS_REPOINT; 1 и BOT_ERR
-	local zones n i=1 ans zid zname name myip recs conflicts
+	local zones n i=1 ans zid zname name myip recs conflicts oz
 	DNS_REPOINT=0 BOT_ERR=
 	[ -n "${DNS_ZONES:-}" ] || cf_zones || return 1
 	zones=$DNS_ZONES
@@ -412,7 +423,16 @@ dns_pick() {  # выбрать домен из Cloudflare и адрес VPN на
 		case $ans in
 			"" | "$zname") name=$zname ;;
 			*".$zname") name=$ans ;;
-			*) name=$ans.$zname ;;
+			*)
+				oz=$(dns_zone_of "$ans")
+				if [ -n "$oz" ]; then   # вписали полное имя в другом домене аккаунта — берём тот домен
+					zid=${oz%%$'\t'*} zname=${oz#*$'\t'} name=$ans
+				elif [[ $ans == *.* ]] && ! bot_consent "Адрес будет $ans.$zname — так?"; then
+					continue   # похоже на полное имя чужого домена, а не на поддомен
+				else
+					name=$ans.$zname
+				fi
+				;;
 		esac
 		if ! [[ $name =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]+$ ]]; then
 			bot_say "  ✗ «$name» — не имя домена"
@@ -509,6 +529,7 @@ dns_apply() {  # шаг DNS (IP известен): одна A-запись $DOMA
 
 dns_wait() {  # запись только что поставлена: ждать, пока DNS отдаёт $DOMAIN → $PUBLIC_IP (до ~2 мин)
 	local i a
+	sleep "${DNS_WAIT_FIRST:-5}"   # не спрашивать сразу: ответ «нет такого имени» осел бы в кэше резолвера
 	for i in $(seq 1 "${DNS_WAIT_TRIES:-24}"); do
 		a=$(resolve "$DOMAIN" A 2> /dev/null || true)
 		case " $a " in *" $PUBLIC_IP "*) return 0 ;; esac
@@ -620,7 +641,13 @@ bot_ask() {  # bot_ask ВОПРОС → BOT_ANSWER; 1 — спросить не�
 		IFS= read -r BOT_ANSWER < /dev/tty || BOT_ANSWER=
 	fi
 }
+bot_tty_flush() {  # выбросить набранное заранее: поздний вопрос не должен получить ответ, набранный на другой
+	local _
+	[ -z "${BOT_TTY_FD:-}" ] || return 0
+	while IFS= read -r -t 0.1 _ < /dev/tty; do :; done 2> /dev/null || true
+}
 bot_consent() {  # bot_consent ВОПРОС → 0 только на явное «да»
+	bot_tty_flush
 	bot_ask "$1 [y/N]: " || return 1
 	case $BOT_ANSWER in y | Y | yes | Yes | д | Д | да | Да | ДА) return 0 ;; *) return 1 ;; esac
 }
@@ -1075,7 +1102,7 @@ bot_read_tokens() {  # спросить недостающие токены; б�
 		bot_ask_secret "   Токен Cloudflare (не отобразится): " || true
 		BOT_CF_TOKEN=$BOT_ANSWER
 	fi
-	if [ -z "${BOT_TG_TOKEN:-}" ] && bot_tty_ok; then
+	if [ -z "${BOT_TG_TOKEN:-}" ] && ! { [ -n "${BOT_DIR:-}" ] && [ -s "$BOT_DIR/tg.token" ]; } && bot_tty_ok; then
 		if [ "${S_BOT:-}" = 1 ]; then
 			bot_ask_secret "2) Токен бота (Enter — прежний бот): " || true
 		else
@@ -2013,7 +2040,7 @@ BOT_SOURCE=acf1836
 BOT_CF_TOKEN=${CF_API_TOKEN:-}
 BOT_TG_TOKEN=${VPN_BOT_TOKEN:-}
 unset CF_API_TOKEN VPN_BOT_TOKEN   # дальше токены — только в переменных скрипта и файлах 600
-DNS_FROM_CF=0 DNS_NOT_CF=0 DNS_ZONES='' DNS_ZONE_ID='' DNS_REPOINT=0 DNS_REPORT=''
+DNS_FROM_CF=0 DNS_NOT_CF=0 DNS_ZONES='' DNS_ZONE_ID='' DNS_REPOINT=0 DNS_REPORT='' DNS_SET_BY_API=0
 
 MODE=
 S_MODE=$(state_val S_MODE || true)
@@ -2363,6 +2390,61 @@ resolve() {  # resolve ИМЯ A|AAAA → записи через DoH (не че�
 		return 0
 	done
 	return 1
+}
+
+dns_verify() {  # A-запись домена указывает сюда (по DoH)? Если её только что поставил сам скрипт (DNS_SET_BY_API),
+	# старый ответ из кэша DNS (до 5 мин) — не повод останавливаться: в Cloudflare уже верно, Let's Encrypt спросит сам.
+	local A first AAAA
+	A=$(resolve "$DOMAIN" A) || die "не удалось проверить DNS (нет доступа к cloudflare-dns.com и dns.google)"
+	case " $A " in
+		*" $PUBLIC_IP "*) ok "A-запись $DOMAIN указывает на этот сервер" ;;
+		*)
+			if [ "${DNS_SET_BY_API:-0}" = 1 ]; then
+				warn "в Cloudflare $DOMAIN уже указывает на этот сервер, а DNS ещё отдаёт ${A:-пустой ответ} — это кэш (до 5 мин), продолжаю"
+			elif [ -z "$A" ]; then
+				die "у $DOMAIN нет A-записи. Создайте её: $DOMAIN → $PUBLIC_IP (в Cloudflare — Proxy выключен, серое облако), подождите пару минут и запустите снова"
+			else
+				first=${A%% *}
+				if is_cloudflare_ip "$first"; then
+					die "$DOMAIN смотрит на Cloudflare ($A): в Cloudflare у A-записи выключите Proxy (облако должно быть серым) и запустите снова"
+				fi
+				die "A-запись $DOMAIN указывает на $A, а IP этого сервера $PUBLIC_IP. Поправьте A-запись, подождите пару минут и запустите снова (или --skip-dns-check, если знаете, что делаете)"
+			fi
+			;;
+	esac
+	AAAA=$(resolve "$DOMAIN" AAAA || true)
+	if [ -n "$AAAA" ]; then
+		if [ "${DNS_SET_BY_API:-0}" = 1 ]; then
+			warn "DNS ещё отдаёт удалённую AAAA-запись $DOMAIN ($AAAA) — это кэш, пройдёт сам"
+		else
+			die "у $DOMAIN есть AAAA-запись ($AAAA): IPv6 на сервере выключается, а Let's Encrypt и клиенты пойдут по IPv6. Удалите AAAA-запись и запустите снова"
+		fi
+	fi
+}
+
+dns_step() {  # шаг DNS: есть токен Cloudflare — A-запись ставит сам скрипт (запись на чужой IP — только с согласием,
+	# без терминала — остановка); потом проверка через DNS. Без бота токен стирается сразу.
+	local l
+	[ "$MODE" = domain ] || return 0
+	if [ "$SKIP_DNS" = 1 ]; then
+		warn "A-запись домена не проверялась (--skip-dns-check)"
+		return 0
+	fi
+	if [ "$DNS_NOT_CF" = 0 ] && bot_have_cf_token; then
+		bot_init_secrets
+		if [ -n "$DNS_ZONE_ID" ] || dns_find_zone; then
+			dns_apply || die "$BOT_ERR"
+			DNS_SET_BY_API=1
+			if [ -n "$DNS_REPORT" ]; then
+				while IFS= read -r l; do [ -z "$l" ] || ok "$l"; done <<< "$DNS_REPORT"
+				dns_wait || true   # не дождались — dns_verify скажет про кэш
+			fi
+		else
+			warn "${BOT_ERR:-токен Cloudflare не видит домен $DOMAIN} — A-запись проверяю как обычно"
+		fi
+		[ "$BOT_DO" = 1 ] || bot_wipe   # без бота токен был нужен только для DNS
+	fi
+	dns_verify
 }
 
 is_cloudflare_ip() {
@@ -3984,44 +4066,7 @@ detect_ips
 if [ "$PUBLIC_IP" = "$LISTEN_IP" ]; then ok "IP сервера $PUBLIC_IP"; else ok "IP сервера $PUBLIC_IP (на интерфейсе $LISTEN_IP — сервер за NAT, так тоже работает)"; fi
 ip_precheck
 
-# Есть токен Cloudflare — A-запись ставит сам скрипт: создаёт, выключает облако; запись на чужой IP — только
-# с согласием, данным на вопросах (без терминала — останавливается). Дальше — обычная проверка через DNS.
-if [ "$MODE" = domain ] && [ "$SKIP_DNS" = 0 ] && [ "$DNS_NOT_CF" = 0 ] && bot_have_cf_token; then
-	bot_init_secrets
-	if [ -n "$DNS_ZONE_ID" ] || dns_find_zone; then
-		dns_apply || die "$BOT_ERR"
-		if [ -n "$DNS_REPORT" ]; then
-			while IFS= read -r l; do [ -z "$l" ] || ok "$l"; done <<< "$DNS_REPORT"
-			dns_wait || warn "DNS ещё не отдаёт $DOMAIN → $PUBLIC_IP — проверяю как обычно"
-		fi
-	else
-		warn "${BOT_ERR:-токен Cloudflare не видит домен $DOMAIN} — A-запись проверяю как обычно"
-	fi
-	[ "$BOT_DO" = 1 ] || bot_wipe   # без бота токен был нужен только для DNS
-fi
-
-if [ "$MODE" = nodomain ]; then
-	:
-elif [ "$SKIP_DNS" = 1 ]; then
-	warn "A-запись домена не проверялась (--skip-dns-check)"
-else
-	A=$(resolve "$DOMAIN" A) || die "не удалось проверить DNS (нет доступа к cloudflare-dns.com и dns.google)"
-	if [ -z "$A" ]; then
-		die "у $DOMAIN нет A-записи. Создайте её: $DOMAIN → $PUBLIC_IP (в Cloudflare — Proxy выключен, серое облако), подождите пару минут и запустите снова"
-	fi
-	case " $A " in
-		*" $PUBLIC_IP "*) ok "A-запись $DOMAIN указывает на этот сервер" ;;
-		*)
-			first=${A%% *}
-			if is_cloudflare_ip "$first"; then
-				die "$DOMAIN смотрит на Cloudflare ($A): в Cloudflare у A-записи выключите Proxy (облако должно быть серым) и запустите снова"
-			fi
-			die "A-запись $DOMAIN указывает на $A, а IP этого сервера $PUBLIC_IP. Поправьте A-запись, подождите пару минут и запустите снова (или --skip-dns-check, если знаете, что делаете)"
-			;;
-	esac
-	AAAA=$(resolve "$DOMAIN" AAAA || true)
-	[ -z "$AAAA" ] || die "у $DOMAIN есть AAAA-запись ($AAAA): IPv6 на сервере выключается, а Let's Encrypt и клиенты пойдут по IPv6. Удалите AAAA-запись и запустите снова"
-fi
+dns_step
 
 if [ "$BOT_DO" = 1 ]; then
 	say "Телеграм-бот: проверка токенов"

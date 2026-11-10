@@ -1006,12 +1006,134 @@ test_have_cf_token_from_file() {  # токен ввели на выборе до
 	rm -f "$BOT_DIR/cf.hdr"
 	! bot_have_cf_token || t_fail "токена нет, а он «есть»"
 }
-test_read_tokens_skips_cf_when_in_file() {
-	base_env; BOT_CF_TOKEN='' BOT_TG_TOKEN='' S_BOT=''
+test_read_tokens_skips_cf_when_in_file() {  # токен Cloudflare в файле (ввели при выборе домена), токена бота нет
+	base_env; BOT_CF_TOKEN='' BOT_TG_TOKEN='' S_BOT=''; rm -f "$BOT_DIR/tg.token"
 	answers TGTOKEN
 	bot_read_tokens
 	! grep -q 'Токен Cloudflare' "$WORK/tty.out" || t_fail "токен Cloudflare спрошен второй раз"
 	t_eq TGTOKEN "$BOT_TG_TOKEN" "токен бота"
+}
+
+# ——— ревью выбора домена (10.11): токен бота из окружения, имена, поздний вопрос, шаг DNS ———
+test_read_tokens_keeps_env_bot_token() {  # токен бота дан окружением и уже в файле — не спрашивать заново
+	base_env; BOT_CF_TOKEN='' BOT_TG_TOKEN='' S_BOT=''
+	answers SHOULD-NOT-BE-ASKED
+	bot_read_tokens
+	! grep -q 'Токен бота' "$WORK/tty.out" 2> /dev/null || t_fail "токен бота спрошен, хотя он дан"
+	t_eq t "$(cat "$BOT_DIR/tg.token")" "прежний токен бота на месте"
+}
+test_dns_pick_other_zone_full_name() {  # выбрали один домен, а вписали полное имя другого из того же аккаунта
+	zones_env; recs Z2 vpn.other.org '[]'
+	answers 1 vpn.other.org
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq vpn.other.org "$DOMAIN" "имя как вписано"; t_eq Z2 "$DNS_ZONE_ID" "зона — того домена"
+}
+test_dns_pick_dotted_name_confirmed() {  # имя с точкой не из аккаунта — переспросить, по умолчанию «нет»
+	zones_env; recs Z1 vpn.example.com '[]'
+	answers 1 vpn.unknown.net '' vpn
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq vpn.example.com "$DOMAIN" "после «нет» — новое имя"
+	t_has "vpn.unknown.net.example.com" "$(cat "$WORK/tty.out")" "переспросил с итоговым адресом"
+}
+test_dns_pick_multilevel_subdomain_yes() {
+	zones_env; recs Z1 vpn.eu.example.com '[]'
+	answers 1 vpn.eu y
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq vpn.eu.example.com "$DOMAIN" "многоуровневый поддомен по «да»"
+}
+test_dns_pick_unknown_server_ip_asks() {  # IP сервера не узнать — любая A-запись под вопросом
+	zones_env; one_zone; bot_public_ip() { :; }
+	recs Z1 example.com '[{"id":"R1","type":"A","name":"example.com","content":"1.2.3.4","proxied":false}]'
+	recs Z1 vpn.example.com '[]'
+	answers '' n vpn
+	dns_pick || t_fail "не выбрал: $BOT_ERR"
+	t_eq vpn.example.com "$DOMAIN" "после «нет» — другое имя"
+	grep -q '\[y/N\]' "$WORK/tty.out" || t_fail "не спросил"
+}
+test_consent_flushes_typeahead() {  # поздний вопрос не должен получить «y», набранное раньше на другой вопрос
+	base_env; answers n
+	bot_tty_flush() { echo flush >> "$WORK/flush.calls"; }
+	! bot_consent "Перенаправить?" || t_fail "согласие из ниоткуда"
+	t_eq flush "$(cat "$WORK/flush.calls" 2> /dev/null)" "набранное заранее сброшено перед вопросом"
+}
+test_dns_apply_no_terminal_refuses() {  # без терминала чужую запись не трогаем никогда
+	dns_env; recs Z1 vpn.example.com '[{"id":"R1","type":"A","name":"vpn.example.com","content":"9.9.9.9","proxied":false}]'
+	bot_tty_ok() { return 1; }
+	! dns_apply || t_fail "перенаправил без терминала"
+	t_eq "" "$(cf_writes)" "ничего не писал"
+	t_has "в терминале" "$BOT_ERR" "сказано, как дать согласие"
+}
+test_init_secrets_without_work() {  # на вопросах $WORK ещё нет: свой каталог 700, файлы 600, ловушка его уберёт
+	local t=$WORK/tmpd d
+	mkdir -p "$t"
+	(
+		WORK='' BOT_DIR='' TMPDIR=$t
+		BOT_CF_TOKEN=cfX bot_init_secrets
+		{ echo "$BOT_DIR"; stat -c %a "$BOT_DIR" "$BOT_DIR/cf.hdr"; trap -p EXIT; } > "$t/out"
+	)
+	d=$(sed -n 1p "$t/out")
+	case $d in "$t"/vpn-bot.*) ;; *) t_fail "каталог не в TMPDIR: $d" ;; esac
+	t_eq 700 "$(sed -n 2p "$t/out")" "права каталога"
+	t_eq 600 "$(sed -n 3p "$t/out")" "права файла"
+	t_has 'rm -rf' "$(sed -n 4p "$t/out")" "ловушка выхода"
+	[ ! -e "$d" ] || t_fail "каталог с токеном остался после выхода"
+}
+step_fns() {  # шаг DNS из шаблона (dns_step, dns_verify); die/ok/warn — строками в $WORK/out
+	eval "$(awk '/^(dns_step|dns_verify)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
+	ok() { echo "OK $*" >> "$WORK/out"; }
+	warn() { echo "WARN $*" >> "$WORK/out"; }
+	is_cloudflare_ip() { return 1; }
+	MODE=domain SKIP_DNS=0 DNS_NOT_CF=0 BOT_DO=0 DNS_SET_BY_API=0 DNS_WAIT_SLEEP=0 DNS_WAIT_FIRST=0 DNS_WAIT_TRIES=2
+	: > "$WORK/out"
+}
+cf_reqs() { grep -c . "$WORK/cf.calls" 2> /dev/null || true; }
+test_dns_step_no_token_no_cloudflare() {
+	dns_env; step_fns; rm -f "$BOT_DIR/cf.hdr" "$BOT_DIR/cf.token"; : > "$WORK/cf.calls"
+	resolve() { [ "$2" = A ] && echo 1.2.3.4; true; }
+	( dns_step ) || t_fail "упал: $(cat "$WORK/out")"
+	t_eq 0 "$(cf_reqs)" "запросов к Cloudflare"
+	t_has "указывает на этот сервер" "$(cat "$WORK/out")" "обычная проверка"
+}
+test_dns_step_not_cloudflare_no_requests() {
+	dns_env; step_fns; DNS_NOT_CF=1; : > "$WORK/cf.calls"
+	resolve() { [ "$2" = A ] && echo 1.2.3.4; true; }
+	( dns_step ) || t_fail "упал: $(cat "$WORK/out")"
+	t_eq 0 "$(cf_reqs)" "запросов к Cloudflare при домене не в Cloudflare"
+}
+test_dns_step_skip_dns_no_requests() {
+	dns_env; step_fns; SKIP_DNS=1; : > "$WORK/cf.calls"
+	( dns_step ) || t_fail "упал: $(cat "$WORK/out")"
+	t_eq 0 "$(cf_reqs)" "запросов к Cloudflare при --skip-dns-check"
+	t_has "не проверялась" "$(cat "$WORK/out")" "предупреждение"
+}
+test_dns_step_wipes_token_without_bot() {
+	dns_env; step_fns; recs Z1 vpn.example.com '[]'
+	resolve() { [ "$2" = A ] && echo 1.2.3.4; true; }
+	( dns_step; [ ! -e "$BOT_DIR/cf.hdr" ] && [ ! -e "$BOT_DIR/cf.token" ] || echo "TOKEN LEFT" >> "$WORK/out" ) || t_fail "упал: $(cat "$WORK/out")"
+	! grep -q 'TOKEN LEFT' "$WORK/out" || t_fail "без бота токен остался на диске"
+	grep -qx 'POST /zones/Z1/dns_records' "$WORK/cf.calls" || t_fail "запись не создана"
+}
+test_dns_step_keeps_token_for_bot() {
+	dns_env; step_fns; BOT_DO=1; recs Z1 vpn.example.com '[]'
+	resolve() { [ "$2" = A ] && echo 1.2.3.4; true; }
+	( dns_step; [ -s "$BOT_DIR/cf.hdr" ] || echo "TOKEN GONE" >> "$WORK/out" ) || t_fail "упал: $(cat "$WORK/out")"
+	! grep -q 'TOKEN GONE' "$WORK/out" || t_fail "токен для бота стёрт"
+	grep -qx 'POST /zones/Z1/dns_records' "$WORK/cf.calls" || t_fail "запись не создана"
+}
+test_dns_step_stale_cache_after_own_write_warns() {  # перенаправили сами, а кэш DNS ещё отдаёт старое — не останавливаться
+	dns_env; step_fns; DNS_REPOINT=1
+	recs Z1 vpn.example.com '[{"id":"R1","type":"A","name":"vpn.example.com","content":"9.9.9.9","proxied":false},{"id":"R2","type":"AAAA","name":"vpn.example.com","content":"2001:db8::1","proxied":false}]'
+	resolve() { case $2 in A) echo 9.9.9.9 ;; AAAA) echo 2001:db8::1 ;; esac; }
+	( dns_step ) || t_fail "остановился на собственной записи: $(cat "$WORK/out")"
+	! grep -q '^DIE' "$WORK/out" || t_fail "остановка: $(grep '^DIE' "$WORK/out")"
+	grep -q '^WARN.*кэш' "$WORK/out" || t_fail "не сказал про кэш DNS: $(cat "$WORK/out")"
+}
+test_dns_verify_strict_without_own_write() {  # запись ставил не скрипт — прежняя строгая проверка
+	dns_env; step_fns
+	resolve() { [ "$2" = A ] && echo 9.9.9.9; true; }
+	! ( dns_verify ) || t_fail "прошёл с чужой A-записью"
+	grep -q '^DIE.*9.9.9.9' "$WORK/out" || t_fail "нет понятной остановки: $(cat "$WORK/out")"
 }
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———

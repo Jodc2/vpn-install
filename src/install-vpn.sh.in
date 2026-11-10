@@ -206,7 +206,7 @@ __EMBED_BOT_BUNDLE__
 BOT_CF_TOKEN=${CF_API_TOKEN:-}
 BOT_TG_TOKEN=${VPN_BOT_TOKEN:-}
 unset CF_API_TOKEN VPN_BOT_TOKEN   # дальше токены — только в переменных скрипта и файлах 600
-DNS_FROM_CF=0 DNS_NOT_CF=0 DNS_ZONES='' DNS_ZONE_ID='' DNS_REPOINT=0 DNS_REPORT=''
+DNS_FROM_CF=0 DNS_NOT_CF=0 DNS_ZONES='' DNS_ZONE_ID='' DNS_REPOINT=0 DNS_REPORT='' DNS_SET_BY_API=0
 
 MODE=
 S_MODE=$(state_val S_MODE || true)
@@ -556,6 +556,61 @@ resolve() {  # resolve ИМЯ A|AAAA → записи через DoH (не че�
 		return 0
 	done
 	return 1
+}
+
+dns_verify() {  # A-запись домена указывает сюда (по DoH)? Если её только что поставил сам скрипт (DNS_SET_BY_API),
+	# старый ответ из кэша DNS (до 5 мин) — не повод останавливаться: в Cloudflare уже верно, Let's Encrypt спросит сам.
+	local A first AAAA
+	A=$(resolve "$DOMAIN" A) || die "не удалось проверить DNS (нет доступа к cloudflare-dns.com и dns.google)"
+	case " $A " in
+		*" $PUBLIC_IP "*) ok "A-запись $DOMAIN указывает на этот сервер" ;;
+		*)
+			if [ "${DNS_SET_BY_API:-0}" = 1 ]; then
+				warn "в Cloudflare $DOMAIN уже указывает на этот сервер, а DNS ещё отдаёт ${A:-пустой ответ} — это кэш (до 5 мин), продолжаю"
+			elif [ -z "$A" ]; then
+				die "у $DOMAIN нет A-записи. Создайте её: $DOMAIN → $PUBLIC_IP (в Cloudflare — Proxy выключен, серое облако), подождите пару минут и запустите снова"
+			else
+				first=${A%% *}
+				if is_cloudflare_ip "$first"; then
+					die "$DOMAIN смотрит на Cloudflare ($A): в Cloudflare у A-записи выключите Proxy (облако должно быть серым) и запустите снова"
+				fi
+				die "A-запись $DOMAIN указывает на $A, а IP этого сервера $PUBLIC_IP. Поправьте A-запись, подождите пару минут и запустите снова (или --skip-dns-check, если знаете, что делаете)"
+			fi
+			;;
+	esac
+	AAAA=$(resolve "$DOMAIN" AAAA || true)
+	if [ -n "$AAAA" ]; then
+		if [ "${DNS_SET_BY_API:-0}" = 1 ]; then
+			warn "DNS ещё отдаёт удалённую AAAA-запись $DOMAIN ($AAAA) — это кэш, пройдёт сам"
+		else
+			die "у $DOMAIN есть AAAA-запись ($AAAA): IPv6 на сервере выключается, а Let's Encrypt и клиенты пойдут по IPv6. Удалите AAAA-запись и запустите снова"
+		fi
+	fi
+}
+
+dns_step() {  # шаг DNS: есть токен Cloudflare — A-запись ставит сам скрипт (запись на чужой IP — только с согласием,
+	# без терминала — остановка); потом проверка через DNS. Без бота токен стирается сразу.
+	local l
+	[ "$MODE" = domain ] || return 0
+	if [ "$SKIP_DNS" = 1 ]; then
+		warn "A-запись домена не проверялась (--skip-dns-check)"
+		return 0
+	fi
+	if [ "$DNS_NOT_CF" = 0 ] && bot_have_cf_token; then
+		bot_init_secrets
+		if [ -n "$DNS_ZONE_ID" ] || dns_find_zone; then
+			dns_apply || die "$BOT_ERR"
+			DNS_SET_BY_API=1
+			if [ -n "$DNS_REPORT" ]; then
+				while IFS= read -r l; do [ -z "$l" ] || ok "$l"; done <<< "$DNS_REPORT"
+				dns_wait || true   # не дождались — dns_verify скажет про кэш
+			fi
+		else
+			warn "${BOT_ERR:-токен Cloudflare не видит домен $DOMAIN} — A-запись проверяю как обычно"
+		fi
+		[ "$BOT_DO" = 1 ] || bot_wipe   # без бота токен был нужен только для DNS
+	fi
+	dns_verify
 }
 
 is_cloudflare_ip() {
@@ -2177,44 +2232,7 @@ detect_ips
 if [ "$PUBLIC_IP" = "$LISTEN_IP" ]; then ok "IP сервера $PUBLIC_IP"; else ok "IP сервера $PUBLIC_IP (на интерфейсе $LISTEN_IP — сервер за NAT, так тоже работает)"; fi
 ip_precheck
 
-# Есть токен Cloudflare — A-запись ставит сам скрипт: создаёт, выключает облако; запись на чужой IP — только
-# с согласием, данным на вопросах (без терминала — останавливается). Дальше — обычная проверка через DNS.
-if [ "$MODE" = domain ] && [ "$SKIP_DNS" = 0 ] && [ "$DNS_NOT_CF" = 0 ] && bot_have_cf_token; then
-	bot_init_secrets
-	if [ -n "$DNS_ZONE_ID" ] || dns_find_zone; then
-		dns_apply || die "$BOT_ERR"
-		if [ -n "$DNS_REPORT" ]; then
-			while IFS= read -r l; do [ -z "$l" ] || ok "$l"; done <<< "$DNS_REPORT"
-			dns_wait || warn "DNS ещё не отдаёт $DOMAIN → $PUBLIC_IP — проверяю как обычно"
-		fi
-	else
-		warn "${BOT_ERR:-токен Cloudflare не видит домен $DOMAIN} — A-запись проверяю как обычно"
-	fi
-	[ "$BOT_DO" = 1 ] || bot_wipe   # без бота токен был нужен только для DNS
-fi
-
-if [ "$MODE" = nodomain ]; then
-	:
-elif [ "$SKIP_DNS" = 1 ]; then
-	warn "A-запись домена не проверялась (--skip-dns-check)"
-else
-	A=$(resolve "$DOMAIN" A) || die "не удалось проверить DNS (нет доступа к cloudflare-dns.com и dns.google)"
-	if [ -z "$A" ]; then
-		die "у $DOMAIN нет A-записи. Создайте её: $DOMAIN → $PUBLIC_IP (в Cloudflare — Proxy выключен, серое облако), подождите пару минут и запустите снова"
-	fi
-	case " $A " in
-		*" $PUBLIC_IP "*) ok "A-запись $DOMAIN указывает на этот сервер" ;;
-		*)
-			first=${A%% *}
-			if is_cloudflare_ip "$first"; then
-				die "$DOMAIN смотрит на Cloudflare ($A): в Cloudflare у A-записи выключите Proxy (облако должно быть серым) и запустите снова"
-			fi
-			die "A-запись $DOMAIN указывает на $A, а IP этого сервера $PUBLIC_IP. Поправьте A-запись, подождите пару минут и запустите снова (или --skip-dns-check, если знаете, что делаете)"
-			;;
-	esac
-	AAAA=$(resolve "$DOMAIN" AAAA || true)
-	[ -z "$AAAA" ] || die "у $DOMAIN есть AAAA-запись ($AAAA): IPv6 на сервере выключается, а Let's Encrypt и клиенты пойдут по IPv6. Удалите AAAA-запись и запустите снова"
-fi
+dns_step
 
 if [ "$BOT_DO" = 1 ]; then
 	say "Телеграм-бот: проверка токенов"

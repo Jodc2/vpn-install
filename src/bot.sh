@@ -181,8 +181,19 @@ dns_conflicts() {  # dns_conflicts ЗАПИСИ IP → что мешает на�
 	printf '%s' "$out"
 }
 
+dns_zone_of() {  # dns_zone_of ИМЯ → домен аккаунта (из DNS_ZONES), в котором лежит имя: «ID<TAB>ДОМЕН»; самый длинный
+	local id z best='' bl=0
+	while IFS=$'\t' read -r id z; do
+		[ -n "$z" ] || continue
+		if [ "$1" = "$z" ] || [[ $1 == *".$z" ]]; then
+			if [ "${#z}" -gt "$bl" ]; then best="$id"$'\t'"$z" bl=${#z}; fi
+		fi
+	done <<< "$DNS_ZONES"
+	printf '%s' "$best"
+}
+
 dns_pick() {  # выбрать домен из Cloudflare и адрес VPN на нём → DOMAIN DNS_ZONE_ID DNS_REPOINT; 1 и BOT_ERR
-	local zones n i=1 ans zid zname name myip recs conflicts
+	local zones n i=1 ans zid zname name myip recs conflicts oz
 	DNS_REPOINT=0 BOT_ERR=
 	[ -n "${DNS_ZONES:-}" ] || cf_zones || return 1
 	zones=$DNS_ZONES
@@ -211,7 +222,16 @@ dns_pick() {  # выбрать домен из Cloudflare и адрес VPN на
 		case $ans in
 			"" | "$zname") name=$zname ;;
 			*".$zname") name=$ans ;;
-			*) name=$ans.$zname ;;
+			*)
+				oz=$(dns_zone_of "$ans")
+				if [ -n "$oz" ]; then   # вписали полное имя в другом домене аккаунта — берём тот домен
+					zid=${oz%%$'\t'*} zname=${oz#*$'\t'} name=$ans
+				elif [[ $ans == *.* ]] && ! bot_consent "Адрес будет $ans.$zname — так?"; then
+					continue   # похоже на полное имя чужого домена, а не на поддомен
+				else
+					name=$ans.$zname
+				fi
+				;;
 		esac
 		if ! [[ $name =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]+$ ]]; then
 			bot_say "  ✗ «$name» — не имя домена"
@@ -308,6 +328,7 @@ dns_apply() {  # шаг DNS (IP известен): одна A-запись $DOMA
 
 dns_wait() {  # запись только что поставлена: ждать, пока DNS отдаёт $DOMAIN → $PUBLIC_IP (до ~2 мин)
 	local i a
+	sleep "${DNS_WAIT_FIRST:-5}"   # не спрашивать сразу: ответ «нет такого имени» осел бы в кэше резолвера
 	for i in $(seq 1 "${DNS_WAIT_TRIES:-24}"); do
 		a=$(resolve "$DOMAIN" A 2> /dev/null || true)
 		case " $a " in *" $PUBLIC_IP "*) return 0 ;; esac
@@ -419,7 +440,13 @@ bot_ask() {  # bot_ask ВОПРОС → BOT_ANSWER; 1 — спросить не�
 		IFS= read -r BOT_ANSWER < /dev/tty || BOT_ANSWER=
 	fi
 }
+bot_tty_flush() {  # выбросить набранное заранее: поздний вопрос не должен получить ответ, набранный на другой
+	local _
+	[ -z "${BOT_TTY_FD:-}" ] || return 0
+	while IFS= read -r -t 0.1 _ < /dev/tty; do :; done 2> /dev/null || true
+}
 bot_consent() {  # bot_consent ВОПРОС → 0 только на явное «да»
+	bot_tty_flush
 	bot_ask "$1 [y/N]: " || return 1
 	case $BOT_ANSWER in y | Y | yes | Yes | д | Д | да | Да | ДА) return 0 ;; *) return 1 ;; esac
 }
@@ -874,7 +901,7 @@ bot_read_tokens() {  # спросить недостающие токены; б�
 		bot_ask_secret "   Токен Cloudflare (не отобразится): " || true
 		BOT_CF_TOKEN=$BOT_ANSWER
 	fi
-	if [ -z "${BOT_TG_TOKEN:-}" ] && bot_tty_ok; then
+	if [ -z "${BOT_TG_TOKEN:-}" ] && ! { [ -n "${BOT_DIR:-}" ] && [ -s "$BOT_DIR/tg.token" ]; } && bot_tty_ok; then
 		if [ "${S_BOT:-}" = 1 ]; then
 			bot_ask_secret "2) Токен бота (Enter — прежний бот): " || true
 		else
