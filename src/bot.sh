@@ -92,3 +92,163 @@ bot_zone_candidates() {  # ИМЯ → само имя и родительски�
 		esac
 	done
 }
+
+cf_code() { python3 -I -c 'import json, sys
+try:
+    print(((json.load(sys.stdin).get("errors") or [{}])[0]).get("code", ""))
+except Exception:
+    print("")'; }
+
+bot_cf_check() {  # → BOT_ZONE BOT_ACC BOT_KV_ID BOT_SUBDOMAIN BOT_EXISTING(none|ours|foreign); 1 и BOT_ERR
+	local z body n
+	BOT_ZONE= BOT_ACC= BOT_KV_ID= BOT_SUBDOMAIN= BOT_EXISTING= BOT_ERR=
+	for z in $(bot_zone_candidates "$DOMAIN"); do
+		body=$(cf_api GET "/zones?name=$z") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+		BOT_ZONE=$(jget result.0.id <<< "$body")
+		[ -z "$BOT_ZONE" ] || { BOT_ACC=$(jget result.0.account.id <<< "$body"); break; }
+	done
+	if [ -z "$BOT_ZONE" ]; then
+		BOT_ERR="токен Cloudflare не видит домен $DOMAIN: зоны для него нет в этом аккаунте или у токена нет права Zone Read"
+		return 1
+	fi
+	body=$(cf_api GET "/zones/$BOT_ZONE/dns_records?type=A&name=$DOMAIN") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	if ! cf_ok <<< "$body"; then BOT_ERR="у токена нет права DNS на зону домена — $(cf_err <<< "$body")"; return 1; fi
+	n=$(python3 -I -c 'import json, sys; print(len(json.load(sys.stdin).get("result") or []))' <<< "$body")
+	case $n in
+		0) BOT_ERR="в Cloudflare нет A-записи $DOMAIN"; return 1 ;;
+		1) ;;
+		*) BOT_ERR="у $DOMAIN в Cloudflare $n A-записи, а бот при переезде меняет одну — оставьте одну"; return 1 ;;
+	esac
+	if [ "$(jget result.0.proxied <<< "$body")" = true ]; then
+		BOT_ERR="у A-записи $DOMAIN в Cloudflare включён Proxy (оранжевое облако) — выключите его"
+		return 1
+	fi
+	if [ "$(jget result.0.content <<< "$body")" != "$PUBLIC_IP" ]; then
+		BOT_ERR="A-запись $DOMAIN в Cloudflare указывает на $(jget result.0.content <<< "$body"), а этот сервер — $PUBLIC_IP"
+		return 1
+	fi
+	body=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces?per_page=100") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	if ! cf_ok <<< "$body"; then BOT_ERR="у токена нет права Workers KV Storage Edit — $(cf_err <<< "$body")"; return 1; fi
+	BOT_KV_ID=$(python3 -I -c 'import json, sys
+t = sys.argv[1]
+print(next((n["id"] for n in json.load(sys.stdin).get("result") or [] if n.get("title") == t), ""))' "$BOT_WORKER-state" <<< "$body")
+	body=$(cf_api GET "/accounts/$BOT_ACC/workers/subdomain") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	if cf_ok <<< "$body"; then
+		BOT_SUBDOMAIN=$(jget result.subdomain <<< "$body")
+	elif [ "$(cf_code <<< "$body")" = 10000 ]; then
+		BOT_ERR="у токена нет права Workers Scripts Edit — $(cf_err <<< "$body")"
+		return 1
+	fi
+	body=$(cf_api GET "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER/settings") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	if cf_ok <<< "$body"; then
+		printf '%s' "$body" > "$BOT_DIR/settings.json"
+		if python3 -I -c 'import json, sys
+kv = sys.argv[1]
+b = (json.load(sys.stdin).get("result") or {}).get("bindings") or []
+ours = any(x.get("name") == "VPN_BOT_INSTALLER" and x.get("type") == "plain_text" for x in b) or \
+       (kv != "" and any(x.get("type") == "kv_namespace" and x.get("name") == "STATE" and x.get("namespace_id") == kv for x in b))
+sys.exit(0 if ours else 1)' "$BOT_KV_ID" <<< "$body"; then BOT_EXISTING=ours; else BOT_EXISTING=foreign; fi
+	elif [ "$(cf_code <<< "$body")" = 10007 ]; then
+		BOT_EXISTING=none
+	else
+		BOT_ERR="у токена нет права Workers Scripts Edit — $(cf_err <<< "$body")"
+		return 1
+	fi
+}
+
+bot_tg_check() {  # → BOT_USERNAME BOT_HOOK_URL; 1 и BOT_ERR
+	local body
+	BOT_USERNAME= BOT_HOOK_URL= BOT_ERR=
+	body=$(tg_api getMe) || { BOT_ERR="Телеграм не отвечает"; return 1; }
+	BOT_USERNAME=$(jget result.username <<< "$body")
+	if [ "$(jget ok <<< "$body")" != true ] || [ -z "$BOT_USERNAME" ]; then
+		BOT_ERR="Телеграм не принял токен бота — скопирован целиком? (вида 123456789:AAE…)"
+		return 1
+	fi
+	body=$(tg_api getWebhookInfo) || { BOT_ERR="Телеграм не отвечает"; return 1; }
+	BOT_HOOK_URL=$(jget result.url <<< "$body")
+}
+
+bot_hook_is_ours() { [ -z "${BOT_HOOK_URL:-}" ] || [ "$BOT_HOOK_URL" = "https://$BOT_WORKER.${BOT_SUBDOMAIN:-}.workers.dev/tg" ]; }
+
+# Вопросы человеку — через терминал (в тестах — дескриптор BOT_TTY_FD с ответами, вопросы в $WORK/tty.out).
+bot_tty_ok() { [ -n "${BOT_TTY_FD:-}" ] || { : > /dev/tty; } 2> /dev/null; }
+bot_say() { if [ -n "${BOT_TTY_FD:-}" ]; then printf '%s\n' "$*" >> "$WORK/tty.out"; else printf '%s\n' "$*" > /dev/tty; fi; }
+bot_ask() {  # bot_ask ВОПРОС → BOT_ANSWER; 1 — спросить некого
+	BOT_ANSWER=
+	bot_tty_ok || return 1
+	if [ -n "${BOT_TTY_FD:-}" ]; then
+		printf '%s' "$1" >> "$WORK/tty.out"
+		IFS= read -r BOT_ANSWER <&"$BOT_TTY_FD" || BOT_ANSWER=
+	else
+		printf '%s' "$1" > /dev/tty
+		IFS= read -r BOT_ANSWER < /dev/tty || BOT_ANSWER=
+	fi
+}
+bot_consent() {  # bot_consent ВОПРОС → 0 только на явное «да»
+	bot_ask "$1 [y/N]: " || return 1
+	case $BOT_ANSWER in y | Y | yes | Yes | д | Д | да | Да | ДА) return 0 ;; *) return 1 ;; esac
+}
+
+bot_pair() {  # bot_pair [СЕКУНД=300] → BOT_ADMIN_ID BOT_ADMIN_NAME: кто написал боту и подтвердил «это я»
+	local secs=${1:-300} deadline left offset=0 body uid fid fname uname ctype
+	BOT_ADMIN_ID= BOT_ADMIN_NAME= BOT_ERR=
+	bot_tty_ok || { BOT_ERR="привязать владельца можно только в терминале (или задайте VPN_BOT_ADMIN_ID)"; return 1; }
+	if [ -n "${BOT_HOOK_URL:-}" ]; then
+		if ! bot_hook_is_ours && ! bot_consent "Бот @$BOT_USERNAME сейчас подключён к $BOT_HOOK_URL — перенастроить его на этот сервер?"; then
+			BOT_ERR="бот @$BOT_USERNAME подключён к другому адресу ($BOT_HOOK_URL) — его не трогаю"
+			return 1
+		fi
+		echo '{"drop_pending_updates":false}' > "$BOT_DIR/req.json"
+		body=$(tg_api deleteWebhook "$BOT_DIR/req.json") || { BOT_ERR="Телеграм не отвечает"; return 1; }
+	fi
+	bot_say "Открой https://t.me/$BOT_USERNAME и отправь боту любое сообщение — так я узнаю, что это ты (жду до $(((secs + 59) / 60)) мин)…"
+	deadline=$(($(date +%s) + secs))
+	while left=$((deadline - $(date +%s))) && [ "$left" -gt 0 ]; do
+		printf '{"offset":%s,"timeout":%s,"allowed_updates":["message"]}' "$offset" "$((left < 25 ? left : 25))" > "$BOT_DIR/req.json"
+		body=$(tg_api getUpdates "$BOT_DIR/req.json") || { sleep 2; continue; }
+		while IFS=$'\t' read -r uid fid fname uname ctype; do
+			offset=$((uid + 1))
+			[ "$ctype" = private ] || continue
+			bot_ask "Это ты: $fname${uname:+ (@$uname)}, id $fid? [Y/n]: " || continue
+			case $BOT_ANSWER in n | N | no | No | н | Н | нет | Нет | НЕТ) continue ;; esac
+			BOT_ADMIN_ID=$fid
+			BOT_ADMIN_NAME=$fname
+			printf '{"offset":%s,"timeout":0}' "$offset" > "$BOT_DIR/req.json"
+			tg_api getUpdates "$BOT_DIR/req.json" > /dev/null || true
+			return 0
+		done < <(python3 -I -c 'import json, sys
+for u in json.load(sys.stdin).get("result") or []:
+    m = u.get("message") or {}
+    f = m.get("from") or {}
+    clean = lambda v: str(v or "").replace("\t", " ").replace("\n", " ")
+    print("\t".join([str(u.get("update_id", 0)), str(f.get("id", "")), clean(f.get("first_name")), clean(f.get("username")), clean((m.get("chat") or {}).get("type"))]))' <<< "$body" 2> /dev/null)
+	done
+	BOT_ERR="не дождался сообщения боту @$BOT_USERNAME"
+	return 1
+}
+
+bot_has_binding() {  # bot_has_binding ИМЯ — есть ли у прежней версии нашего воркера такая привязка
+	[ "${BOT_EXISTING:-}" = ours ] && [ -s "$BOT_DIR/settings.json" ] && python3 -I -c 'import json, sys
+b = (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or []
+sys.exit(0 if any(x.get("name") == sys.argv[2] for x in b) else 1)' "$BOT_DIR/settings.json" "$1"
+}
+
+bot_validate() {  # всё, что проверяется до установки: токены, чужой воркер, владелец; 0 — можно разворачивать
+	bot_cf_check || return 1
+	if [ "$BOT_EXISTING" = foreign ] && ! bot_consent "Воркер $BOT_WORKER в аккаунте Cloudflare уже есть, и он не от установщика — перезаписать?"; then
+		BOT_ERR="воркер $BOT_WORKER в аккаунте Cloudflare не от установщика — не трогаю"
+		return 1
+	fi
+	if [ -s "$BOT_DIR/tg.token" ]; then
+		bot_tg_check || return 1
+	elif [ "$BOT_EXISTING" != ours ]; then
+		BOT_ERR="нужен токен бота от @BotFather"
+		return 1
+	fi
+	if [ -n "${VPN_BOT_ADMIN_ID:-}" ]; then
+		BOT_ADMIN_ID=$VPN_BOT_ADMIN_ID
+	elif ! bot_has_binding ADMIN_ID; then
+		bot_pair || return 1
+	fi
+}
