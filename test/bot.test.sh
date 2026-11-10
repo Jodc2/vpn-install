@@ -541,6 +541,16 @@ test_retry_declined() {
 	grep -q "ещё раз" "$WORK/tty.out" || t_fail "не спросил «ещё раз?»"
 }
 
+# ——— шаблон: сайты-прикрытия Reality ———
+test_cover_sites_exclude_broken() {  # проверено живьём 2026-11-10: с dest www.microsoft.com Reality (Xray 26.6.1) не проходит
+	local exit_list nodomain_list
+	nodomain_list=$(sed -n '/^SNI_CANDIDATES="/,/"$/p' "$ROOT/src/install-vpn.sh.in")
+	exit_list=$(grep -E '^for d in \$\{EXIT_SNI_HINT:-\}' "$ROOT/src/install-vpn.sh.in")
+	[ -n "$nodomain_list" ] && [ -n "$exit_list" ] || t_fail "списки прикрытий не найдены в шаблоне"
+	case "$nodomain_list $exit_list" in *www.microsoft.com*) t_fail "www.microsoft.com в списке прикрытий" ;; esac
+	t_has "www.apple.com" "$exit_list" "у выхода остались рабочие кандидаты"
+}
+
 # ——— прогон ———
 PASS=0
 FAILN=0

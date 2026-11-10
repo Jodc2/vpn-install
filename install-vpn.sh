@@ -80,7 +80,9 @@ F2B_JAIL=/etc/fail2ban/jail.d/vpn-sshd.local
 WARP_ENDPOINT=162.159.192.8:2408   # engage.cloudflareclient.com по IP: имя через DNS дало бы петлю
 # Без домена Reality маскируется под один из этих сайтов: берётся самый быстрый с этого сервера из тех,
 # что держат TLS 1.3 + X25519 + HTTP/2 с верным сертификатом и не стоят за Cloudflare.
-SNI_CANDIDATES="www.microsoft.com www.apple.com swdist.apple.com images.apple.com www.samsung.com dl.google.com
+# www.microsoft.com из списков убран: 2026-11-10 Reality (Xray 26.6.1) с ним не проходит рукопожатие — ни на
+# одном из двух проверенных хостингов, — хотя openssl он устраивает (TLS 1.3, X25519, h2); 13 остальных проходят.
+SNI_CANDIDATES="www.apple.com swdist.apple.com images.apple.com www.samsung.com dl.google.com
 www.nvidia.com www.oracle.com www.intel.com www.dell.com www.hp.com www.asus.com www.cisco.com www.amazon.com"
 
 DOMAIN=
@@ -2873,7 +2875,7 @@ ip=ipaddress.ip_address(sys.argv[1]); sys.exit(0 if any(ip in ipaddress.ip_netwo
 PYC
 }
 SNI=
-for d in ${EXIT_SNI_HINT:-} www.microsoft.com www.apple.com swdist.apple.com www.samsung.com dl.google.com www.nvidia.com www.intel.com www.amazon.com; do
+for d in ${EXIT_SNI_HINT:-} www.apple.com swdist.apple.com www.samsung.com dl.google.com www.nvidia.com www.intel.com www.amazon.com; do
 	[ -n "$d" ] || continue
 	ip=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}'); [ -n "$ip" ] || continue
 	cf "$ip" && continue
