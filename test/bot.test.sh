@@ -445,6 +445,27 @@ test_deploy_selftest_entry_fail() {
 	t_has "permission denied" "$BOT_ERR" "причина"
 }
 
+test_deploy_deletes_dropped_secrets() {  # Cloudflare не убирает секрет, которого нет в загрузке, — только явным DELETE
+	deploy_env
+	settings '[{"type":"secret_text","name":"BOT_TOKEN"},{"type":"secret_text","name":"WEBHOOK_SECRET"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"secret_text","name":"EXIT_SSH_KEY"},{"type":"secret_text","name":"EXIT_HOSTKEY_FPR"},{"type":"secret_text","name":"GLOBALPING_TOKEN"},{"type":"plain_text","name":"EXIT_HOST","text":"5.6.7.8"}]'
+	rm -f "$BOT_DIR/tg.token"; BOT_ADMIN_ID=''
+	EXIT_MODE=direct; bot_exit_bindings
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	grep -qx 'DELETE /accounts/A1/workers/scripts/vpn-bot/secrets/EXIT_SSH_KEY' "$WORK/cf.calls" || t_fail "ключ выхода не удалён"
+	grep -qx 'DELETE /accounts/A1/workers/scripts/vpn-bot/secrets/EXIT_HOSTKEY_FPR' "$WORK/cf.calls" || t_fail "отпечаток выхода не удалён"
+	! grep -qE 'DELETE .*/secrets/(BOT_TOKEN|WEBHOOK_SECRET|ADMIN_ID|GLOBALPING_TOKEN)$' "$WORK/cf.calls" || t_fail "удалён нужный секрет: $(grep DELETE "$WORK/cf.calls" | tr '\n' ' ')"
+}
+
+test_deploy_foreign_drops_stale_exit_access() {  # перезаписали чужой воркер — его доступ к выходу не должен остаться
+	deploy_env
+	printf '{"success":true,"result":{"bindings":%s}}' '[{"type":"secret_text","name":"BOT_TOKEN"},{"type":"secret_text","name":"EXIT_SSH_PASS"},{"type":"secret_text","name":"EXIT_SSH_KEY"},{"type":"secret_text","name":"GLOBALPING_TOKEN"}]' > "$BOT_DIR/settings.json"
+	BOT_EXISTING=foreign
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	grep -qx 'DELETE /accounts/A1/workers/scripts/vpn-bot/secrets/EXIT_SSH_PASS' "$WORK/cf.calls" || t_fail "пароль выхода чужого бота не удалён"
+	grep -qx 'DELETE /accounts/A1/workers/scripts/vpn-bot/secrets/EXIT_SSH_KEY' "$WORK/cf.calls" || t_fail "ключ выхода чужого бота не удалён"
+	! grep -qE 'DELETE .*/secrets/(BOT_TOKEN|GLOBALPING_TOKEN)$' "$WORK/cf.calls" || t_fail "удалено лишнее: $(grep DELETE "$WORK/cf.calls" | tr '\n' ' ')"
+}
+
 # ——— Task 8: решение «ставить / обновить / не трогать» ———
 decide_env() {
 	MODE=domain BOT_ARG= S_BOT= BOT_CF_TOKEN= DOMAIN=vpn.example.com S_DOMAIN_OLD=vpn.example.com

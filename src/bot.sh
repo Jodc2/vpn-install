@@ -436,6 +436,22 @@ json.dump({"main_module": "worker.js", "compatibility_date": "2026-10-20", "bind
 		-F "metadata=@$BOT_DIR/metadata.json;type=application/json" \
 		-F "worker.js=@$BOT_DIR/worker.js;type=application/javascript+module") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
 	cf_ok <<< "$body" || { BOT_ERR="Cloudflare не принял воркер — $(cf_err <<< "$body")"; return 1; }
+	# Cloudflare сохраняет секрет, которого нет в загрузке: ненужные (ключ выхода после перехода на прямой
+	# выход или на другой выход без доступа, пароль выхода перезаписанного чужого бота) удалить явно —
+	# иначе бот держит доступ, которого быть не должно, и при переезде идёт с ним не туда.
+	if [ "${BOT_EXISTING:-none}" != none ] && [ -s "$BOT_DIR/settings.json" ]; then
+		for f in $(python3 -I -c 'import json, sys
+keep = {l.split()[1] for l in open(sys.argv[2], encoding="utf-8") if l.strip()}
+managed = set(sys.argv[3].split())
+for x in (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or []:
+    n = x.get("name")
+    if x.get("type") == "secret_text" and n in managed and n not in keep:
+        print(n)' "$BOT_DIR/settings.json" "$BOT_DIR/bindings.list" "$BOT_MANAGED"); do
+			if ! body=$(cf_api DELETE "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER/secrets/$f") || ! cf_ok <<< "$body"; then
+				BOT_REPORT+="⚠ старый секрет $f в воркере не удалён — $(cf_err <<< "$body")"$'\n'
+			fi
+		done
+	fi
 	echo '{"enabled":true,"previews_enabled":false}' > "$BOT_DIR/req.json"
 	body=$(cf_api POST "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER/subdomain" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
 	cf_ok <<< "$body" || { BOT_ERR="не включить адрес workers.dev — $(cf_err <<< "$body")"; return 1; }
