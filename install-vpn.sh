@@ -6,7 +6,7 @@
 #     SNI ваш домен, а тому, кто прощупывает сервер, Reality показывает настоящий сайт с этого же сервера;
 #     nginx на 443: сайт-заглушка, панель и подписка за доменом по секретным путям; Let's Encrypt.
 #     Нужна A-запись домена на IP сервера (в Cloudflare — серое облако, Proxy выключен).
-#   • Без домена: VLESS + XHTTP + Reality на порту 443 под крупный чужой сайт (скрипт сам проверит
+#   • Без домена: VLESS + XHTTP + Reality на порту 2083 под крупный чужой сайт (скрипт сам проверит
 #     и выберет подходящий). Ссылки привязаны к IP сервера, панель — https://IP:порт/секретный-путь/.
 # В обоих: 3x-ui 3.3.1 + Xray 26.6.1 (sha256 закреплены), BBR, IPv6 выключен, swap, фаервол ufw,
 # fail2ban против подбора пароля SSH, бэкап для переезда — вручную (vpn-backup.sh), сам не запускается.
@@ -21,7 +21,7 @@
 #
 # Опции:
 #   --domain ДОМЕН    свой домен, A-запись которого уже указывает на этот сервер
-#   --no-domain       без домена: Reality на 443 под крупный чужой сайт
+#   --no-domain       без домена: Reality на 2083 под крупный чужой сайт
 #   --sni САЙТ        (без домена) под какой сайт маскироваться вместо автовыбора, например www.samsung.com
 #   --panel-local     (без домена) панель только на 127.0.0.1 — заходить через SSH-туннель, снаружи не видна
 #   --no-ip-cert      (без домена) не брать сертификат Let's Encrypt на IP: подписка только внутри сервера
@@ -38,15 +38,16 @@
 #                       chain   — через другой мой сервер (его IP как выход); нужен --exit-host
 #                     выбор запоминается; переключить WARP потом — vpn-warp off|on|ru
 #   --ssh-key-only    выключить вход по паролю (только если у root уже есть SSH-ключ)
-#   --no-fail2ban     не ставить fail2ban
-#   --no-ufw          не трогать фаервол
-#   --tz ЗОНА         часовой пояс сервера (по умолчанию Europe/Moscow)
+#   --no-fail2ban     не ставить fail2ban (запоминается; вернуть — --fail2ban)
+#   --no-ufw          не трогать фаервол (запоминается; вернуть — --ufw)
+#   --tz ЗОНА         часовой пояс сервера (по умолчанию Europe/Moscow; запоминается)
 #   --skip-dns-check  не сверять A-запись домена с IP сервера
 #   --skip-ip-check   не проверять до установки, доступен ли IP из России
 #   --check           только проверить: службы, туннель, доступность портов из России и Европы
 #   --warp off|on|ru  быстро переключить выход без переустановки (то же — команда vpn-warp):
 #                     off — напрямую, on — всё через WARP, ru — российские сайты через WARP
 #   --exit-host IP    (с --exit chain) IP старого сервера, через который выходить; его настроит скрипт по SSH
+#                     (можно ubuntu@IP — тогда пользователь ubuntu)
 #   --exit-ssh-port N порт SSH старого сервера (по умолчанию 22); пароль — в EXIT_PASS или спросит
 #   --exit-ssh-user И пользователь на старом сервере (по умолчанию root; AWS и Oracle — ubuntu). Не root —
 #                     настройка через sudo; пароль sudo, если нужен, — EXIT_SUDO_PASS или спросит
@@ -90,9 +91,9 @@ CLIENTS=1
 PORT_ARG=
 EXIT_MODE=
 SSH_KEY_ONLY=0
-DO_F2B=1
-DO_UFW=1
-TZ_NAME=Europe/Moscow
+DO_F2B=     # пусто — как в прошлый раз, по умолчанию 1
+DO_UFW=
+TZ_NAME=
 SKIP_DNS=0
 SKIP_IP_CHECK=0
 CHECK_ONLY=0
@@ -107,6 +108,10 @@ EXIT_STOP_XUI=
 TEST_SELFSIGNED=0   # только для проверки самого скрипта: самоподписанный сертификат вместо Let's Encrypt
 ACME_STAGING=0      # только для проверки: тестовый сервер Let's Encrypt
 while [ $# -gt 0 ]; do
+	case $1 in   # у опции нет значения — сказать об этом, а не молча выйти на shift 2
+		--domain | --sni | --clients | --port | --exit | --exit-host | --exit-ssh-port | --exit-ssh-user | --exit-ssh-key | --exit-port | --tz)
+			[ $# -ge 2 ] && [ -n "$2" ] || { echo "опции $1 нужно значение (см. --help)" >&2; exit 2; } ;;
+	esac
 	case $1 in
 		--domain) DOMAIN=${2:-}; shift 2 ;;
 		--no-domain) NO_DOMAIN=1; shift ;;
@@ -127,7 +132,9 @@ while [ $# -gt 0 ]; do
 		--exit-keep-xui) EXIT_STOP_XUI=0; shift ;;
 		--ssh-key-only) SSH_KEY_ONLY=1; shift ;;
 		--no-fail2ban) DO_F2B=0; shift ;;
+		--fail2ban) DO_F2B=1; shift ;;
 		--no-ufw) DO_UFW=0; shift ;;
+		--ufw) DO_UFW=1; shift ;;
 		--tz) TZ_NAME=${2:-}; shift 2 ;;
 		--skip-dns-check) SKIP_DNS=1; shift ;;
 		--skip-ip-check) SKIP_IP_CHECK=1; shift ;;
@@ -158,8 +165,29 @@ XRAY=/usr/local/x-ui/bin/xray-linux-$ARCH
 
 # --- Режим: с доменом или без ---
 norm_host() { printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E 's#^[a-z]+://##; s#[/:].*$##; s#\.$##'; }
-is_host() { [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$ ]]; }
+is_host() { [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]*[a-z][a-z0-9-]*$ ]]; }   # в последней части буква: 1.2.3.44 — не имя
 state_val() { [ -f "$STATE" ] && sed -n "s/^$1='\(.*\)'\$/\1/p" "$STATE" | head -1; }
+tty_flush() { local _; while IFS= read -r -t 0.1 _ < /dev/tty; do :; done 2>/dev/null || true; }   # выбросить набранное заранее
+exit_host_parse() {  # EXIT_HOST «пользователь@адрес» → адрес (IPv4 или имя); пользователь — если не задан опцией
+	local h
+	h=$(printf '%s' "$EXIT_HOST" | tr -d '[:space:]')
+	if [[ $h == *@* ]]; then
+		[ -n "$EXIT_SSH_USER_ARG" ] || EXIT_SSH_USER_ARG=${h%%@*}
+		h=${h#*@}
+	fi
+	h=$(norm_host "$h")
+	[[ $h =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || is_host "$h" || return 1
+	EXIT_HOST=$h
+}
+exit_ssh_defaults() {  # пользователь и порт SSH старого сервера: заданы — как заданы; тот же сервер — как в прошлый раз; другой — root:22
+	if [ -n "$EXIT_HOST" ] && [ "$EXIT_HOST" != "$CHAIN_IP" ]; then
+		EXIT_SSH_USER=${EXIT_SSH_USER_ARG:-root}
+		EXIT_SSH_PORT=${EXIT_SSH_PORT_ARG:-22}
+	else
+		EXIT_SSH_USER=${EXIT_SSH_USER_ARG:-${CHAIN_SSH_USER:-root}}
+		EXIT_SSH_PORT=${EXIT_SSH_PORT_ARG:-${CHAIN_SSH_PORT:-22}}
+	fi
+}
 MODE=
 S_MODE=$(state_val S_MODE || true)
 S_DOMAIN_OLD=$(state_val S_DOMAIN || true)
@@ -174,8 +202,13 @@ CHAIN_SID=$(state_val CHAIN_SID || true)
 CHAIN_SNI=$(state_val CHAIN_SNI || true)
 CHAIN_SSH_USER=$(state_val CHAIN_SSH_USER || true)
 CHAIN_SSH_PORT=$(state_val CHAIN_SSH_PORT || true)
-EXIT_SSH_USER=${EXIT_SSH_USER:-${CHAIN_SSH_USER:-root}}   # не задан — как в прошлый раз
-EXIT_SSH_PORT=${EXIT_SSH_PORT:-${CHAIN_SSH_PORT:-22}}
+EXIT_SSH_USER_ARG=$EXIT_SSH_USER   # заданы опциями (пусто — нет): другой сервер-выход прошлые не наследует
+EXIT_SSH_PORT_ARG=$EXIT_SSH_PORT
+exit_ssh_defaults
+# Фаервол, fail2ban и часовой пояс — как в прошлый раз, если не заданы опциями.
+DO_UFW=${DO_UFW:-$(state_val S_DO_UFW || true)}; DO_UFW=${DO_UFW:-1}
+DO_F2B=${DO_F2B:-$(state_val S_DO_F2B || true)}; DO_F2B=${DO_F2B:-1}
+TZ_NAME=${TZ_NAME:-$(state_val S_TZ || true)}; TZ_NAME=${TZ_NAME:-Europe/Moscow}
 if [ "$CHECK_ONLY" = 1 ] || [ -n "$WARP_CMD" ]; then
 	[ -n "$S_MODE" ] || die "VPN этим скриптом здесь ещё не ставился (нет $STATE) — сначала bash $0"
 	MODE=$S_MODE
@@ -212,14 +245,17 @@ EOF
 		fi
 	fi
 	if [ -n "$S_MODE" ] && [ "$S_MODE" != "$MODE" ]; then
-		die "сервер уже ставился $([ "$S_MODE" = domain ] && echo "с доменом $S_DOMAIN_OLD" || echo "без домена"). Сменить вариант можно только на чистом сервере"
+		MODE_CHANGED=1   # можно ли — решится ниже, когда будет видно, есть ли уже подключение
 	fi
 fi
 if [ "$MODE" = domain ]; then
 	DOMAIN=$(norm_host "$DOMAIN")
+	if [[ $DOMAIN == *[![:ascii:]]* ]]; then   # кириллический домен (пример.рф) — в punycode
+		DOMAIN=$(python3 -c 'import sys; print(sys.argv[1].encode("idna").decode())' "$DOMAIN" 2>/dev/null) ||
+			die "домен с нелатинскими буквами: укажите его в виде xn--… (punycode)"
+	fi
 	is_host "$DOMAIN" || die "нужен домен вида vpn.example.com (сейчас: «$DOMAIN»)"
-	[ -z "$S_DOMAIN_OLD" ] || [ "$S_DOMAIN_OLD" = "$DOMAIN" ] ||
-		die "сервер уже ставился на домен $S_DOMAIN_OLD. Для другого домена нужен чистый сервер"
+	[ -z "$S_DOMAIN_OLD" ] || [ "$S_DOMAIN_OLD" = "$DOMAIN" ] || MODE_CHANGED=1
 else
 	DOMAIN=
 	if [ -n "$SNI_ARG" ]; then
@@ -246,8 +282,38 @@ PY
 }
 OLD_REALITY_PORT=$(existing_reality_port)
 S_REALITY_PORT=$(state_val S_REALITY_PORT || true)
+reset_failed_attempt() {  # смена варианта после неудачной первой установки: убрать то, что успела сделать прошлая попытка
+	local d=$S_DOMAIN_OLD ip
+	ip=$(state_val S_IP_CERT_IP || true)
+	if [ -n "$d" ] && [ "$d" != "$DOMAIN" ]; then
+		[ ! -x /root/.acme.sh/acme.sh ] || /root/.acme.sh/acme.sh --remove -d "$d" --ecc >/dev/null 2>&1 || true
+		rm -rf "/root/.acme.sh/${d}_ecc" "/root/cert/$d"
+	fi
+	if [ "$MODE" = nodomain ]; then   # nginx без домена не нужен, а :80 нужен Let's Encrypt для сертификата на IP
+		rm -f /etc/nginx/conf.d/acme-http.conf /etc/nginx/conf.d/panel.conf /etc/nginx/stream-enabled/443-demux.conf
+		systemctl disable --now nginx >/dev/null 2>&1 || true
+	elif [ -n "$ip" ]; then
+		[ ! -x /root/.acme.sh/acme.sh ] || /root/.acme.sh/acme.sh --remove -d "$ip" --ecc >/dev/null 2>&1 || true
+		rm -rf "/root/.acme.sh/${ip}_ecc" /etc/x-ui/ip-cert
+	fi
+	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"
+	OWN_XUI=1   # 3x-ui прошлой попытки поставил этот скрипт — не чужой
+	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
+	exit_ssh_defaults
+}
+if [ "${MODE_CHANGED:-0}" = 1 ]; then
+	PREV_DESC=$([ "$S_MODE" = domain ] && echo "с доменом $S_DOMAIN_OLD" || echo "без домена")
+	if [ "$(state_val S_DONE || true)" = 1 ] || [ -n "$OLD_REALITY_PORT" ]; then
+		die "сервер уже ставился $PREV_DESC, и VPN на нём настроен. Сменить вариант или домен можно только на чистом сервере"
+	fi
+	warn "прошлая установка ($PREV_DESC) не дошла до конца — её настройки не нужны, ставлю заново $([ "$MODE" = domain ] && echo "с доменом $DOMAIN" || echo "без домена")"
+	reset_failed_attempt
+fi
 if [ -n "$PORT_ARG" ] && [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
-	[[ $PORT_ARG =~ ^[0-9]+$ ]] && [ "$PORT_ARG" -ge 1 ] && [ "$PORT_ARG" -le 65535 ] || die "--port: число от 1 до 65535"
+	[[ $PORT_ARG =~ ^[1-9][0-9]{0,4}$ ]] && [ "$PORT_ARG" -le 65535 ] || die "--port: число от 1 до 65535"
+	case $PORT_ARG in 62789 | 11111) die "--port $PORT_ARG: на нём внутренние службы Xray (API, статистика) — выберите другой" ;; esac
+	[ "$PORT_ARG" != "$(state_val WEB_PORT || true)" ] || die "--port $PORT_ARG: на нём панель 3x-ui — выберите другой"
+	[ "$MODE" = domain ] || [ "$PORT_ARG" != 80 ] || die "--port 80: он нужен Let's Encrypt для сертификата на IP — выберите другой"
 	[ "$PORT_ARG" != "$SUB_PORT" ] || die "--port $PORT_ARG: на нём подписка 3x-ui — выберите другой"
 	if [ "$MODE" = domain ]; then
 		case $PORT_ARG in 80 | 443 | 8443) die "--port $PORT_ARG: с доменом 80, 443 и 8443 заняты nginx — выберите другой (по умолчанию 2083)" ;; esac
@@ -328,18 +394,33 @@ EOF
 		esac
 	done
 	if [ "$EXIT_MODE" = chain ]; then
-		printf 'IP старого сервера-выхода: ' > /dev/tty; read -r EXIT_HOST < /dev/tty || true
-		printf 'SSH-порт старого сервера [%s]: ' "$EXIT_SSH_PORT" > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_PORT=$a
-		printf 'Пользователь на старом сервере [%s] (AWS, Oracle — ubuntu): ' "$EXIT_SSH_USER" > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_USER=$a
+		tries=0
+		while :; do
+			printf 'IP старого сервера-выхода: ' > /dev/tty; read -r EXIT_HOST < /dev/tty || EXIT_HOST=
+			exit_host_parse && break
+			tries=$((tries + 1)); [ "$tries" -lt 3 ] || die "не получил адрес старого сервера"
+			tty_flush   # вставили не то (например ключ) — остаток вставки не должен уйти в следующие вопросы
+			printf '  нужен IPv4-адрес вида 203.0.113.5 или имя сервера (можно ubuntu@203.0.113.5)\n' > /dev/tty
+		done
+		exit_ssh_defaults
+		printf 'SSH-порт старого сервера [%s]: ' "$EXIT_SSH_PORT" > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_PORT=$a EXIT_SSH_PORT_ARG=$a
+		printf 'Пользователь на старом сервере [%s] (AWS, Oracle — ubuntu): ' "$EXIT_SSH_USER" > /dev/tty; read -r a < /dev/tty || true; [ -n "$a" ] && EXIT_SSH_USER=$a EXIT_SSH_USER_ARG=$a
 		if [ -z "$EXIT_SSH_KEY" ] && [ -z "${EXIT_PASS:-}" ]; then ask_exit_auth; fi
 	fi
 fi
 EXIT_MODE=${EXIT_MODE:-${S_EXIT:-direct}}   # не указан — как в прошлый раз
 case $EXIT_MODE in direct | warp | warp-ru | chain) ;; *) die "--exit: direct, warp, warp-ru или chain" ;; esac
 if [ "$EXIT_MODE" = chain ]; then
-	[ -n "$EXIT_HOST" ] && EXIT_HOST=$(norm_host "$EXIT_HOST")
+	if [ -n "$EXIT_HOST" ]; then
+		exit_host_parse || die "--exit-host: нужен IPv4-адрес старого сервера вида 203.0.113.5 или его имя (сейчас: «$EXIT_HOST»)"
+		exit_ssh_defaults
+	fi
+	if [ -n "$EXIT_PORT_ARG" ]; then
+		[[ $EXIT_PORT_ARG =~ ^[1-9][0-9]{0,4}$ ]] && [ "$EXIT_PORT_ARG" -le 65535 ] || die "--exit-port: число от 1 до 65535"
+	fi
+	[ -n "$EXIT_HOST" ] || [ -z "$EXIT_STOP_XUI" ] || warn "--exit-stop-xui и --exit-keep-xui действуют только вместе с --exit-host (при настройке старого сервера)"
 	[[ $EXIT_SSH_USER =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || die "--exit-ssh-user: имя пользователя вида ubuntu (сейчас: «$EXIT_SSH_USER»)"
-	[[ $EXIT_SSH_PORT =~ ^[0-9]+$ ]] && [ "$EXIT_SSH_PORT" -ge 1 ] && [ "$EXIT_SSH_PORT" -le 65535 ] || die "--exit-ssh-port: число от 1 до 65535"
+	[[ $EXIT_SSH_PORT =~ ^[1-9][0-9]{0,4}$ ]] && [ "$EXIT_SSH_PORT" -le 65535 ] || die "--exit-ssh-port: число от 1 до 65535"
 	# Первый раз (нет сохранённой цепочки) нужен IP старого сервера; повторный запуск берёт из state.
 	if [ -z "$EXIT_HOST" ] && [ -z "$CHAIN_IP" ]; then
 		die "для --exit chain укажите --exit-host IP старого сервера (и EXIT_PASS=… либо --exit-ssh-key)"
@@ -455,9 +536,22 @@ detect_ips() {  # LISTEN_IP — адрес на интерфейсе, PUBLIC_IP 
 		PUBLIC_IP=
 	done
 	if [ -z "$PUBLIC_IP" ]; then
-		[ "$MODE" = domain ] || die "не удалось узнать внешний IP сервера (api.ipify.org, ifconfig.me недоступны), а без домена он нужен для ссылок"
-		PUBLIC_IP=$LISTEN_IP
+		if [ "$MODE" != domain ] && [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
+			die "не удалось узнать внешний IP сервера (api.ipify.org, ifconfig.me, icanhazip.com недоступны), а без домена он нужен для ссылок"
+		fi
+		# Проверке и vpn-warp хватит адреса из ссылок клиентов (или адреса на интерфейсе).
+		[ "$MODE" = domain ] || PUBLIC_IP=$(sqlite3 -readonly "$DB" "select share_addr from inbounds where share_addr<>'' order by id limit 1;" 2>/dev/null || true)
+		[[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || PUBLIC_IP=$LISTEN_IP
+		[ "$MODE" = domain ] || warn "внешний IP сервера не узнать (сервисы определения IP недоступны — нет выхода в интернет?): считаю, что это $PUBLIC_IP"
 	fi
+}
+
+ssh_login_method() {  # как вошли в эту SSH-сессию: publickey | password | keyboard-interactive | пусто (не узнать)
+	local cip cport rest
+	read -r cip cport rest <<<"${SSH_CONNECTION:-}" || true
+	[ -n "${cport:-}" ] || return 0
+	{ journalctl -q --no-pager -o cat -t sshd -t sshd-session 2>/dev/null || true; cat /var/log/auth.log 2>/dev/null || true; } |
+		{ grep -oE "Accepted [a-z-]+ for [^ ]+ from ${cip//./\\.} port $cport( |\$)" || true; } | tail -1 | awk '{print $2}'
 }
 
 ssh_ports() {  # TCP-порты sshd (обычно 22)
@@ -473,35 +567,27 @@ chk_probe() {  # chk_probe IP ПОРТ… → по строке на порт: �
 import json, sys, time, urllib.request
 ip, ports = sys.argv[1], sys.argv[2:]
 H = {"Accept": "application/json", "User-Agent": "vpn-install-check/1.0"}
+END = time.monotonic() + 240   # весь опрос — не дольше 4 минут, как бы ни тормозил check-host
+
+
+def left():
+    return END - time.monotonic()
+
 
 def get(url, tries=3):
-    err = None
+    err = TimeoutError("check-host: время вышло")
     for _ in range(tries):
+        if left() < 2:
+            break
         try:
-            return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=H), timeout=20))
+            return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=H), timeout=min(20, left())))
         except Exception as e:
             err = e
-            time.sleep(4)
+            time.sleep(min(4, max(0, left() - 1)))
     raise err
 
-try:
-    nodes = get("https://check-host.net/nodes/hosts")["nodes"]
-except Exception:
-    print("NOAPI")
-    sys.exit(0)
-ru = sorted(n for n, i in nodes.items() if (i.get("location") or [""])[0] == "ru")
-eu = []
-for p in ("de1", "nl1", "fi1", "se1", "pl1", "fr2", "de4", "nl2"):
-    eu += [n for n in sorted(nodes) if n.split(".")[0] == p and n not in eu]
-eu = eu[:2]
-if not ru:
-    print("NORU")
-    sys.exit(0)
-city = {n: (nodes[n].get("location") or ["", "", n])[-1] for n in ru + eu}
-q = "&".join("node=" + n for n in ru + eu)
 
-
-def probe(ports):  # один заход: порт → {узел: ok|fail|?}; None — check-host не принял проверку
+def probe(ports, ru, eu, q):  # один заход: порт → {узел: ok|fail|?}; None — check-host не принял проверку
     rids, res = {}, {p: {} for p in ports}
     for k, port in enumerate(ports):
         if k:
@@ -511,13 +597,16 @@ def probe(ports):  # один заход: порт → {узел: ok|fail|?}; No
         except Exception:
             rids[port] = None
     for _ in range(25):
+        if left() < 5:
+            break
         time.sleep(3)
         pending = False
         for port, rid in rids.items():
             if not rid or (res[port] and all(v is not None for v in res[port].values())):
                 continue
             try:
-                res[port] = get("https://check-host.net/check-result/" + rid, tries=1) or {}
+                r = get("https://check-host.net/check-result/" + rid, tries=1)
+                res[port] = r if isinstance(r, dict) else {}
             except Exception:
                 pass
             if not res[port] or any(v is None for v in res[port].values()):
@@ -532,48 +621,68 @@ def probe(ports):  # один заход: порт → {узел: ok|fail|?}; No
         out[port] = {}
         for n in ru + eu:
             v = res[port].get(n)
-            out[port][n] = "?" if v is None else ("ok" if v and isinstance(v[0], dict) and "time" in v[0] else "fail")
+            ok = isinstance(v, list) and v and isinstance(v[0], dict) and "time" in v[0]
+            out[port][n] = "?" if v is None else ("ok" if ok else "fail")
     return out
 
 
-# Узлы check-host иногда промахиваются поодиночке: порты, где не все узлы достучались, проверяются второй раз,
-# и узел считается достучавшимся, если получилось хоть раз.
-first = probe(ports)
-again = [p for p in ports if first[p] is not None and any(s != "ok" for s in first[p].values())]
-if again:
-    time.sleep(4)
-    second = probe(again)
-    for p in again:
-        if second.get(p):
-            for n, s in second[p].items():
-                if s == "ok" or first[p].get(n) == "?":
-                    first[p][n] = s
-res = first
+def main():
+    try:
+        nodes = get("https://check-host.net/nodes/hosts")["nodes"]
+    except Exception:
+        return ["NOAPI"]
+    ru = sorted(n for n, i in nodes.items() if (i.get("location") or [""])[0] == "ru")
+    eu = []
+    for p in ("de1", "nl1", "fi1", "se1", "pl1", "fr2", "de4", "nl2"):
+        eu += [n for n in sorted(nodes) if n.split(".")[0] == p and n not in eu]
+    eu = eu[:2]
+    if not ru:
+        return ["NORU"]
+    city = {n: (nodes[n].get("location") or ["", "", n])[-1] for n in ru + eu}
+    q = "&".join("node=" + n for n in ru + eu)
+    # Узлы check-host иногда промахиваются поодиночке: порты, где не все узлы достучались, проверяются второй раз,
+    # и узел считается достучавшимся, если получилось хоть раз.
+    res = probe(ports, ru, eu, q)
+    again = [p for p in ports if res[p] is not None and any(st != "ok" for st in res[p].values())]
+    if again and left() > 60:
+        time.sleep(4)
+        second = probe(again, ru, eu, q)
+        for p in again:
+            if second.get(p):
+                for n, st in second[p].items():
+                    if st == "ok" or res[p].get(n) == "?":
+                        res[p][n] = st
+    mark = {"ok": "✓", "fail": "✗", "?": "…"}
+    rows = []
+    for port in ports:
+        if res[port] is None:
+            rows.append("%s|UNAVAILABLE" % port)
+            continue
+        row = [port]
+        for group in (ru, eu):
+            st = [res[port].get(n, "?") for n in group]
+            row += [str(st.count("ok")), str(len(st) - st.count("?")), str(len(group))]
+        for group in (ru, eu):
+            row.append(", ".join("%s %s" % (city.get(n, n), mark[res[port].get(n, "?")]) for n in group))
+        rows.append("|".join(row))
+    return rows
 
-def state(port, n):
-    return res[port].get(n, "?")
 
-mark = {"ok": "✓", "fail": "✗", "?": "…"}
-for port in ports:
-    if res[port] is None:
-        print("%s|UNAVAILABLE" % port)
-        continue
-    row = [port]
-    for group in (ru, eu):
-        st = [state(port, n) for n in group]
-        row += [str(st.count("ok")), str(len(st) - st.count("?")), str(len(group))]
-    for group in (ru, eu):
-        row.append(", ".join("%s %s" % (city.get(n, n), mark[state(port, n)]) for n in group))
-    print("|".join(row))
+try:
+    out = main()
+except Exception:   # check-host ответил чем-то неожиданным: «проверить не удалось», а не обрыв установки
+    out = ["NOAPI"]
+print("\n".join(out))
 PY
 }
 
 port_verdict() {  # port_verdict ru_ok ru_done ru_n eu_ok eu_done → OK | RU_BLOCKED | CLOSED | PARTIAL | UNKNOWN
-	if [ "$2" = 0 ] && [ "$5" = 0 ]; then echo UNKNOWN
-	elif [ "$1" = "$3" ]; then echo OK
-	elif [ "$1" = 0 ] && [ "$4" -gt 0 ]; then echo RU_BLOCKED
-	elif [ "$1" = 0 ] && [ "$4" = 0 ] && [ "$5" -gt 0 ]; then echo CLOSED
+	# Считаются только ответившие узлы: молчащий узел — «неизвестно», а не «закрыто».
+	if [ "$2" = 0 ]; then echo UNKNOWN          # из России не ответил ни один узел
+	elif [ "$1" = "$2" ]; then echo OK         # все ответившие узлы в России достучались
 	elif [ "$1" -gt 0 ]; then echo PARTIAL
+	elif [ "$4" -gt 0 ]; then echo RU_BLOCKED  # из России — нет, из Европы — да
+	elif [ "$5" -gt 0 ]; then echo CLOSED      # ни оттуда, ни оттуда
 	else echo UNKNOWN
 	fi
 }
@@ -582,7 +691,7 @@ ip_precheck() {  # до установки: не заблокирован ли I
 	local port line p ru_ok ru_done ru_n eu_ok eu_done eu_n ru_s eu_s
 	port=$(ssh_ports | awk '{print $1}')
 	if [ "$SKIP_IP_CHECK" = 1 ]; then warn "доступность IP из России не проверялась (--skip-ip-check)"; return 0; fi
-	line=$(chk_probe "$PUBLIC_IP" "$port" | head -1)
+	line=$(chk_probe "$PUBLIC_IP" "$port" | head -1) || line=
 	case $line in
 		NOAPI | "") warn "check-host.net недоступен — не проверить, заблокирован ли IP в России; ставлю дальше"; return 0 ;;
 		NORU) warn "у check-host.net сейчас нет узлов в России — блокировку IP проверить нечем; ставлю дальше"; return 0 ;;
@@ -592,7 +701,7 @@ ip_precheck() {  # до установки: не заблокирован ли I
 	if [ "$(port_verdict "$ru_ok" "$ru_done" "$ru_n" "$eu_ok" "$eu_done")" = RU_BLOCKED ]; then
 		# Прежде чем отказаться от установки — ещё раз, через полминуты: узлы иногда сбоят вместе.
 		sleep 30
-		line=$(chk_probe "$PUBLIC_IP" "$port" | head -1)
+		line=$(chk_probe "$PUBLIC_IP" "$port" | head -1) || line=
 		case $line in *"|"*"|"*) IFS='|' read -r p ru_ok ru_done ru_n eu_ok eu_done eu_n ru_s eu_s <<<"$line" ;; esac
 	fi
 	case $(port_verdict "$ru_ok" "$ru_done" "$ru_n" "$eu_ok" "$eu_done") in
@@ -603,6 +712,7 @@ ip_precheck() {  # до установки: не заблокирован ли I
 		PARTIAL)
 			warn "из России IP открывается не со всех узлов ($ru_s; Европа — $eu_s): похоже на частичную блокировку — у части провайдеров VPN может не работать"
 			if { : > /dev/tty; } 2>/dev/null; then
+				tty_flush
 				printf 'Продолжить установку на этот IP всё равно? [y/N]: ' > /dev/tty
 				read -r ans < /dev/tty || ans=
 				case $ans in y | Y | yes | да | Да) ok "продолжаю по вашему решению" ;; *) die "установка отменена: лучше взять другой IP (новый сервер или смена IP у хостера). Поставить всё равно — --skip-ip-check" ;; esac
@@ -621,7 +731,7 @@ reach_check() {  # после установки и в --check: открыты �
 	if [ "${PANEL_PUBLIC:-0}" = 1 ]; then ports="$ports $WEB_PORT"; fi
 	if [ "${SUB_TLS:-0}" = 1 ]; then ports="$ports $SUB_PORT"; fi   # :80 при сертификате на IP открыт только во время продления
 	# shellcheck disable=SC2086
-	chk_probe "$PUBLIC_IP" $ports > "$CHK_OUT"
+	chk_probe "$PUBLIC_IP" $ports > "$CHK_OUT" || true
 	case $(head -1 "$CHK_OUT") in
 		NOAPI | "") warn "check-host.net недоступен — доступность из России не проверена (повторить потом: bash $0 --check)"; return 0 ;;
 		NORU) warn "у check-host.net сейчас нет узлов в России — проверить нечем (повторить потом: bash $0 --check)"; return 0 ;;
@@ -746,7 +856,12 @@ local_checks() {
 		if wait_port "$p" 15; then ok "слушает $p"; else bad "никто не слушает $p"; fi
 	done
 	if [ "$(exit_mode_now)" = chain ]; then
-		ok "выход клиентов: $(exit_label chain); сейчас активно — $(active_label "$(chain_active)")"
+		s=$(chain_active)
+		if [ "$s" = chain ]; then
+			ok "выход клиентов: $(exit_label chain)"
+		else
+			warn "выход клиентов: $(exit_label chain), но сейчас $(active_label "$s"): старый сервер $CHAIN_IP:$CHAIN_PORT отсюда недоступен (выключен? порт закрыт у хостера?) — когда вернётся, вотчдог переключит сам"
+		fi
 		if [ -f /etc/systemd/system/vpn-exit-watchdog.service ]; then
 			if systemctl is-active -q vpn-exit-watchdog; then ok "вотчдог следит за старым сервером (упадёт — российские сайты через WARP, остальное напрямую; вернётся — назад)"; else bad "вотчдог не работает (journalctl -u vpn-exit-watchdog)"; fi
 		fi
@@ -789,7 +904,7 @@ local_checks() {
 		fi
 		# Кто прощупывает сервер без ключа, должен увидеть настоящий сайт с верным сертификатом.
 		if timeout 10 openssl s_client -connect "$LISTEN_IP:$REALITY_PORT" -servername "$REALITY_SNI" -verify_hostname "$REALITY_SNI" \
-			-verify_return_error < /dev/null 2>&1 | grep -q 'Verify return code: 0 (ok)'; then
+			-verify_return_error < /dev/null 2>&1 | grep 'Verify return code: 0 (ok)' >/dev/null; then
 			ok "чужим на :$REALITY_PORT отвечает настоящий $REALITY_SNI (сертификат верный)"
 		else
 			bad "проба :$REALITY_PORT с SNI $REALITY_SNI не получила настоящий сертификат сайта"
@@ -813,18 +928,33 @@ local_checks() {
 		ok "подписка отдаёт ссылку"
 		case $link in *"@$SHARE_ADDR:$REALITY_PORT"*) ok "в ссылке адрес $SHARE_ADDR:$REALITY_PORT" ;; *) bad "в ссылке не тот адрес: ${link%%\?*}" ;; esac
 		read -r code exit_ip exit_warp log <<<"$(tunnel_check "$link")"
+		s=$(exit_mode_now); p=
+		[ "$s" != chain ] || p=$(chain_active)
 		if [ "$code" != 204 ]; then
 			bad "туннель по ссылке клиента не работает (ответ $code): $log"
 		elif [ "$exit_warp" = on ] || [ "$exit_warp" = plus ]; then
 			ok "туннель по ссылке клиента работает, выход через Cloudflare WARP ($exit_ip)"
+		elif [ "$s" = warp ] || [ "$p" = warp ]; then
+			bad "туннель работает, но выход с IP $exit_ip, а должен идти через Cloudflare WARP — WARP отсюда не работает (выход напрямую: vpn-warp off)"
+		elif [ "$p" = chain ] && [ "$exit_ip" != "$CHAIN_IP" ] && [ "$exit_ip" != "$(getent ahostsv4 "$CHAIN_IP" 2>/dev/null | awk 'NR == 1 {print $1}')" ]; then
+			warn "туннель работает, выход с IP $exit_ip — не с адреса старого сервера $CHAIN_IP (у него другой IP выхода в интернет?)"
 		else
-			ok "туннель по ссылке клиента работает, выход с IP $exit_ip"
+			ok "туннель по ссылке клиента работает, выход с IP $exit_ip$([ "$p" = chain ] && echo " (старый сервер)")"
 		fi
 	else
 		bad "подписка не отдала vless-ссылку — туннель не проверить"
 	fi
 }
 
+xui_stop() {  # остановить x-ui на время правки базы; вотчдог цепочки — тоже, чтобы не перезапустил x-ui посреди правки
+	systemctl stop vpn-exit-watchdog 2>/dev/null || true
+	systemctl stop x-ui 2>/dev/null || true
+	# Первая остановка работавшего VPN — снимок базы: оборвётся установка — база вернётся как была до запуска.
+	if [ "$XUI_TOUCHED" = 0 ] && [ "$XUI_WAS_ACTIVE" = 1 ] && [ -f "$DB" ]; then
+		sqlite3 "$DB" ".backup '$WORK/db.before'" 2>/dev/null || cp -a "$DB" "$WORK/db.before" 2>/dev/null || true
+	fi
+	XUI_TOUCHED=1
+}
 xui_set() {  # xui_set КЛЮЧ=ЗНАЧЕНИЕ… — строки таблицы settings (x-ui должен быть остановлен)
 	python3 - "$DB" "$@" <<'PY'
 import sqlite3, sys
@@ -842,7 +972,12 @@ import json, sys
 mode, warp_file, chain_file = sys.argv[1], sys.argv[2], sys.argv[3]
 warp = json.load(open(warp_file)) if warp_file != "-" else None
 chain = json.load(open(chain_file)) if chain_file != "-" else None
-direct = {"protocol": "freedom", "settings": {"domainStrategy": "AsIs", "finalRules": [{"action": "allow"}]}, "tag": "direct"}
+# Внутренние адреса (127.0.0.1, 10/8, 169.254/16, 192.168/16 …) клиентам закрыты и по имени: правило geoip:private
+# в routing ловит только IP, а «localhost» или имя, указывающее внутрь, freedom разрешает сам — без блокировки здесь
+# клиент VPN достучался бы до служб самого сервера (API Xray, метрики, панель на 127.0.0.1) и его сети.
+# Проверено на Xray 26.6.1: без finalRules «localhost» тоже открыт, с этим правилом — нет.
+direct = {"protocol": "freedom", "settings": {"domainStrategy": "AsIs", "finalRules": [
+    {"action": "block", "ip": ["geoip:private"]}, {"action": "allow"}]}, "tag": "direct"}
 blocked = {"protocol": "blackhole", "settings": {}, "tag": "blocked"}
 rules = [{"inboundTag": ["api"], "outboundTag": "api", "type": "field"},
          {"ip": ["geoip:private"], "outboundTag": "blocked", "type": "field"},
@@ -862,8 +997,9 @@ elif mode == "chain" and chain:
     main, dns_out = "chain", "chain"
 else:
     outbounds, main, dns_out = [direct, blocked], "direct", "direct"
-rules += [{"type": "field", "inboundTag": ["dns-internal"], "outboundTag": dns_out},
-          {"type": "field", "network": "tcp,udp", "outboundTag": main}]
+# Метки main и dns-out: по ним вотчдог и vpn-check находят главные правила, а не по признакам.
+rules += [{"type": "field", "ruleTag": "dns-out", "inboundTag": ["dns-internal"], "outboundTag": dns_out},
+          {"type": "field", "ruleTag": "main", "network": "tcp,udp", "outboundTag": main}]
 print(json.dumps({
     "log": {"access": "none", "dnsLog": False, "error": "", "loglevel": "warning", "maskAddress": ""},
     "routing": {"domainStrategy": "AsIs", "rules": rules},
@@ -898,8 +1034,12 @@ SHORT_IDS='${SHORT_IDS:-}'
 REALITY_SNI='${REALITY_SNI:-}'
 S_EXIT='$EXIT_MODE'
 S_PANEL_PUBLIC='${PANEL_PUBLIC:-0}'
-S_IP_CERT='${IP_CERT:-0}'
-S_IP_CERT_IP='${IP_CERT_IP:-}'
+S_IP_CERT='${IP_CERT-${S_IP_CERT:-0}}'
+S_IP_CERT_IP='${IP_CERT_IP-${S_IP_CERT_IP:-}}'
+S_DO_UFW='${DO_UFW:-1}'
+S_DO_F2B='${DO_F2B:-1}'
+S_TZ='${TZ_NAME:-}'
+S_DONE='${S_DONE:-0}'
 S_REALITY_PORT='$REALITY_PORT'
 CHAIN_IP='${CHAIN_IP:-}'
 CHAIN_PORT='${CHAIN_PORT:-}'
@@ -911,6 +1051,8 @@ CHAIN_SNI='${CHAIN_SNI:-}'
 CHAIN_SSH_USER='${CHAIN_SSH_USER:-}'
 CHAIN_SSH_PORT='${CHAIN_SSH_PORT:-}'
 EOF
+	# Файл потом читается через «.»: значение с кавычкой исполнилось бы как команда — такой не сохранять.
+	if grep -v '^#' "$tmp" | grep -q "^[A-Z_0-9]*='.*'.*'"; then rm -f "$tmp"; die "в настройках оказалась кавычка — $STATE не записан"; fi
 	chmod 600 "$tmp"
 	mv "$tmp" "$STATE"
 }
@@ -936,7 +1078,8 @@ import json, sqlite3, sys
 row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
 t = json.loads(row[0]) if row and row[0] else {}
 rules = (t.get("routing") or {}).get("rules") or []
-main = next((r.get("outboundTag") for r in rules if r.get("network") == "tcp,udp"), None)
+main = next((r.get("outboundTag") for r in rules if r.get("ruleTag") == "main"), None) or \
+    next((r.get("outboundTag") for r in rules if r.get("network") == "tcp,udp"), None)
 main = main or ((t.get("outbounds") or [{}])[0].get("tag") or "direct")
 if any(o.get("tag") == "chain" for o in t.get("outbounds") or []):
     print("chain")           # цепочка настроена; активный путь (chain/warp) — отдельно, chain_active
@@ -964,7 +1107,8 @@ chain_active() {  # активный выход цепочки: chain (стар�
 import json, sqlite3, sys
 row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
 t = json.loads(row[0]) if row and row[0] else {}
-cat = [r for r in (t.get("routing") or {}).get("rules") or [] if r.get("network") == "tcp,udp"]
+rules = (t.get("routing") or {}).get("rules") or []
+cat = [r for r in rules if r.get("ruleTag") == "main"] or [r for r in rules if r.get("network") == "tcp,udp"]
 print(cat[0].get("outboundTag", "chain") if cat else "chain")
 PY
 }
@@ -986,8 +1130,16 @@ import sys
 
 path, mode, chain = sys.argv[1:4]
 RU_TAG = "ru-via-warp"
-db = sqlite3.connect(path)
+db = sqlite3.connect(path, timeout=30)
 t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+tags = {o.get("tag") for o in t.get("outbounds", [])}
+main = chain if mode == "chain" else "direct"
+if main not in tags:
+    sys.exit(3)
+all_rules = t["routing"]["rules"]
+# Главные правила помечены ruleTag (main — весь трафик, dns-out — DNS самого Xray). В шаблонах прежних версий
+# меток нет — тогда по признакам; свои правила человека с network tcp,udp при метках не трогаются.
+tagged = any(r.get("ruleTag") in ("main", "dns-out") for r in all_rules)
 
 
 def is_ru(r):
@@ -996,16 +1148,17 @@ def is_ru(r):
 
 
 def is_main(r):
+    if tagged:
+        return r.get("ruleTag") in ("main", "dns-out")
     return r.get("network") == "tcp,udp" or "dns-internal" in (r.get("inboundTag") or [])
 
 
-rules = [r for r in t["routing"]["rules"] if not is_ru(r)]
-main = chain if mode == "chain" else "direct"
+rules = [r for r in all_rules if not is_ru(r)]
 for r in rules:
     if is_main(r):
         r["outboundTag"] = main
         r.pop("balancerTag", None)
-if mode == "fallback":
+if mode == "fallback" and "warp" in tags:
     at = next((i for i, r in enumerate(rules) if is_main(r)), len(rules))
     rules[at:at] = [
         {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp",
@@ -1085,6 +1238,7 @@ prepare_exit_key() {  # ключ (вставленный или файл) → $W
 		(umask 077 && : > "$ppf")
 		if ! grep -q '^Encryption: none' "$src"; then
 			if [ -z "$pp" ] && { : > /dev/tty; } 2>/dev/null; then
+				tty_flush
 				printf 'Ключ защищён парольной фразой — введите её (не отобразится): ' > /dev/tty
 				IFS= read -rs pp < /dev/tty || true; echo > /dev/tty
 			fi
@@ -1102,6 +1256,7 @@ prepare_exit_key() {  # ключ (вставленный или файл) → $W
 	if ! err=$(ssh-keygen -y -P "" -f "$k" 2>&1 >/dev/null); then
 		if grep -qi passphrase <<<"$err"; then
 			if [ -z "$pp" ] && { : > /dev/tty; } 2>/dev/null; then
+				tty_flush
 				printf 'Ключ защищён парольной фразой — введите её (не отобразится): ' > /dev/tty
 				IFS= read -rs pp < /dev/tty || true; echo > /dev/tty
 			fi
@@ -1123,6 +1278,7 @@ emit_exit_setup() {  # пишет в $WORK/exit-setup.sh скрипт настр
 # Запускается от root (напрямую или через sudo). Параметры и секреты — в exit.env рядом со скриптом;
 # папка со скриптом (~/.vpn-exit-stage) удаляется в конце, в том числе при ошибке.
 set -eu
+trap 'echo "EXIT_RESULT=FAIL на старом сервере не прошла команда (строка $LINENO скрипта настройки)"' ERR
 STAGE=$(dirname "$(readlink -f "$0")")
 case $STAGE in */.vpn-exit-stage) trap 'rm -rf "$STAGE"' EXIT ;; esac
 [ -f "$STAGE/exit.env" ] || { echo "EXIT_RESULT=FAIL нет параметров (exit.env)"; exit 1; }
@@ -1136,8 +1292,15 @@ case $(uname -m) in
 	aarch64 | arm64) A=arm64; SHA=$XUI_SHA_ARM64 ;;
 	*) echo "EXIT_RESULT=FAIL архитектура $(uname -m) не поддержана"; exit 1 ;;
 esac
-for t in 1 2 3 4 5 6; do apt-get -y -q -o DPkg::Lock::Timeout=600 update >/dev/null 2>&1 && break; [ "$t" = 6 ] && { echo "EXIT_RESULT=FAIL apt update"; exit 1; }; sleep 15; done
-apt-get -y -q install curl ca-certificates python3 openssl iproute2 tar >/dev/null 2>&1 || { echo "EXIT_RESULT=FAIL пакеты"; exit 1; }
+# Пакеты — только если чего-то нет: на старом сервере apt бывает сломан (снятый с поддержки релиз), а всё нужное стоит.
+need=
+for c in curl python3 openssl ss tar; do command -v "$c" >/dev/null 2>&1 || need=1; done
+[ -s /etc/ssl/certs/ca-certificates.crt ] || need=1
+if [ -n "$need" ]; then
+	for t in 1 2 3 4 5 6; do apt-get -y -q -o DPkg::Lock::Timeout=600 update >/dev/null 2>&1 && break; [ "$t" = 6 ] && { echo "EXIT_RESULT=FAIL apt-get update на старом сервере не прошёл"; exit 1; }; sleep 15; done
+	apt-get -y -q -o DPkg::Lock::Timeout=600 install curl ca-certificates python3 openssl iproute2 tar >/dev/null 2>&1 ||
+		{ echo "EXIT_RESULT=FAIL на старом сервере не установились curl, python3, openssl, iproute2 (apt-get install)"; exit 1; }
+fi
 # Старый сервер мог быть прежним VPN на 3x-ui. Цепочке он не мешает (отдельный процесс, другой порт),
 # но по желанию (STOP_XUI=1) выключаем — если старый теперь только выход.
 XUISTAT=absent
@@ -1147,6 +1310,13 @@ fi
 if [ "${STOP_XUI:-0}" = 1 ] && [ "$XUISTAT" != absent ]; then
 	systemctl disable --now x-ui >/dev/null 2>&1 || true
 	XUISTAT=stopped
+fi
+# Порт цепочки занят чужим процессом — отказ до любых изменений (свой прежний vpn-exit не в счёт).
+own=$(systemctl show -p MainPID --value vpn-exit 2>/dev/null || true); own=${own:-0}
+lst=$(ss -Htlnp "sport = :$EXIT_PORT" 2>/dev/null || true)
+if [ -n "$lst" ] && { [ "$own" = 0 ] || ! grep -q "pid=$own," <<<"$lst"; }; then
+	who=$(grep -o 'users:(("[^"]*"' <<<"$lst" | cut -d'"' -f2 | sort -u | tr '\n' ' ')
+	echo "EXIT_RESULT=FAIL порт $EXIT_PORT на старом сервере занят (${who:-другой процесс}) — укажи другой --exit-port или выключи 3x-ui (--exit-stop-xui)"; exit 1
 fi
 DIR=/usr/local/vpn-exit; install -d -m 755 "$DIR"
 if [ -s "$STAGE/xray" ]; then
@@ -1177,19 +1347,30 @@ for d in ${EXIT_SNI_HINT:-} www.microsoft.com www.apple.com swdist.apple.com www
 	grep -q 'New, TLSv1.3' <<<"$o" && grep -q 'ALPN protocol: h2' <<<"$o" && grep -q 'Server Temp Key: X25519' <<<"$o" && grep -q 'Verify return code: 0 (ok)' <<<"$o" && { SNI=$d; break; }
 done
 [ -n "$SNI" ] || { echo "EXIT_RESULT=FAIL не нашёлся сайт для маскировки (нет выхода на 443?)"; exit 1; }
-python3 - "$DIR/config.json" "$EXIT_PORT" "$CHAIN_PRIV" "$CHAIN_UUID" "$CHAIN_SID" "$SNI" <<'PYJ'
-import json,sys
-out,port,priv,uuid,sid,sni=sys.argv[1:7]
+# Секреты — через окружение, не аргументами: командную строку процесса видят все пользователи сервера.
+EXIT_PORT=$EXIT_PORT CHAIN_PRIV=$CHAIN_PRIV CHAIN_UUID=$CHAIN_UUID CHAIN_SID=$CHAIN_SID SNI=$SNI python3 - "$DIR/config.new.json" <<'PYJ'
+import json,os,sys
+e=os.environ
+out=sys.argv[1]
+port,priv,uuid,sid,sni=e["EXIT_PORT"],e["CHAIN_PRIV"],e["CHAIN_UUID"],e["CHAIN_SID"],e["SNI"]
 json.dump({"log":{"loglevel":"warning"},
  "inbounds":[{"listen":"0.0.0.0","port":int(port),"protocol":"vless",
    "settings":{"clients":[{"id":uuid,"flow":""}],"decryption":"none"},
    "streamSettings":{"network":"tcp","security":"reality",
      "realitySettings":{"show":False,"dest":sni+":443","xver":0,"serverNames":[sni],"privateKey":priv,"shortIds":[sid]}},
    "sniffing":{"enabled":False}}],
- "outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}],
+ "outbounds":[{"protocol":"freedom","tag":"direct",
+   "settings":{"finalRules":[{"action":"block","ip":["geoip:private"]},{"action":"allow"}]}},
+  {"protocol":"blackhole","tag":"blocked"}],
  "routing":{"rules":[{"type":"field","ip":["geoip:private"],"outboundTag":"blocked"},
                      {"type":"field","protocol":["bittorrent"],"outboundTag":"blocked"}]}},open(out,"w"))
 PYJ
+chmod 600 "$DIR/config.new.json"
+if ! XRAY_LOCATION_ASSET=$DIR "$DIR/xray" run -test -c "$DIR/config.new.json" >/dev/null 2>&1; then
+	rm -f "$DIR/config.new.json"; echo "EXIT_RESULT=FAIL Xray на старом сервере не принял конфиг выхода (xray run -test)"; exit 1
+fi
+[ ! -f "$DIR/config.json" ] || cp -a "$DIR/config.json" "$DIR/config.bak.json"
+mv -f "$DIR/config.new.json" "$DIR/config.json"
 cat > /etc/systemd/system/vpn-exit.service <<UNIT
 [Unit]
 Description=VPN exit node (Xray VLESS-TCP+Reality inbound)
@@ -1202,19 +1383,22 @@ ExecStart=$DIR/xray run -c $DIR/config.json
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl stop vpn-exit 2>/dev/null || true   # свой прежний экземпляр — чтобы проверка порта не спутала его с чужим
-if ss -Htln "sport = :$EXIT_PORT" 2>/dev/null | grep -q .; then
-	who=$(ss -Htlnp "sport = :$EXIT_PORT" 2>/dev/null | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | tr '\n' ' ')
-	echo "EXIT_RESULT=FAIL порт $EXIT_PORT на старом сервере занят (${who:-другой процесс}) — укажи другой --exit-port или выключи 3x-ui (--exit-stop-xui)"; exit 1
-fi
 systemctl enable vpn-exit >/dev/null 2>&1 || true
-systemctl restart vpn-exit
+systemctl restart vpn-exit || true
 ok=0; for _ in $(seq 1 20); do systemctl is-active -q vpn-exit 2>/dev/null && ss -Htln "sport = :$EXIT_PORT" 2>/dev/null | grep -q . && { ok=1; break; }; sleep 1; done
-[ "$ok" = 1 ] || { echo "EXIT_RESULT=FAIL vpn-exit не слушает порт $EXIT_PORT (journalctl -u vpn-exit)"; exit 1; }
+if [ "$ok" != 1 ]; then
+	# Новый конфиг не поднялся — вернуть прежний, если был: выход для уже работающего входа не пропадёт.
+	# (Временные файлы — с расширением .json: по нему Xray узнаёт формат конфига.)
+	if [ -f "$DIR/config.bak.json" ]; then mv -f "$DIR/config.bak.json" "$DIR/config.json"; systemctl restart vpn-exit 2>/dev/null || true; fi
+	echo "EXIT_RESULT=FAIL vpn-exit не слушает порт $EXIT_PORT (journalctl -u vpn-exit)"; exit 1
+fi
+rm -f "$DIR/config.bak.json"
 # Фаервол: если ufw активен — пустить новый сервер на порт цепочки (ssh не трогаем). Неактивный ufw не включаем, чтобы не запереть.
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
 	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
@@ -1223,12 +1407,13 @@ elif command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -qE 
 	# iptables без ufw, лишнее отклоняется (так у образов Oracle Cloud): пустить новый сервер и сохранить правило.
 	iptables -C INPUT -p tcp -s "$ENTRY_IP" --dport "$EXIT_PORT" -j ACCEPT 2>/dev/null ||
 		iptables -I INPUT 1 -p tcp -s "$ENTRY_IP" --dport "$EXIT_PORT" -j ACCEPT
+	saved=
 	if command -v netfilter-persistent >/dev/null; then
-		netfilter-persistent save >/dev/null 2>&1 || true
+		netfilter-persistent save >/dev/null 2>&1 && saved=1
 	elif [ -d /etc/iptables ]; then
-		iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+		iptables-save > /etc/iptables/rules.v4 2>/dev/null && saved=1
 	fi
-	echo "EXIT_UFW=iptables"
+	if [ -n "$saved" ]; then echo "EXIT_UFW=iptables"; else echo "EXIT_UFW=iptables-unsaved"; fi
 else
 	echo "EXIT_UFW=open"
 fi
@@ -1254,21 +1439,30 @@ fails=0; oks=0
 state() {  # chain | direct (запасной) | warp (запасной прежней версии)
 python3 - "$DB" <<'PY'
 import json, sqlite3, sys
-t = json.loads(sqlite3.connect(sys.argv[1]).execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
-cat = [r for r in t["routing"]["rules"] if r.get("network") == "tcp,udp"]
+t = json.loads(sqlite3.connect(sys.argv[1], timeout=30).execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+rules = t["routing"]["rules"]
+cat = [r for r in rules if r.get("ruleTag") == "main"] or [r for r in rules if r.get("network") == "tcp,udp"]
 print(cat[0].get("outboundTag", "?") if cat else "?")
 PY
 }
-switch() {  # switch chain|fallback
-python3 - "$DB" "$1" "$CHAIN" <<'PY'
+switch() {  # switch chain|fallback → 0, если шаблон переписан и x-ui перезапущен
+python3 - "$DB" "$1" "$CHAIN" <<'PY' || return 1
 import json
 import sqlite3
 import sys
 
 path, mode, chain = sys.argv[1:4]
 RU_TAG = "ru-via-warp"
-db = sqlite3.connect(path)
+db = sqlite3.connect(path, timeout=30)
 t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+tags = {o.get("tag") for o in t.get("outbounds", [])}
+main = chain if mode == "chain" else "direct"
+if main not in tags:
+    sys.exit(3)
+all_rules = t["routing"]["rules"]
+# Главные правила помечены ruleTag (main — весь трафик, dns-out — DNS самого Xray). В шаблонах прежних версий
+# меток нет — тогда по признакам; свои правила человека с network tcp,udp при метках не трогаются.
+tagged = any(r.get("ruleTag") in ("main", "dns-out") for r in all_rules)
 
 
 def is_ru(r):
@@ -1277,16 +1471,17 @@ def is_ru(r):
 
 
 def is_main(r):
+    if tagged:
+        return r.get("ruleTag") in ("main", "dns-out")
     return r.get("network") == "tcp,udp" or "dns-internal" in (r.get("inboundTag") or [])
 
 
-rules = [r for r in t["routing"]["rules"] if not is_ru(r)]
-main = chain if mode == "chain" else "direct"
+rules = [r for r in all_rules if not is_ru(r)]
 for r in rules:
     if is_main(r):
         r["outboundTag"] = main
         r.pop("balancerTag", None)
-if mode == "fallback":
+if mode == "fallback" and "warp" in tags:
     at = next((i for i, r in enumerate(rules) if is_main(r)), len(rules))
     rules[at:at] = [
         {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp",
@@ -1308,9 +1503,13 @@ while true; do
   st=$(state)
   if probe; then oks=$((oks+1)); fails=0; else fails=$((fails+1)); oks=0; fi
   if [ "$st" = "$CHAIN" ] && [ "$fails" -ge "$FAIL_LIMIT" ]; then
-     logger -t vpn-watchdog "exit $EXIT_IP unreachable x$fails -> fallback: RU via WARP, rest direct"; switch fallback; fails=0
+     if switch fallback; then logger -t vpn-watchdog "exit $EXIT_IP unreachable x$fails -> fallback: RU via WARP, rest direct"
+     else logger -t vpn-watchdog "exit $EXIT_IP unreachable x$fails, switch to fallback FAILED (no direct outbound in template?)"; fi
+     fails=0; oks=0
   elif { [ "$st" = direct ] || [ "$st" = warp ]; } && [ "$oks" -ge "$OK_LIMIT" ]; then
-     logger -t vpn-watchdog "exit $EXIT_IP recovered x$oks -> chain"; switch chain; oks=0
+     if switch chain; then logger -t vpn-watchdog "exit $EXIT_IP recovered x$oks -> chain"
+     else logger -t vpn-watchdog "exit $EXIT_IP recovered x$oks, switch to chain FAILED (no outbound $CHAIN in template?)"; fi
+     oks=0; fails=0
   fi
   sleep "$INTERVAL"
 done
@@ -1334,12 +1533,45 @@ EOF
 	systemctl restart vpn-exit-watchdog || warn "вотчдог не запустился (journalctl -u vpn-exit-watchdog)"
 }
 
+chain_apply() {  # шаблон с цепочкой ($CHAIN_SAVED); порт старого отсюда закрыт — сразу запасной режим
+	xui_stop
+	xui_set "xrayTemplateConfig=$(template_json chain "$WORK/warp.json" "$CHAIN_SAVED")"
+	if timeout 6 bash -c "cat </dev/null >/dev/tcp/$CHAIN_IP/$CHAIN_PORT" 2>/dev/null; then
+		CHAIN_BLOCKED=0
+		ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — вотчдог включит запасной режим (российские сайты через WARP, остальное напрямую) и вернёт назад"
+	else
+		CHAIN_BLOCKED=1
+		chain_activate fallback
+		warn "порт $CHAIN_PORT старого сервера $CHAIN_IP отсюда не открывается — почти всегда это фаервол хостера: откройте входящий TCP $CHAIN_PORT для $PUBLIC_IP в панели хостера (AWS — Security Group, Oracle — Security List или NSG). Пока — запасной режим (российские сайты через WARP, остальное напрямую); как порт откроется, вотчдог сам переключит на старый сервер"
+	fi
+}
+
 setup_chain_exit() {  # настроить старый сервер по SSH и собрать outbound цепочки; ошибка → CHAIN_ERR
+	# Новые настройки цепочки остаются только при удаче: неудачная попытка (другой сервер, неверный пароль)
+	# возвращает прежние — работавшая цепочка не теряется.
+	local p_ip=$CHAIN_IP p_port=$CHAIN_PORT p_uuid=$CHAIN_UUID p_pub=$CHAIN_PUB p_priv=$CHAIN_PRIV p_sid=$CHAIN_SID
+	local p_sni=$CHAIN_SNI p_user=$CHAIN_SSH_USER p_sport=$CHAIN_SSH_PORT
+	PREV_CHAIN_IP=$p_ip
+	setup_chain_exit_try && return 0
+	CHAIN_IP=$p_ip CHAIN_PORT=$p_port CHAIN_UUID=$p_uuid CHAIN_PUB=$p_pub CHAIN_PRIV=$p_priv CHAIN_SID=$p_sid
+	CHAIN_SNI=$p_sni CHAIN_SSH_USER=$p_user CHAIN_SSH_PORT=$p_sport
+	return 1
+}
+
+setup_chain_exit_try() {
 	CHAIN_ERR=
 	if [ -z "$EXIT_HOST" ] && [ -n "$CHAIN_IP" ]; then
+		if [ -z "$CHAIN_PORT" ] || [ -z "$CHAIN_UUID" ] || [ -z "$CHAIN_PUB" ] || [ -z "$CHAIN_SID" ] || [ -z "$CHAIN_SNI" ]; then
+			CHAIN_ERR="в $STATE не хватает настроек цепочки — настройте старый сервер заново: --exit-host $CHAIN_IP"
+			return 1
+		fi
 		ok "цепочка: прежние настройки выхода ($CHAIN_IP:$CHAIN_PORT), старый сервер не трогаю"
 		build_chain_outbound "$WORK/chain.json"; save_chain "$WORK/chain.json"
 		return 0
+	fi
+	if [ "$EXIT_HOST" = "$PUBLIC_IP" ] || [ "$EXIT_HOST" = "$LISTEN_IP" ]; then
+		CHAIN_ERR="$EXIT_HOST — это сам этот сервер, а выходом нужен другой (старый) сервер"
+		return 1
 	fi
 	CHAIN_IP=$EXIT_HOST
 	CHAIN_PORT=${EXIT_PORT_ARG:-${CHAIN_PORT:-2087}}
@@ -1348,7 +1580,9 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 	if [ -z "$EXIT_SSH_KEY" ] && ! command -v sshpass >/dev/null; then
 		"${APT[@]}" install sshpass >/dev/null 2>&1 || { CHAIN_ERR="не установился sshpass (вход по паролю к старому серверу)"; return 1; }
 	fi
-	: > "$WORK/exit_known_hosts"
+	# Ключ SSH старого сервера запоминается: при повторной настройке того же сервера подменённый ключ не пройдёт.
+	local kh=/etc/x-ui/chain/known_hosts
+	if [ "$EXIT_HOST" = "${PREV_CHAIN_IP:-}" ] && [ -s "$kh" ]; then cp "$kh" "$WORK/exit_known_hosts"; else : > "$WORK/exit_known_hosts"; fi
 	local sshe uhint
 	sshe=$(ssh_exit true 2>&1) && sshe=OK
 	# Облака с cloud-init (AWS, Oracle и др.) пускают root по ключу, но вместо входа отвечают
@@ -1359,8 +1593,12 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 		EXIT_SSH_USER=$uhint
 		sshe=$(ssh_exit true 2>&1) && sshe=OK
 	fi
+	if [ "$sshe" != OK ] && grep -qE 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed' <<<"$sshe"; then
+		CHAIN_ERR="SSH-ключ старого сервера $EXIT_HOST не тот, что при прошлой настройке (сервер переустановлен — или подмена по дороге). Если переустанавливали сами: rm $kh и запустите снова"
+		return 1
+	fi
 	if [ "$sshe" != OK ]; then
-		sshe=$(grep -v -e '^Warning: Permanently added' -e '^$' <<<"$sshe" | tail -1)
+		sshe=$(grep -v -e '^Warning: Permanently added' -e '^$' <<<"$sshe" | tail -1 | tr -d '\000-\037\177' | cut -c1-200)
 		if [ -n "$EXIT_SSH_KEY" ]; then
 			CHAIN_ERR="SSH к старому серверу $EXIT_SSH_USER@$EXIT_HOST:$EXIT_SSH_PORT по ключу не прошёл (${sshe:-нет ответа}) — публичная часть ключа должна быть в ~$EXIT_SSH_USER/.ssh/authorized_keys старого сервера"
 		else
@@ -1377,6 +1615,7 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 		else
 			local spw=${EXIT_SUDO_PASS:-${EXIT_PASS:-}} serr=""
 			if [ -z "$spw" ] && { : > /dev/tty; } 2>/dev/null; then
+				tty_flush
 				printf 'Пароль sudo для %s на старом сервере (не отобразится): ' "$EXIT_SSH_USER" > /dev/tty
 				IFS= read -rs spw < /dev/tty || true
 				echo > /dev/tty
@@ -1385,7 +1624,7 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 				EXIT_SUDO=pass
 				EXIT_SUDO_PW=$spw
 			else
-				serr=$(grep -v -e '^Warning: Permanently added' -e '^$' <<<"$serr" | tail -1)
+				serr=$(grep -v -e '^Warning: Permanently added' -e '^$' <<<"$serr" | tail -1 | tr -d '\000-\037\177' | cut -c1-200)
 				CHAIN_ERR="у $EXIT_SSH_USER на старом сервере нет sudo без пароля, а пароль sudo $([ -n "$spw" ] && echo "не подошёл${serr:+ ($serr)}" || echo "не задан (EXIT_SUDO_PASS)")"
 				return 1
 			fi
@@ -1421,6 +1660,7 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 		rxui=$(ssh_exit 'command -v systemctl >/dev/null 2>&1 && systemctl is-active x-ui 2>/dev/null || echo none' 2>/dev/null | tr -d '\r')
 		if [ "$rxui" = active ]; then
 			if { : > /dev/tty; } 2>/dev/null; then
+				tty_flush
 				printf 'На старом сервере работает панель 3x-ui. Выключить её (старый теперь только выход)? [y/N]: ' > /dev/tty
 				read -r a < /dev/tty || a=
 				case $a in y | Y | yes | да | Да) EXIT_STOP_XUI=1 ;; *) EXIT_STOP_XUI=0 ;; esac
@@ -1453,14 +1693,18 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 	EXIT_SUDO_PW=
 	ssh_exit "rm -rf '$stage'" >/dev/null 2>&1 || true   # скрипт удаляет её сам; это — если он не дошёл до старта
 	if ! grep -q '^EXIT_RESULT=OK' <<<"$out"; then
-		CHAIN_ERR=$(grep -m1 '^EXIT_RESULT=FAIL' <<<"$out" | sed 's/^EXIT_RESULT=FAIL //'); CHAIN_ERR=${CHAIN_ERR:-"настройка старого сервера не прошла"}
+		# Текст ошибки пришёл со старого сервера — без управляющих символов и не длиннее строки.
+		CHAIN_ERR=$(grep -m1 '^EXIT_RESULT=FAIL' <<<"$out" | sed 's/^EXIT_RESULT=FAIL //' | tr -d '\000-\037\177' | cut -c1-300)
+		CHAIN_ERR=${CHAIN_ERR:-"настройка старого сервера не прошла"}
 		return 1
 	fi
+	# Имя сайта ляжет в $STATE, а он читается через «.»: принять только имя хоста.
 	CHAIN_SNI=$(sed -n 's/^EXIT_SNI=//p' <<<"$out" | tail -1)
-	[ -n "$CHAIN_SNI" ] || { CHAIN_ERR="старый сервер не выбрал сайт для маскировки"; return 1; }
+	is_host "$CHAIN_SNI" || { CHAIN_ERR="старый сервер не выбрал сайт для маскировки"; return 1; }
 	case $(sed -n 's/^EXIT_UFW=//p' <<<"$out" | tail -1) in
 		open) warn "на старом сервере ufw выключен — порт $CHAIN_PORT открыт всем; включи там ufw и оставь доступ только новому серверу" ;;
 		iptables) ok "на старом сервере фаервол iptables (как у Oracle): порт $CHAIN_PORT открыт новому серверу, правило сохранено" ;;
+		iptables-unsaved) warn "на старом сервере фаервол iptables: порт $CHAIN_PORT открыт новому серверу, но правило не переживёт перезагрузку — поставь там iptables-persistent" ;;
 	esac
 	case $(sed -n 's/^EXIT_XUI=//p' <<<"$out" | tail -1) in
 		running) ok "на старом сервере 3x-ui продолжает работать — цепочке не мешает (выключить: переустанови с --exit-stop-xui)" ;;
@@ -1468,6 +1712,7 @@ setup_chain_exit() {  # настроить старый сервер по SSH и
 	esac
 	CHAIN_SSH_USER=$EXIT_SSH_USER
 	CHAIN_SSH_PORT=$EXIT_SSH_PORT
+	{ install -d -m 700 /etc/x-ui/chain && install -m 600 "$WORK/exit_known_hosts" "$kh"; } 2>/dev/null || true
 	ok "старый сервер $CHAIN_IP настроен: вход цепочки на :$CHAIN_PORT (маскировка под $CHAIN_SNI)"
 	build_chain_outbound "$WORK/chain.json"; save_chain "$WORK/chain.json"
 	return 0
@@ -1480,7 +1725,7 @@ api_open() {  # одноразовый API-токен панели (x-ui дол�
 	[ -n "$API_TOKEN" ] || die "x-ui не выдал API-токен: $out"
 	TOKEN_ID=$(sqlite3 "$DB" 'select max(id) from api_tokens;')
 }
-api_close() { sqlite3 "$DB" "delete from api_tokens where id=${TOKEN_ID:-0};" 2>/dev/null || true; API_TOKEN=; }
+api_close() { sqlite3 "$DB" "delete from api_tokens where id=${TOKEN_ID:-0};" 2>/dev/null || true; API_TOKEN=; TOKEN_ID=; }
 api() {  # api POST|GET ПУТЬ [аргументы curl] → тело ответа
 	local m=$1 p=$2
 	shift 2
@@ -1536,7 +1781,11 @@ XUI_RELOAD_CERT='p=$(systemctl show -p MainPID --value x-ui); [ "${p:-0}" -gt 0 
 
 ensure_acme() {  # acme.sh закреплённой версии (sha256) в /root/.acme.sh
 	ACME=/root/.acme.sh/acme.sh
-	[ -x "$ACME" ] && return 0
+	if [ -x "$ACME" ]; then
+		# Автообновление (его включала прежняя версия скрипта) тянуло бы незакреплённый код с GitHub мимо sha256.
+		sed -i '/^AUTO_UPGRADE=/d' /root/.acme.sh/account.conf 2>/dev/null || true
+		return 0
+	fi
 	local tmp
 	tmp=$(mktemp -d)
 	if curl -fsSL --retry 3 -o "$tmp/acme.sh" "https://raw.githubusercontent.com/acmesh-official/acme.sh/$ACME_TAG/acme.sh" &&
@@ -1618,6 +1867,12 @@ drop_ip_cert() {  # --no-ip-cert после сертификата на IP: сн
 	ok "сертификат на IP снят (--no-ip-cert): подписка только внутри сервера, панель — с самоподписанным"
 }
 
+ip_cert_valid() {  # прежний сертификат на IP ещё годен (больше суток) и выписан на нынешний IP
+	[ -s "$IPCERT_DIR/fullchain.pem" ] && [ -s "$IPCERT_DIR/privkey.pem" ] &&
+		openssl x509 -checkend 86400 -noout -in "$IPCERT_DIR/fullchain.pem" >/dev/null 2>&1 &&
+		openssl x509 -noout -ext subjectAltName -in "$IPCERT_DIR/fullchain.pem" 2>/dev/null | grep -qE "IP Address:${PUBLIC_IP//./\\.}(,|\$)"
+}
+
 PANEL_CERT_DIR=/etc/x-ui/panel-cert   # без домена: самоподписанный сертификат панели на IP сервера
 
 xui_get() { sqlite3 -readonly "$DB" "select value from settings where key='$1';" 2>/dev/null || true; }
@@ -1665,7 +1920,28 @@ verdict() {
 
 CHK_OUT=$(mktemp)
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK" "$CHK_OUT"' EXIT
+# Остановка посреди установки (die, ошибка, Ctrl-C) не оставляет VPN выключенным: что работало до запуска —
+# запускается снова; одноразовый API-токен панели удаляется.
+XUI_WAS_ACTIVE=0; systemctl is-active -q x-ui 2>/dev/null && XUI_WAS_ACTIVE=1
+WD_WAS_ACTIVE=0; systemctl is-active -q vpn-exit-watchdog 2>/dev/null && WD_WAS_ACTIVE=1
+XUI_TOUCHED=0
+on_exit() {
+	local rc=$?
+	[ -z "${TOKEN_ID:-}" ] || sqlite3 "$DB" "delete from api_tokens where id=$TOKEN_ID;" 2>/dev/null || true
+	if [ "$rc" != 0 ] && [ "$XUI_TOUCHED" = 1 ] && [ "${INSTALL_DONE:-0}" != 1 ]; then
+		if [ "$XUI_WAS_ACTIVE" = 1 ]; then
+			systemctl stop x-ui >/dev/null 2>&1 || true
+			if [ -s "$WORK/db.before" ] && cp -f "$WORK/db.before" "$DB"; then
+				rm -f "$DB-wal" "$DB-shm"
+				printf '  база 3x-ui возвращена такой, как была до запуска\n' >&2
+			fi
+			{ systemctl start x-ui >/dev/null 2>&1 && printf '  x-ui запущен снова — VPN работает, как до запуска скрипта\n' >&2; } || true
+		fi
+		if [ "$WD_WAS_ACTIVE" = 1 ]; then systemctl start vpn-exit-watchdog >/dev/null 2>&1 || true; fi
+	fi
+	rm -rf "$WORK" "$CHK_OUT"
+}
+trap on_exit EXIT
 
 # --- Только проверка ---
 if [ "$CHECK_ONLY" = 1 ]; then
@@ -1687,8 +1963,9 @@ if [ -n "$WARP_CMD" ]; then
 	NOW=$(exit_mode_now)
 	if [ "$NOW" = chain ]; then
 		echo "Выход цепочкой через ${CHAIN_IP:-?}, сейчас активно: $(active_label "$(chain_active)"). В запасной режим (российские сайты через WARP, остальное напрямую) и обратно переключает вотчдог (journalctl -t vpn-watchdog)."
-		[ "$TARGET_EXIT" = status ] || echo "Чтобы сменить выход насовсем — переустанови: bash install-vpn.sh --exit direct (или warp)."
-		exit 0
+		[ "$TARGET_EXIT" != status ] || exit 0
+		echo "Чтобы сменить выход насовсем — переустанови: bash install-vpn.sh --exit direct (или warp)."
+		exit 1
 	fi
 	if [ "$TARGET_EXIT" = status ]; then
 		echo "Выход клиентов сейчас: $(exit_label "$NOW")"
@@ -1734,6 +2011,7 @@ if [ -n "$WARP_CMD" ]; then
 	if [ "$code" = 204 ] && [ "$got_warp" = "$want_warp" ]; then
 		EXIT_MODE=$TARGET_EXIT
 		save_state
+		[ ! -f "$INFO" ] || sed -i "s|^Выход клиентов сейчас: .*|Выход клиентов сейчас: $(exit_label "$TARGET_EXIT"). Переключить без переустановки:|" "$INFO"
 		ok "готово: $(exit_label "$TARGET_EXIT") — туннель работает, выход с IP $exit_ip$([ "$got_warp" = on ] && echo " (Cloudflare WARP)")"
 		[ "$TARGET_EXIT" = warp-ru ] && ok "российские сайты пойдут через WARP — это видно только на них, проверочный адрес нероссийский"
 		exit 0
@@ -1820,6 +2098,20 @@ if [ -f "$STATE" ]; then
 	# shellcheck source=/dev/null
 	. "$STATE"
 	ok "найдены настройки прошлой установки ($STATE): ключи, пароли и клиенты остаются прежними"
+elif [ -f "$DB" ] && [ "${OWN_XUI:-0}" != 1 ]; then
+	# 3x-ui здесь ставили без этого скрипта: панель получит новые логин, пароль, порт и путь, шаблон Xray — схему скрипта.
+	n=$(sqlite3 -readonly "$DB" 'select count(*) from inbounds;' 2>/dev/null || echo '?')
+	warn "здесь уже есть 3x-ui, поставленный не этим скриптом (подключений: $n): логин, пароль, порт и путь панели и шаблон Xray будут заменены, подключения и клиенты останутся"
+	if { : > /dev/tty; } 2>/dev/null; then
+		tty_flush
+		printf 'Продолжить? [y/N]: ' > /dev/tty
+		read -r ans < /dev/tty || ans=
+		case $ans in y | Y | yes | да | Да) ;; *) die "ничего не менял. Для нового VPN лучше чистый сервер" ;; esac
+	else
+		die "здесь уже есть 3x-ui, поставленный не этим скриптом: запустите скрипт в терминале (он спросит) или поставьте VPN на чистый сервер"
+	fi
+	cp -a "$DB" "$DB.before-install-$(date +%Y%m%d-%H%M%S)"
+	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
 fi
 : "${PANEL_USER:=$(rnd "$LOWER$DIGITS" 10)}"
 : "${PANEL_PASS:=$(rnd "$LOWER${LOWER^^}$DIGITS" 22)}"
@@ -1835,7 +2127,10 @@ if [ "$MODE" = domain ]; then
 elif [ -n "$PANEL_LOCAL_ARG" ]; then
 	PANEL_PUBLIC=$((1 - PANEL_LOCAL_ARG))
 else
-	PANEL_PUBLIC=${S_PANEL_PUBLIC:-1}
+	PANEL_PUBLIC=${S_PANEL_PUBLIC:-}
+	if [ -z "$PANEL_PUBLIC" ]; then   # прежняя версия скрипта выбор не записывала — как сейчас в базе; чистый сервер — открыта
+		if [ -f "$STATE" ] && [ -f "$DB" ] && [ "$(xui_get webListen)" = 127.0.0.1 ]; then PANEL_PUBLIC=0; else PANEL_PUBLIC=1; fi
+	fi
 fi
 # Без домена: сертификат Let's Encrypt на IP (короткий, ~6 дней, продлевается сам) — подписка по https://IP:2096/…
 # и панель без предупреждения браузера. --no-ip-cert — как раньше: подписка только внутри, панель с самоподписанным.
@@ -1863,7 +2158,7 @@ else
 		curl -fL --retry 3 --connect-timeout 20 -s -o "$TMP/x-ui.tgz" "$URL" || die "не скачался $URL"
 	fi
 	echo "$XUI_SHA256  $TMP/x-ui.tgz" | sha256sum -c --quiet - >/dev/null 2>&1 || die "архив 3x-ui не совпал по sha256 — скачан не тот файл"
-	systemctl stop x-ui 2>/dev/null || true
+	xui_stop
 	rm -rf /usr/local/x-ui
 	tar -C /usr/local -xzf "$TMP/x-ui.tgz"
 	rm -rf "$TMP"
@@ -1874,10 +2169,11 @@ fi
 install -m 755 /usr/local/x-ui/x-ui.sh /usr/bin/x-ui
 install -m 644 /usr/local/x-ui/x-ui.service.debian /etc/systemd/system/x-ui.service
 systemctl daemon-reload
-"$XRAY" version 2>/dev/null | head -1 | grep -q "Xray $XRAY_VERSION" || warn "Xray не $XRAY_VERSION: $("$XRAY" version 2>/dev/null | head -1)"
+XV=$("$XRAY" version 2>/dev/null || true)
+case $XV in "Xray $XRAY_VERSION "*) ;; *) warn "Xray не $XRAY_VERSION: ${XV%%$'\n'*}" ;; esac
 
 # Пароль, порт и секретный путь панели — до первого запуска x-ui, чтобы она ни минуты не жила с admin/admin.
-systemctl stop x-ui 2>/dev/null || true
+xui_stop
 mkdir -p /etc/x-ui
 "$XUI" setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$WEB_PORT" -webBasePath "$WEB_PATH" -listenIP 127.0.0.1 >/dev/null ||
 	die "x-ui setting не прошёл"
@@ -2129,7 +2425,6 @@ PY
 		rm -f /root/.acme-issue.log
 		"$ACME" --install-cert -d "$DOMAIN" --ecc --key-file "$CERT_DIR/privkey.pem" --fullchain-file "$CERT_DIR/fullchain.pem" \
 			--reloadcmd "systemctl reload nginx ; $XUI_RELOAD_CERT" >/dev/null 2>&1 || die "acme.sh --install-cert не прошёл"
-		"$ACME" --upgrade --auto-upgrade >/dev/null 2>&1 || true
 		acme_cron 1
 		ok "автопродление: acme.sh по cron, проверка через nginx :80"
 	fi
@@ -2191,6 +2486,13 @@ if [ "$MODE" = nodomain ]; then
 		if issue_ip_cert; then
 			IP_CERT_OK=1
 			ok "сертификат на IP действует до $(openssl x509 -enddate -noout -in "$IPCERT_DIR/fullchain.pem" | cut -d= -f2), продлевается сам (проверка дважды в сутки)"
+		elif ip_cert_valid; then
+			# Let's Encrypt сейчас не выдал (лимит, :80 закрыт на время), а прежний ещё годен — оставить его, а не
+			# отключать подписку у всех клиентов; продлить cron попробует сам.
+			IP_CERT_OK=1
+			IP_CERT_IP=$PUBLIC_IP
+			if openssl x509 -noout -issuer -in "$IPCERT_DIR/fullchain.pem" 2>/dev/null | grep -qi staging; then IPK=-k; fi
+			warn "Let's Encrypt сейчас не выдал сертификат на IP (${IPCERT_ERR:-?}), но прежний действует до $(openssl x509 -enddate -noout -in "$IPCERT_DIR/fullchain.pem" | cut -d= -f2) — оставляю его, продлить cron попробует сам"
 		else
 			warn "сертификат на IP не получен — подписка останется внутри сервера, в QR будут прямые ссылки. Ответ: ${IPCERT_ERR:-?}"
 			warn "чаще всего порт 80 закрыт фаерволом хостера: откройте TCP 80 в панели хостера и запустите скрипт ещё раз"
@@ -2201,7 +2503,7 @@ if [ "$MODE" = nodomain ]; then
 fi
 
 say "3x-ui: подписка, шаблон Xray, подключение VLESS + XHTTP + Reality"
-systemctl stop x-ui 2>/dev/null || true
+xui_stop
 # Повторный запуск с другим --port: перенести уже созданное подключение (ключи и клиенты те же).
 MOVED_FROM=
 if [ -n "$OLD_REALITY_PORT" ] && [ "$OLD_REALITY_PORT" != "$REALITY_PORT" ]; then
@@ -2270,7 +2572,10 @@ fi
 # Выход клиентов. Копия outbound warp сохраняется всегда — чтобы vpn-warp on не регистрировал WARP заново.
 HAVE_WARP=0
 if current_warp "$WORK/warp.json"; then save_warp "$WORK/warp.json"; [ "$EXIT_MODE" = direct ] || HAVE_WARP=1; fi
-if [ "$HAVE_WARP" = 1 ]; then
+EXIT_WAS=$(exit_mode_now 2>/dev/null || echo direct)   # выход до этого запуска (свежая база — direct)
+if [ "$EXIT_MODE" = chain ] && [ "$EXIT_WAS" = chain ]; then
+	:   # цепочка уже работает: шаблон перепишет блок цепочки ниже, а до того клиенты ходят как ходили
+elif [ "$HAVE_WARP" = 1 ] && [ "$EXIT_MODE" != chain ]; then
 	xui_set "xrayTemplateConfig=$(template_json "$EXIT_MODE" "$WORK/warp.json")"
 else
 	xui_set "xrayTemplateConfig=$(template_json direct -)"
@@ -2327,36 +2632,41 @@ if [ "$EXIT_MODE" != direct ] && [ "$HAVE_WARP" = 0 ]; then
 		HAVE_WARP=1
 		ok "Cloudflare WARP зарегистрирован (бесплатный аккаунт)"
 		if [ "$EXIT_MODE" != chain ]; then   # цепочку применим ниже, когда соберём outbound
-			systemctl stop x-ui
+			xui_stop
 			xui_set "xrayTemplateConfig=$(template_json "$EXIT_MODE" "$WORK/warp.json")"
 		fi
 	else
 		bad "WARP не зарегистрировался — выход остаётся напрямую с IP сервера. Ответ: $WARP_ERR"
 		EXIT_MODE=direct
+		xui_stop
+		xui_set "xrayTemplateConfig=$(template_json direct -)"
 	fi
 fi
 api_close
 if [ "$EXIT_MODE" = chain ]; then
 	say "Выход цепочкой через другой сервер"
-	if [ "$HAVE_WARP" != 1 ]; then bad "без WARP у цепочки нет запасного режима — оставляю прямой выход"; EXIT_MODE=direct
-	elif setup_chain_exit; then
-		install_watchdog
-		systemctl stop x-ui
-		xui_set "xrayTemplateConfig=$(template_json chain "$WORK/warp.json" "$CHAIN_SAVED")"
-		if timeout 6 bash -c "cat </dev/null >/dev/tcp/$CHAIN_IP/$CHAIN_PORT" 2>/dev/null; then
-			ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — вотчдог включит запасной режим (российские сайты через WARP, остальное напрямую) и вернёт назад"
-		else
-			# Вход на старом настроен, но порт с нового закрыт — почти всегда облачный фаервол хостера.
-			CHAIN_BLOCKED=1
-			chain_activate fallback
-			warn "порт $CHAIN_PORT старого сервера $CHAIN_IP с нового не открывается — его закрывает фаервол хостера. Откройте входящий TCP $CHAIN_PORT для $PUBLIC_IP в панели хостера (AWS — Security Group, Oracle — Security List или NSG). Пока — запасной режим (российские сайты через WARP, остальное напрямую); как порт откроется, вотчдог сам переключит на старый сервер"
-		fi
-	else
-		bad "цепочку настроить не удалось — оставляю выход напрямую. Причина: ${CHAIN_ERR:-?}"
-		warn "проверь адрес, порт, пользователя и пароль/ключ старого сервера и повтори: bash install-vpn.sh --exit chain --exit-host $EXIT_HOST$([ "$EXIT_SSH_USER" = root ] || echo " --exit-ssh-user $EXIT_SSH_USER")"
+	if [ "$HAVE_WARP" != 1 ]; then
+		bad "без WARP у цепочки нет запасного режима — оставляю прямой выход"
 		EXIT_MODE=direct
-		systemctl stop x-ui
+		xui_stop
 		xui_set "xrayTemplateConfig=$(template_json direct -)"
+	elif setup_chain_exit; then
+		chain_apply
+	elif [ "$EXIT_WAS" = chain ] && [ -n "$CHAIN_IP" ] && [ -s "$CHAIN_SAVED" ]; then
+		# Не вышло перенастроить или сменить сервер-выход, а прежняя цепочка работала — её и оставляем.
+		bad "старый сервер настроить не удалось: ${CHAIN_ERR:-?}"
+		warn "оставляю прежнюю цепочку через $CHAIN_IP:$CHAIN_PORT — она работала до запуска"
+		chain_apply
+	else
+		case $EXIT_WAS in warp | warp-ru) EXIT_MODE=$EXIT_WAS ;; *) EXIT_MODE=direct ;; esac
+		bad "цепочку настроить не удалось — выход клиентов: $(exit_label "$EXIT_MODE"). Причина: ${CHAIN_ERR:-?}"
+		warn "проверь адрес, порт, пользователя и пароль/ключ старого сервера и повтори: bash install-vpn.sh --exit chain --exit-host ${EXIT_HOST:-IP}$([ "$EXIT_SSH_USER" = root ] || echo " --exit-ssh-user $EXIT_SSH_USER")"
+		xui_stop
+		if [ "$EXIT_MODE" = direct ]; then
+			xui_set "xrayTemplateConfig=$(template_json direct -)"
+		else
+			xui_set "xrayTemplateConfig=$(template_json "$EXIT_MODE" "$WORK/warp.json")"
+		fi
 	fi
 fi
 if [ "$EXIT_MODE" != chain ] && grep -qs 'EXIT_IP=' /etc/systemd/system/vpn-exit-watchdog.service; then
@@ -2367,6 +2677,8 @@ if [ "$EXIT_MODE" != chain ] && grep -qs 'EXIT_IP=' /etc/systemd/system/vpn-exit
 fi
 save_state
 systemctl restart x-ui || bad "x-ui не перезапустился (journalctl -u x-ui)"
+# Вотчдог — только на окончательном шаблоне: раньше он мог переключить выход и перезапустить x-ui посреди установки.
+[ "$EXIT_MODE" != chain ] || install_watchdog
 case $EXIT_MODE in
 	direct) ok "выход клиентов в интернет — напрямую с IP сервера $PUBLIC_IP (включить WARP потом: vpn-warp on или vpn-warp ru)" ;;
 	warp) ok "выход клиентов — через Cloudflare WARP (IP сервера сайтам не виден; выключить: vpn-warp off)" ;;
@@ -2407,19 +2719,26 @@ detect_other_vpn() {  # уже работающий на этом сервере
 detect_other_vpn
 
 say "Ядро, swap, часовой пояс"
-cat > /etc/sysctl.d/99-vpn.conf <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-net.ipv4.ip_nonlocal_bind=1
-EOF
+# IPv6 выключается (клиенты и Let's Encrypt — по IPv4). Зашли на сервер по IPv6 — не трогать: вход оборвался бы.
+SSH_FROM=${SSH_CONNECTION:-}; SSH_FROM=${SSH_FROM%% *}
+V6_OFF=1
+case $SSH_FROM in ::ffff:*) ;; *:*) V6_OFF=0 ;; esac
+{
+	echo "net.core.default_qdisc=fq"
+	echo "net.ipv4.tcp_congestion_control=bbr"
+	if [ "$V6_OFF" = 1 ]; then
+		echo "net.ipv6.conf.all.disable_ipv6=1"
+		echo "net.ipv6.conf.default.disable_ipv6=1"
+	fi
+	echo "net.ipv4.ip_nonlocal_bind=1"
+} > /etc/sysctl.d/99-vpn.conf
+[ "$V6_OFF" = 1 ] || warn "вы зашли на сервер по IPv6 — IPv6 оставляю включённым (выключение оборвало бы вход)"
 if [ "$CONTAINER" = 1 ]; then
 	warn "контейнер: /etc/sysctl.d/99-vpn.conf записан, но не применён"
 else
 	modprobe tcp_bbr 2>/dev/null || true
 	if sysctl -p /etc/sysctl.d/99-vpn.conf >/dev/null 2>&1; then
-		ok "BBR ($(sysctl -n net.ipv4.tcp_congestion_control)), IPv6 выключен"
+		ok "BBR ($(sysctl -n net.ipv4.tcp_congestion_control))$([ "$V6_OFF" = 1 ] && echo ", IPv6 выключен")"
 	else
 		warn "часть настроек ядра не применилась (бывает на OpenVZ/LXC-серверах) — VPN это не мешает"
 	fi
@@ -2445,7 +2764,10 @@ say "SSH"
 if ! command -v sshd >/dev/null; then
 	warn "sshd не установлен — пропущено"
 elif [ "$SSH_KEY_ONLY" = 1 ]; then
-	if [ -s /root/.ssh/authorized_keys ]; then
+	SSH_HOW=$(ssh_login_method)
+	if [ "$SSH_HOW" = password ] || [ "$SSH_HOW" = keyboard-interactive ]; then
+		bad "вы сами вошли сейчас по паролю — выключать его нельзя, иначе после выхода не войдёте. Войдите по ключу и запустите скрипт ещё раз с --ssh-key-only"
+	elif [ -s /root/.ssh/authorized_keys ]; then
 		mkdir -p /etc/ssh/sshd_config.d
 		cat > /etc/ssh/sshd_config.d/00-disable-password.conf <<'EOF'
 PasswordAuthentication no
@@ -2467,6 +2789,8 @@ else
 fi
 SSH_PORTS=$(ssh_ports)
 SSH_PORT=${SSH_PORTS%% *}
+SSH_LOGIN=root   # под кем входить в инструкциях: зашли через sudo (AWS, Oracle — ubuntu) — под тем же пользователем
+if [[ ${SUDO_USER:-} =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] && [ "$SUDO_USER" != root ]; then SSH_LOGIN=$SUDO_USER; fi
 
 say "fail2ban: бан за подбор пароля SSH"
 if [ "$DO_F2B" = 0 ]; then
@@ -2520,7 +2844,7 @@ if [ "$DO_UFW" = 1 ]; then
 		if [ "${SUB_TLS:-0}" = 1 ]; then echo 80/tcp; echo "$SUB_PORT/tcp"; fi   # :80 — продление сертификата на IP
 		echo "$REALITY_PORT/tcp"
 		for pp in $OTHER_VPN_PORTS; do echo "$pp"; done
-	} | sort -u -t/ -k1,1n)
+	} | sort -u | sort -t/ -k1,1n -k2,2)
 	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
 	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ]; then
 		ufw delete allow "$MOVED_FROM/tcp" >/dev/null 2>&1 || true
@@ -2533,6 +2857,16 @@ if [ "$DO_UFW" = 1 ]; then
 	fi
 	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
 	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
+	if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+		# Что ещё слушает снаружи, фаервол закроет — назвать, чтобы чужая служба не пропала молча.
+		CLOSING=$(ss -Htuln 2>/dev/null | awk '{print $1, $5}' | while read -r proto addr; do
+			case $addr in 127.* | "[::1]"* | *%lo:*) continue ;; esac
+			p=${addr##*:}
+			case $p in '' | *[!0-9]*) continue ;; esac
+			echo "$p/$proto"
+		done | sort -u | { grep -vxF -f <(printf '%s\n' 68/udp 546/udp $OPEN) || true; } | sort -t/ -k1,1n | tr '\n' ' ')
+		[ -z "$CLOSING" ] || warn "фаервол закроет и порты, которые сейчас слушает этот сервер: ${CLOSING}— если там нужная служба, откройте: ufw allow ПОРТ/tcp (или /udp)"
+	fi
 	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился (ufw status)"; fi
 else
 	warn "фаервол не трогали (--no-ufw)"
@@ -2585,7 +2919,7 @@ NAME=vpn-backup-${DOMAIN:-ip-$PUBLIC_IP}-$TS
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 WORK=$(mktemp -d "$BACKUP_DIR/.work.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; [ -z "${OUT:-}" ] || rm -f "$OUT.part"' EXIT   # и недописанный архив — при ошибке
 B=$WORK/$NAME
 F=$B/files          # копия файлов с полными путями: files/etc/x-ui/x-ui.db и т. д.
 mkdir -p "$F/etc/x-ui" "$B/info"
@@ -2790,13 +3124,30 @@ case $(uname -m) in
 	*) die "архитектура $(uname -m) скриптом не поддержана" ;;
 esac
 DB=/etc/x-ui/x-ui.db
+touch /root/vpn-restore.log && chmod 600 /root/vpn-restore.log   # в журнале ссылки клиентов и пароль панели
 exec > >(tee -a /root/vpn-restore.log) 2>&1
 
 detect_ips() {
+	local u
 	[ -n "$LISTEN_IP" ] || LISTEN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
 	[ -n "$LISTEN_IP" ] || die "не удалось определить IP сервера — укажите --listen-ip"
-	PUBLIC_IP=$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)
-	[ -n "$PUBLIC_IP" ] || PUBLIC_IP=$LISTEN_IP
+	PUBLIC_IP=
+	for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+		PUBLIC_IP=$(curl -4 -fsS --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]') || true
+		[[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+		PUBLIC_IP=
+	done
+	if [ -z "$PUBLIC_IP" ]; then
+		PUBLIC_IP=$LISTEN_IP
+		warn "внешний IP не узнать (api.ipify.org, ifconfig.me, icanhazip.com недоступны) — считаю, что это $PUBLIC_IP"
+	fi
+}
+
+release_sha() {  # release_sha ВЕРСИЯ АРХИТЕКТУРА → sha256 архива релиза 3x-ui, если он известен (как в install-vpn.sh)
+	case $1/$2 in
+		3.3.1/amd64) echo 06adfff2b27af6d59225338a8112caca882d32d11136d962649826d42c24d12e ;;
+		3.3.1/arm64) echo 0f7907b56554eba624c51c6aed2a9ba4af1378c8134b30afa5cee622e3100209 ;;
+	esac
 }
 
 setting() { sqlite3 -readonly "$DB" "select value from settings where key='$1';"; }
@@ -2961,7 +3312,7 @@ tunnel_check() {  # tunnel_check LINK XRAY → «код_ответа ip_выхо
 
 verify() {
 	say "Проверка"
-	local T s p code code2 n link xray_bin exit_ip exit_warp chain log web_port web_path sub_port subid
+	local T s p code code2 n link xray_bin exit_ip exit_warp chain log web_port web_path sub_port subid want sub_listen
 	T=$(mktemp -d)
 	web_port=$(setting webPort); web_path=$(setting webBasePath)
 	sub_port=$(setting subPort)
@@ -2972,7 +3323,9 @@ verify() {
 	if [ -f /etc/systemd/system/vpn-exit-watchdog.service ]; then
 		if systemctl is-active -q vpn-exit-watchdog; then ok "вотчдог выхода работает"; else bad "вотчдог выхода не работает (journalctl -u vpn-exit-watchdog)"; fi
 	fi
-	for p in $([ "$HAS_NGINX" = 1 ] && echo "$LISTEN_IP:443 127.0.0.1:8443") ":$web_port" "127.0.0.1:$sub_port"; do
+	# Подписка слушает 127.0.0.1 или (сертификат на IP) все адреса — проверять там, где она должна быть.
+	sub_listen=$(setting subListen)
+	for p in $([ "$HAS_NGINX" = 1 ] && echo "$LISTEN_IP:443 127.0.0.1:8443") ":$web_port" "$sub_listen:$sub_port"; do
 		if wait_port "$p" 10; then ok "слушает $p"; else bad "никто не слушает $p"; fi
 	done
 	for p in $(inbound_ports "$DB" | grep /tcp | cut -d/ -f1); do
@@ -3009,7 +3362,7 @@ verify() {
 	if [ -n "${s:-}" ]; then
 		# Reality под чужой сайт: кто прощупывает без ключа, должен получить настоящий сайт с верным сертификатом.
 		if timeout 10 openssl s_client -connect "$LISTEN_IP:$p" -servername "$s" -verify_hostname "$s" -verify_return_error \
-			< /dev/null 2>&1 | grep -q 'Verify return code: 0 (ok)'; then
+			< /dev/null 2>&1 | grep 'Verify return code: 0 (ok)' >/dev/null; then
 			ok "чужим на :$p отвечает настоящий $s (сертификат верный)"
 		else
 			bad "проба :$p с SNI $s не получила настоящий сертификат сайта — target недоступен с этого сервера?"
@@ -3027,6 +3380,14 @@ verify() {
 			n=$(grep -cE '^(vless|vmess|trojan|ss)://' "$T/links" || true)
 			if [ "${n:-0}" -gt 0 ]; then ok "подписка отдаёт ссылки ($n шт.)"; else bad "подписка пустая"; fi
 			link=$(grep -m1 '^vless://' "$T/links" || true)
+			# Адрес в ссылке — этого сервера (домен или нынешний IP), а не старого: иначе клиенты уйдут туда.
+			want=${DOMAIN:-$PUBLIC_IP}
+			if [ -n "$link" ]; then
+				case $link in
+					*"@$want:"*) ok "в ссылках адрес этого сервера: $want" ;;
+					*) bad "в ссылках не адрес этого сервера ($want) — клиенты пойдут на прежний (адрес подключения в панели: share_addr)" ;;
+				esac
+			fi
 		else
 			bad "подписка отвечает $code"
 		fi
@@ -3077,10 +3438,20 @@ final_note() {
 	if [ -n "$chain" ]; then
 		cat <<EOF
 
-Выход клиентов идёт цепочкой через сервер ${chain%:*}. До переключения DNS на нём должен быть открыт порт для нового IP:
+Выход клиентов идёт цепочкой через сервер ${chain%:*}. На нём должен быть открыт порт для нового IP:
   ufw allow from $PUBLIC_IP to any port ${chain##*:} proto tcp comment 'vpn entry'
-(старое правило для прежнего IP входа потом удалить: ufw status numbered → ufw delete N)
+(у AWS и Oracle — ещё и в панели хостера: Security Group / Security List; старое правило для прежнего IP
+входа потом удалить: ufw status numbered → ufw delete N). Как порт откроется, вотчдог сам вернёт цепочку.
 EOF
+	fi
+	if [ "$FAILS" != 0 ]; then
+		cat <<EOF
+
+Сначала разберитесь с ошибками выше$([ -n "$chain" ] && echo " (не работает туннель — скорее всего, ещё не открыт порт на сервере-выходе)"),
+потом проверьте ещё раз: bash $HERE/restore.sh --verify
+$([ -n "$DOMAIN" ] && echo "DNS переключать — только после «Проверка: всё OK»." || echo "Новые ссылки раздавать клиентам — только после «Проверка: всё OK».")
+EOF
+		return 0
 	fi
 	if [ -z "$DOMAIN" ]; then
 		cat <<EOF
@@ -3090,7 +3461,11 @@ EOF
 EOF
 		client_links
 		if [ "$(setting webListen)" != 127.0.0.1 ]; then
-			echo "Панель: https://$PUBLIC_IP:$(setting webPort)$(setting webBasePath) (сертификат самоподписанный, логин и пароль — прежние)"
+			if [ "$(setting webCertFile)" = /etc/x-ui/ip-cert/fullchain.pem ]; then
+				echo "Панель: https://$PUBLIC_IP:$(setting webPort)$(setting webBasePath) (сертификат Let's Encrypt на IP, логин и пароль — прежние)"
+			else
+				echo "Панель: https://$PUBLIC_IP:$(setting webPort)$(setting webBasePath) (сертификат самоподписанный, логин и пароль — прежние)"
+			fi
 		fi
 		if [ "${IPCERT_FALLBACK:-0}" = 1 ]; then
 			echo "Подписку по IP (https://$PUBLIC_IP:$(setting subPort)/…) вернёт повторный запуск: bash /usr/local/lib/vpn-backup/install-vpn.sh"
@@ -3115,7 +3490,7 @@ EOF
 if [ "$VERIFY_ONLY" = 1 ]; then
 	detect_ips
 	verify
-	[ "$FAILS" = 0 ] && final_note
+	final_note   # что делать дальше — и при ошибках проверки: в цепочке их часто даёт ещё не открытый порт выхода
 	exit $((FAILS > 0))
 fi
 
@@ -3148,6 +3523,19 @@ if command -v python3 >/dev/null; then
 		u=$(port_users "$p")
 		case $u in "" | xray* | x-ui*) ;; *) die "порт $p (inbound) занят: $u" ;; esac
 	done
+	# Порты панели и подписки из бэкапа — тоже свободны (иначе x-ui поднимется без них).
+	for p in $(python3 - "$F$DB" 2>/dev/null <<'PY' || true
+import sqlite3, sys
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+for k in ("webPort", "subPort"):
+    r = db.execute("select value from settings where key=?", (k,)).fetchone()
+    if r and str(r[0]).isdigit():
+        print(r[0])
+PY
+	); do
+		u=$(port_users "$p")
+		case $u in "" | xray* | x-ui*) ;; *) die "порт $p (панель или подписка 3x-ui) занят: $u" ;; esac
+	done
 fi
 if [ "$HAS_NGINX" = 1 ]; then ok "порты 80, 443 и порты inbound'ов свободны"; else ok "порты inbound'ов свободны"; fi
 
@@ -3178,6 +3566,12 @@ else
 		cp "$XUI_TARBALL" "$TMP/x-ui.tgz"
 	else
 		curl -fL --retry 3 --connect-timeout 20 -s -o "$TMP/x-ui.tgz" "$URL" || die "не скачался $URL"
+	fi
+	# Известный релиз сверяется по sha256 до распаковки: подменённый или битый архив не ставится.
+	want_sha=$(release_sha "$XUI_WANT" "$ARCH_NEW")
+	if [ -n "$want_sha" ]; then
+		echo "$want_sha  $TMP/x-ui.tgz" | sha256sum -c --quiet - >/dev/null 2>&1 || die "архив 3x-ui $XUI_WANT не совпал по sha256 — скачан не тот файл"
+		ok "архив 3x-ui $XUI_WANT сверен по sha256"
 	fi
 	systemctl stop x-ui 2>/dev/null || true
 	rm -rf /usr/local/x-ui
@@ -3222,10 +3616,11 @@ if [ -d "$F/etc/x-ui/warp" ]; then cp -a "$F/etc/x-ui/warp" /etc/x-ui/; fi
 # Как официальный install.sh после установки: приводит базу к схеме установленной версии.
 if out=$(/usr/local/x-ui/x-ui migrate 2>&1); then ok "x-ui migrate: база приведена к версии $XUI_WANT"; else bad "x-ui migrate: $out"; fi
 ok "база восстановлена: inbound'ов $(sqlite3 -readonly "$DB" 'select count(*) from inbounds;'), клиентов $(sqlite3 -readonly "$DB" 'select count(*) from clients;' 2>/dev/null || echo '?')"
-# Без домена адрес в ссылках клиентов — IP сервера (share_addr подключения): переносим на новый.
-if [ -z "$DOMAIN" ] && [[ $SRC_PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$SRC_PUBLIC_IP" != "$PUBLIC_IP" ]; then
-	n=$(sqlite3 "$DB" "update inbounds set share_addr='$PUBLIC_IP' where share_addr_strategy='custom' and share_addr='$SRC_PUBLIC_IP'; select changes();")
-	ok "адрес в ссылках клиентов: $SRC_PUBLIC_IP → $PUBLIC_IP (подключений: $n)"
+# Без домена адрес в ссылках клиентов — IP сервера (share_addr подключения): переносим на новый. Не только прежний
+# IP из бэкапа: если старый сервер менял адрес, в ссылках мог остаться и более ранний.
+if [ -z "$DOMAIN" ]; then
+	n=$(sqlite3 "$DB" "update inbounds set share_addr='$PUBLIC_IP' where share_addr_strategy='custom' and share_addr<>'$PUBLIC_IP' and (share_addr='$SRC_PUBLIC_IP' or share_addr glob '[0-9]*.[0-9]*.[0-9]*.[0-9]*'); select changes();")
+	[ "${n:-0}" = 0 ] || ok "адрес в ссылках клиентов теперь $PUBLIC_IP (подключений: $n)"
 fi
 # Без домена панель открыта по IP с самоподписанным сертификатом (install-vpn.sh): на новом IP — новый сертификат.
 if [ -z "$DOMAIN" ] && [ -d "$F/etc/x-ui/panel-cert" ]; then
@@ -3282,7 +3677,7 @@ if [ -n "$DOMAIN" ] && [ -d "$F/root/.acme.sh" ]; then
 	crontab /root/.crontab.new
 	rm -f /root/.crontab.new
 	crontab -l | grep -qF 'acme.sh --cron' || die "не записалась строка cron для acme.sh"
-	grep -qF 'acme.sh.env' /root/.bashrc 2>/dev/null || echo '. "/root/.acme.sh/acme.sh.env"' >> /root/.bashrc
+	[ ! -f /root/.acme.sh/acme.sh.env ] || grep -qF 'acme.sh.env' /root/.bashrc 2>/dev/null || echo '. "/root/.acme.sh/acme.sh.env"' >> /root/.bashrc
 	ok "acme.sh: аккаунт Let's Encrypt и автопродление (webroot /var/www/acme через nginx :80)"
 fi
 
@@ -3330,6 +3725,8 @@ if [ -n "$(swapon --show --noheadings 2>/dev/null)" ]; then
 	ok "swap уже есть"
 elif systemd-detect-virt -cq 2>/dev/null || [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
 	warn "это контейнер — swap пропущен"
+elif [ "$(df -Pm / | awk 'NR==2 {print $4}')" -lt 4096 ]; then
+	warn "на диске меньше 4 ГБ свободно — swap не создаю"
 elif { fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none; } &&
 	chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile; then
 	grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
@@ -3351,7 +3748,10 @@ if [ -f "$F/root/.ssh/authorized_keys" ]; then
 	install -d -m 700 /root/.ssh
 	touch /root/.ssh/authorized_keys
 	chmod 600 /root/.ssh/authorized_keys
-	while IFS= read -r k; do
+	# Последняя строка без перевода строки — новый ключ приклеился бы к ней и испортил оба.
+	if [ -s /root/.ssh/authorized_keys ] && [ -n "$(tail -c1 /root/.ssh/authorized_keys)" ]; then echo >> /root/.ssh/authorized_keys; fi
+	while IFS= read -r k || [ -n "$k" ]; do   # и последний ключ бэкапа без перевода строки — тоже
+		k=${k%$'\r'}
 		[ -n "$k" ] || continue
 		grep -qxF -- "$k" /root/.ssh/authorized_keys || printf '%s\n' "$k" >> /root/.ssh/authorized_keys
 	done < "$F/root/.ssh/authorized_keys"
@@ -3403,7 +3803,7 @@ else
 	warn "фаервол не трогали (--no-ufw)"
 fi
 
-say "Ежедневный бэкап на этом сервере"
+say "Бэкап на этом сервере"
 install -m 755 "$F/usr/local/bin/vpn-backup.sh" /usr/local/bin/vpn-backup.sh
 install -d -m 755 /usr/local/lib/vpn-backup
 install -m 755 "$HERE/restore.sh" /usr/local/lib/vpn-backup/restore.sh
@@ -3419,7 +3819,7 @@ if [ -f "$F/etc/vpn-install.env" ]; then install -m 600 "$F/etc/vpn-install.env"
 for f in vpn-check vpn-warp; do
 	if [ -f "$F/usr/local/bin/$f" ]; then install -m 755 "$F/usr/local/bin/$f" "/usr/local/bin/$f"; fi
 done
-ok "vpn-backup.sh по cron, архивы в /root/backups"
+if [ -f /etc/cron.d/vpn-backup ]; then ok "vpn-backup.sh по cron, архивы в /root/backups"; else ok "vpn-backup.sh — бэкап вручную, архивы в /root/backups"; fi
 
 WATCHDOG=0
 if [ -f "$F/usr/local/bin/vpn-exit-watchdog.sh" ] && [ -f "$F/etc/systemd/system/vpn-exit-watchdog.service" ]; then
@@ -3444,7 +3844,7 @@ fi
 
 verify
 echo "Заняло $(( $(date +%s) - START )) с. Журнал: /root/vpn-restore.log"
-[ "$FAILS" = 0 ] && final_note
+final_note
 exit $((FAILS > 0))
 VPN_KIT_EOF_1
 chmod 755 /usr/local/lib/vpn-backup/restore.sh
@@ -3505,6 +3905,9 @@ vpn-check
 - Если на старом ещё работает 3x-ui — цепочке это не мешает; захочешь, скрипт предложит его выключить
   (или сразу `--exit-stop-xui`). Переехал новый сервер на другой IP — на старом открой ему порт:
   `ufw allow from НОВЫЙ_IP to any port 2087 proto tcp`.
+- Не вышло настроить другой старый сервер (не тот пароль, сервер недоступен) — прежняя цепочка остаётся как
+  была. SSH-ключ старого сервера запоминается (`/etc/x-ui/chain/known_hosts`): переустановили старый сервер —
+  удалите этот файл, иначе скрипт примет новый ключ за подмену.
 
 ## Выход через WARP
 
@@ -3519,6 +3922,8 @@ vpn-check
 
 ```bash
 scp root@IP_СЕРВЕРА:/root/backups/latest.tgz ./vpn-backup.tgz
+# вход не под root (AWS, Oracle):
+ssh ubuntu@IP_СЕРВЕРА 'sudo cat /root/backups/latest.tgz' > vpn-backup.tgz
 ```
 
 ## Переезд на новый сервер
@@ -3532,7 +3937,8 @@ scp root@IP_СЕРВЕРА:/root/backups/latest.tgz ./vpn-backup.tgz
    ssh root@НОВЫЙ_IP
    tar xzf vpn-backup.tgz && bash vpn-backup-*/restore.sh
    ```
-3. В конце должно быть **«Проверка: всё OK»**.
+3. В конце должно быть **«Проверка: всё OK»**. Выход цепочкой: на старом сервере сначала откройте порт новому IP
+   (команду напечатает `restore.sh`), потом `bash vpn-backup-*/restore.sh --verify`.
 4. С доменом: поменять A-запись домена на новый IP (TTL 300, в Cloudflare — Proxy выключен).
    Клиенты переподключатся сами за несколько минут. Старый сервер держать ещё сутки.
    Без домена: раздать клиентам новые ссылки, которые напечатал `restore.sh` (в приложении удалить
@@ -3544,6 +3950,11 @@ scp root@IP_СЕРВЕРА:/root/backups/latest.tgz ./vpn-backup.tgz
 ## Тонкости
 
 - Порт 80 должен оставаться открытым: через него продлевается сертификат.
+- Повторный запуск установщика оборвался (ошибка, Ctrl-C) — база 3x-ui возвращается такой, какой была до
+  запуска, VPN работает как работал. Первая установка не дошла до конца — можно запустить снова с другим
+  вариантом (`--no-domain`) или другим доменом.
+- Клиенты VPN не достают до внутренних адресов серверов (127.0.0.1, 10/8, 192.168/16 и т. п.) ни по IP, ни по
+  имени вроде `localhost`: службы самих серверов (API Xray, панель) через VPN не видны.
 - Клиентов добавлять и удалять в панели (3x-ui хранит их в отдельных таблицах базы).
 - В приложениях нужно ядро Xray (Happ, v2RayTun, v2rayNG, v2rayN, Streisand): транспорт XHTTP
   приложения на sing-box (Hiddify и похожие) не поддерживают.
@@ -3595,6 +4006,9 @@ systemctl restart cron || warn "cron не перезапустился"
 systemctl restart x-ui || bad "x-ui не запустился (journalctl -u x-ui)"
 wait_port ":$WEB_PORT" 40 || true
 if [ "$MODE" = domain ]; then systemctl restart nginx || bad "nginx не запустился (journalctl -u nginx)"; fi
+INSTALL_DONE=1   # дальше — проверки и итог: ловушка на выходе x-ui уже не трогает
+S_DONE=1
+save_state
 
 K=
 [ "$TEST_SELFSIGNED" = 1 ] && K=-k
@@ -3604,6 +4018,7 @@ reach_check
 say "Готово"
 mkdir -p /root/vpn-qr
 chmod 700 /root/vpn-qr
+rm -f /root/vpn-qr/*.png   # прежние QR (удалённых клиентов, старых адресов) не оставлять
 : > "$WORK/qr"
 {
 	if [ "$MODE" = domain ]; then
@@ -3655,7 +4070,7 @@ chmod 700 /root/vpn-qr
 		else
 			echo "Панель управления — только через SSH-туннель, снаружи её не видно:"
 			echo "  1) на своём компьютере в терминале (окно не закрывать):"
-			echo "       ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT -p $SSH_PORT root@$PUBLIC_IP"
+			echo "       ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT -p $SSH_PORT $SSH_LOGIN@$PUBLIC_IP"
 			echo "  2) в браузере: http://127.0.0.1:$WEB_PORT$WEB_PATH"
 			echo "     логин:  $PANEL_USER"
 			echo "     пароль: $PANEL_PASS"
@@ -3682,14 +4097,20 @@ chmod 700 /root/vpn-qr
 	fi
 	echo
 	echo "Переезд на другой сервер с теми же ключами и клиентами: vpn-backup.sh — архив в /root/backups"
-	echo "  (секретный; забрать: scp -P $SSH_PORT root@$PUBLIC_IP:/root/backups/latest.tgz .), дальше — README.md"
+	if [ "$SSH_LOGIN" = root ]; then
+		echo "  (секретный; забрать: scp -P $SSH_PORT root@$PUBLIC_IP:/root/backups/latest.tgz .), дальше — README.md"
+	else
+		echo "  (секретный; забрать: ssh -p $SSH_PORT $SSH_LOGIN@$PUBLIC_IP 'sudo cat /root/backups/latest.tgz' > latest.tgz), дальше — README.md"
+	fi
 	echo "  в архиве (restore.sh$([ "$MODE" = domain ] && echo ", потом смена A-записи")). Сам бэкап не запускается."
 } > "$INFO"
 chmod 600 "$INFO"
 cat "$INFO"
 echo
+qn=0
 while IFS='|' read -r c l; do
-	qrencode -o "/root/vpn-qr/$(printf '%s' "$c" | tr -c 'A-Za-z0-9._-' '_').png" -s 6 -m 2 "$l" 2>/dev/null || true
+	qn=$((qn + 1))   # номер в имени файла: у клиентов бывают одинаковые или нелатинские имена
+	qrencode -o "/root/vpn-qr/$(printf '%02d' "$qn")-$(printf '%s' "$c" | tr -c 'A-Za-z0-9._-' '_').png" -s 6 -m 2 "$l" 2>/dev/null || true
 	echo "QR $c:"
 	qrencode -t ansiutf8 -m 1 "$l" 2>/dev/null || true
 done < "$WORK/qr"
@@ -3705,7 +4126,7 @@ elif [ "$PANEL_PUBLIC" = 1 ]; then
 else
 	echo "  Снаружи панель не видна (так её не найдут сканеры) — открывать через SSH-туннель:"
 	echo "  1) на своём компьютере в терминале, окно не закрывать:"
-	printf '       \033[1mssh -N -L %s:127.0.0.1:%s -p %s root@%s\033[0m\n' "$WEB_PORT" "$WEB_PORT" "$SSH_PORT" "$PUBLIC_IP"
+	printf '       \033[1mssh -N -L %s:127.0.0.1:%s -p %s %s@%s\033[0m\n' "$WEB_PORT" "$WEB_PORT" "$SSH_PORT" "$SSH_LOGIN" "$PUBLIC_IP"
 	printf '  2) в браузере:  \033[1mhttp://127.0.0.1:%s%s\033[0m\n' "$WEB_PORT" "$WEB_PATH"
 fi
 printf '  Логин:  \033[1m%s\033[0m\n' "$PANEL_USER"
