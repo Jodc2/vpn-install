@@ -330,6 +330,121 @@ test_exit_setup_bot_key() {  # блок шаблона, который клад�
 	t_eq 600 "$(stat -c %a "$h/.ssh/authorized_keys")" "права"
 }
 
+# ——— Task 7: развёртывание воркера ———
+# Заглушка Cloudflare с копией файлов из аргументов (развёртывание потом стирает секреты).
+cf_stub_capture() {
+	cf_api() {
+		local k="$1 $2" f n a
+		printf '%s\n' "$k" >> "$WORK/cf.calls"
+		n=$(wc -l < "$WORK/cf.calls")
+		for a in "$@"; do
+			f=
+			case $a in
+				*=@*) f=${a#*=@} ;;
+				*"=<"*) f=${a#*=<} ;;
+				@*) f=${a#@} ;;
+			esac
+			f=${f%%;*}
+			if [ -n "$f" ] && [ -f "$f" ]; then cp "$f" "$WORK/cap.$n.$(basename "$f")"; fi
+		done
+		f="$WORK/cf/$(printf '%s' "$k" | md5sum | cut -c1-16)"
+		if [ -f "$f" ]; then cat "$f"; else echo '{"success":true,"result":{}}'; fi
+	}
+}
+deploy_env() {
+	base_env; good_cf; cf_stub_capture
+	BOT_ACC=A1 BOT_ZONE=Z1 BOT_SUBDOMAIN=sub1 BOT_KV_ID=K1 BOT_EXISTING=none BOT_ADMIN_ID=42
+	WEB_PATH=/panel123/ SUB_PATH=/sub456/ SSH_PORT=22 EXIT_MODE=direct
+	BOT_AUTH_KEYS=$WORK/ak; touch "$WORK/ak"; bot_keys 0
+	(umask 077 && printf P1 > "$BOT_DIR/panel.token"); BOT_PANEL_NEW=1
+	bot_exit_bindings
+	mkdir -p "$WORK/etc_ssh"; ssh-keygen -q -t ed25519 -N '' -f "$WORK/etc_ssh/ssh_host_ed25519_key"
+	BOT_HOST_KEYS="$WORK/etc_ssh/ssh_host_*_key.pub"
+	head -c 2048 /dev/urandom > "$WORK/latest.tgz"
+	printf '#!/bin/bash\necho "Бэкап готов"\necho %s\n' "$WORK/latest.tgz" > "$WORK/backup.sh"; chmod +x "$WORK/backup.sh"
+	BOT_BACKUP_CMD=$WORK/backup.sh
+	bot_extract_bundle() { echo 'export default {}' > "$BOT_DIR/worker.js"; }
+	bot_http() { printf '%s\n' "$1" >> "$WORK/http.calls"; case $1 in /healthz) echo ok ;; "/selftest?part="*) cat "$WORK/st.${1#*part=}" ;; esac; }
+	echo '{"panel":{"ok":true,"clients":3},"dns":{"ok":true,"ip":"1.2.3.4"},"webhook":{"ok":true,"url":"https://vpn-bot.sub1.workers.dev/tg"},"admin":{"ok":true}}' > "$WORK/st.base"
+	echo '{"ok":true}' > "$WORK/st.entry"
+	echo '{"skipped":true}' > "$WORK/st.exit"
+	tg_push setWebhook '{"ok":true,"result":true}'
+}
+mb() {  # mb ИМЯ → «тип|значение» привязки из загруженного metadata.json
+	python3 -I -c 'import json, sys
+m = json.load(open(sys.argv[1]))
+for b in m["bindings"]:
+    if b["name"] == sys.argv[2]:
+        print(b["type"] + "|" + str(b.get("text", b.get("namespace_id", ""))))' "$(ls "$WORK"/cap.*.metadata.json | head -1)" "$1"
+}
+test_deploy_first_install() {
+	deploy_env
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	grep -qx 'PUT /accounts/A1/workers/scripts/vpn-bot?bindings_inherit=strict' "$WORK/cf.calls" || t_fail "нет загрузки с bindings_inherit=strict"
+	! grep -q '"inherit"' "$WORK"/cap.*.metadata.json || t_fail "наследование при первой установке"
+	t_eq "plain_text|1" "$(mb VPN_BOT_INSTALLER)" "метка"
+	t_eq "secret_text|42" "$(mb ADMIN_ID)" "владелец"
+	t_eq "secret_text|c" "$(mb CF_API_TOKEN)" "токен Cloudflare"
+	t_eq "secret_text|P1" "$(mb PANEL_TOKEN)" "токен панели"
+	t_eq "secret_text|t" "$(mb BOT_TOKEN)" "токен бота"
+	t_eq "plain_text|https://vpn.example.com" "$(mb PANEL_ORIGIN)" "панель"
+	t_eq "plain_text|/panel123/" "$(mb PANEL_BASE)" "путь панели"
+	t_eq "plain_text|https://vpn.example.com/sub456/" "$(mb SUB_PREFIX)" "подписка"
+	t_eq "plain_text|https://vpn-bot.sub1.workers.dev" "$(mb SELF_ORIGIN)" "адрес воркера"
+	t_eq "kv_namespace|K1" "$(mb STATE)" "KV"
+	t_eq "" "$(mb EXIT_HOST)" "без цепочки нет EXIT_*"
+	t_has '"drop_pending_updates": true' "$(grep '^setWebhook' "$WORK/tg.calls")" "очередь сброшена при первой установке"
+	t_has '"url": "https://vpn-bot.sub1.workers.dev/tg"' "$(grep '^setWebhook' "$WORK/tg.calls")" "адрес вебхука"
+	grep -qF '0 */3 * * *' "$WORK"/cap.*.req.json 2> /dev/null || grep -rqF '0 */3 * * *' "$WORK"/cap.* || t_fail "нет cron"
+	grep -qx 'PUT /accounts/A1/storage/kv/namespaces/K1/values/entry%3Afpr' "$WORK/cf.calls" || t_fail "нет entry:fpr"
+	grep -q "$(ssh-keygen -lf "$WORK/etc_ssh/ssh_host_ed25519_key.pub" | awk '{print $2}')" "$WORK"/cap.*.fpr.json || t_fail "в entry:fpr не тот ключ"
+	grep -qx 'PUT /accounts/A1/storage/kv/namespaces/K1/values/backup%3Abytes' "$WORK/cf.calls" || t_fail "нет бэкапа в KV"
+}
+test_deploy_creates_kv() {
+	deploy_env; BOT_KV_ID=
+	cf_set "POST /accounts/A1/storage/kv/namespaces" '{"success":true,"result":{"id":"K2","title":"vpn-bot-state"}}'
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_eq "kv_namespace|K2" "$(mb STATE)" "новый KV"
+	grep -q '"title":"vpn-bot-state"' "$WORK"/cap.*.req.json || t_fail "KV не с тем именем"
+}
+test_deploy_rerun_inherits() {
+	deploy_env
+	settings '[{"type":"secret_text","name":"BOT_TOKEN"},{"type":"secret_text","name":"WEBHOOK_SECRET"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"secret_text","name":"PANEL_TOKEN"},{"type":"secret_text","name":"ENTRY_SSH_KEY"},{"type":"secret_text","name":"GLOBALPING_TOKEN"},{"type":"plain_text","name":"EXIT_HOST","text":"7.7.7.7"}]'
+	rm -f "$BOT_DIR/tg.token" "$BOT_DIR/id" "$BOT_DIR/panel.token"; BOT_KEY_NEW=0 BOT_PANEL_NEW=0 BOT_ADMIN_ID=
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	for n in BOT_TOKEN WEBHOOK_SECRET ADMIN_ID PANEL_TOKEN ENTRY_SSH_KEY; do t_eq "inherit|" "$(mb $n)" "$n наследуется"; done
+	t_eq "inherit|" "$(mb GLOBALPING_TOKEN)" "чужая настройка владельца сохраняется"
+	t_eq "" "$(mb EXIT_HOST)" "цепочки больше нет — EXIT_HOST не тянется"
+	! grep -q '^setWebhook' "$WORK/tg.calls" 2> /dev/null || t_fail "вебхук трогали без токена бота"
+}
+test_deploy_no_secret_on_disk_after() {
+	deploy_env
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	local f
+	for f in id panel.token tg.token cf.token cf.hdr metadata.json webhook.secret selftest.secret selftest.hdr admin.id hook.json; do
+		[ ! -e "$BOT_DIR/$f" ] || t_fail "остался $f"
+	done
+}
+test_deploy_no_subdomain_forbidden() {
+	deploy_env; BOT_SUBDOMAIN=
+	cf_set "PUT /accounts/A1/workers/subdomain" '{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}'
+	! bot_deploy || t_fail "развернул без workers.dev"
+	t_has "Workers & Pages" "$BOT_ERR" "что сделать"
+	[ ! -e "$BOT_DIR/cf.hdr" ] || t_fail "секреты не стёрты после неудачи"
+}
+test_deploy_selftest_report() {
+	deploy_env; EXIT_MODE=chain CHAIN_IP=5.6.7.8 CHAIN_PORT=2087; bot_exit_bindings
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_has "панель" "$BOT_REPORT" "панель"; t_has "вход по SSH" "$BOT_REPORT" "вход"; t_has "руками" "$BOT_REPORT" "выход без доступа"
+	t_has "3" "$BOT_REPORT" "число клиентов"
+}
+test_deploy_selftest_entry_fail() {
+	deploy_env
+	echo '{"ok":false,"error":"permission denied (publickey)"}' > "$WORK/st.entry"
+	! bot_deploy || t_fail "успех при провале входа по SSH"
+	t_has "permission denied" "$BOT_ERR" "причина"
+}
+
 # ——— прогон ———
 PASS=0
 FAILN=0

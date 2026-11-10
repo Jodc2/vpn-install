@@ -10,6 +10,8 @@ TG_API_BASE=${TG_API_BASE:-https://api.telegram.org}
 BOT_DIR=
 BOT_AUTH_KEYS=${BOT_AUTH_KEYS:-/root/.ssh/authorized_keys}   # куда класть ключ бота на этом сервере
 BOT_KNOWN_HOSTS=${BOT_KNOWN_HOSTS:-/etc/x-ui/chain/known_hosts}   # ключ хоста выхода (его запомнила цепочка)
+BOT_HOST_KEYS=${BOT_HOST_KEYS:-/etc/ssh/ssh_host_*_key.pub}   # ключи этого сервера — бот сверяет их при входе
+BOT_BACKUP_CMD=${BOT_BACKUP_CMD:-/usr/local/bin/vpn-backup.sh}
 
 jget() {  # jget ПУТЬ ← JSON на stdin: значение по пути «a.0.b» (числа — индексы списков); нет — пусто
 	python3 -I -c '
@@ -51,7 +53,9 @@ print("%s (код %s)" % (e.get("message") or "нет ответа", e.get("code
 bot_init_secrets() {  # BOT_CF_TOKEN / BOT_TG_TOKEN → файлы в $WORK/bot (600), переменные стираются
 	BOT_DIR=$WORK/bot
 	(umask 077 && mkdir -p "$BOT_DIR")
-	if [ -n "${BOT_CF_TOKEN:-}" ]; then (umask 077 && printf 'Authorization: Bearer %s\n' "$BOT_CF_TOKEN" > "$BOT_DIR/cf.hdr"); fi
+	if [ -n "${BOT_CF_TOKEN:-}" ]; then
+		(umask 077 && printf 'Authorization: Bearer %s\n' "$BOT_CF_TOKEN" > "$BOT_DIR/cf.hdr" && printf '%s' "$BOT_CF_TOKEN" > "$BOT_DIR/cf.token")
+	fi
 	if [ -n "${BOT_TG_TOKEN:-}" ]; then (umask 077 && printf '%s' "$BOT_TG_TOKEN" > "$BOT_DIR/tg.token"); fi
 	unset BOT_CF_TOKEN BOT_TG_TOKEN
 }
@@ -315,4 +319,184 @@ bot_exit_bindings() {  # → $BOT_DIR/exit.list: «plain|secret|inherit ИМЯ [
 	elif bot_has_binding EXIT_SSH_KEY && bot_has_binding EXIT_HOSTKEY_FPR && [ "$(bot_plain EXIT_HOST)" = "$CHAIN_IP" ]; then
 		printf 'inherit EXIT_SSH_KEY\ninherit EXIT_HOSTKEY_FPR\n' >> "$out"
 	fi
+}
+
+# ——— развёртывание ———
+# Имена привязок, которыми распоряжается установщик. Прочие привязки нашего воркера (например,
+# GLOBALPING_TOKEN, заданный владельцем руками) при обновлении наследуются как есть.
+BOT_MANAGED="STATE PANEL_ORIGIN PANEL_BASE SUB_PREFIX CF_ZONE_ID DNS_NAME ENTRY_USER ENTRY_SSH_PORT SELF_ORIGIN
+VPN_BOT_INSTALLER CF_API_TOKEN SELFTEST_SECRET BOT_TOKEN WEBHOOK_SECRET ADMIN_ID PANEL_TOKEN ENTRY_SSH_KEY
+EXIT_HOST EXIT_PORT EXIT_USER CHAIN_PORT EXIT_FW EXIT_SSH_KEY EXIT_HOSTKEY_FPR EXIT_SSH_PASS"
+
+bot_rand() { python3 -I -c 'import secrets; print(secrets.token_urlsafe(24))'; }
+bot_put_secret() { (umask 077 && printf '%s' "$2" > "$BOT_DIR/$1"); }   # bot_put_secret ФАЙЛ ЗНАЧЕНИЕ
+bot_http() { curl -sS --max-time 40 -H @"$BOT_DIR/selftest.hdr" "$BOT_ORIGIN$1"; }   # запрос к самому воркеру
+bot_alive() { [ "$(curl -sS --max-time 15 "$1/healthz" 2> /dev/null)" = ok ]; }   # bot_alive АДРЕС_ВОРКЕРА
+
+bot_wipe() {  # стереть секреты из $BOT_DIR (они уже в воркере или больше не нужны)
+	local f
+	for f in id id.pub panel.token tg.token cf.token cf.hdr metadata.json webhook.secret selftest.secret selftest.hdr \
+		admin.id hook.json req.json exit.fpr fpr.json backup.meta bindings.list settings.json; do
+		rm -f "${BOT_DIR:?}/$f"
+	done
+}
+
+bot_secret_or_inherit() {  # ИМЯ ФАЙЛ → строка привязки: новый секрет из файла или наследование от прежней версии
+	if [ -s "$BOT_DIR/$2" ]; then
+		printf 'secret %s @%s\n' "$1" "$BOT_DIR/$2"
+	elif [ "${BOT_EXISTING:-}" = ours ]; then
+		printf 'inherit %s\n' "$1"
+	else
+		BOT_ERR="для нового бота нет $1"
+		return 1
+	fi
+}
+
+bot_deploy() {  # → BOT_ORIGIN BOT_REPORT; 1 и BOT_ERR. Секреты из $BOT_DIR стираются при любом исходе
+	local rc=0
+	bot_deploy_steps || rc=1
+	bot_wipe
+	return "$rc"
+}
+
+bot_deploy_steps() {
+	local body sub f p kb res
+	BOT_ERR= BOT_REPORT=
+	if [ -z "${BOT_KV_ID:-}" ]; then
+		printf '{"title":"%s-state"}' "$BOT_WORKER" > "$BOT_DIR/req.json"
+		body=$(cf_api POST "/accounts/$BOT_ACC/storage/kv/namespaces" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+		cf_ok <<< "$body" || { BOT_ERR="не создать хранилище KV — $(cf_err <<< "$body")"; return 1; }
+		BOT_KV_ID=$(jget result.id <<< "$body")
+	fi
+	if [ -z "${BOT_SUBDOMAIN:-}" ]; then
+		sub=vpnbot-$(python3 -I -c 'import secrets, string; print("".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)))')
+		printf '{"subdomain":"%s"}' "$sub" > "$BOT_DIR/req.json"
+		body=$(cf_api PUT "/accounts/$BOT_ACC/workers/subdomain" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+		if ! cf_ok <<< "$body"; then
+			BOT_ERR="в аккаунте Cloudflare нет адреса workers.dev, и создать его не вышло ($(cf_err <<< "$body")): открой dash.cloudflare.com → Workers & Pages один раз и запусти установку снова"
+			return 1
+		fi
+		BOT_SUBDOMAIN=$(jget result.subdomain <<< "$body")
+		BOT_SUBDOMAIN=${BOT_SUBDOMAIN:-$sub}
+	fi
+	BOT_ORIGIN=https://$BOT_WORKER.$BOT_SUBDOMAIN.workers.dev
+	# Секреты этого развёртывания: самопроверка — всегда новый; вебхук — новый, если есть токен бота.
+	bot_put_secret selftest.secret "$(bot_rand)"
+	(umask 077 && printf 'X-Selftest-Secret: %s\n' "$(cat "$BOT_DIR/selftest.secret")" > "$BOT_DIR/selftest.hdr")
+	if [ -s "$BOT_DIR/tg.token" ]; then bot_put_secret webhook.secret "$(bot_rand)"; fi
+	if [ -n "${BOT_ADMIN_ID:-}" ]; then bot_put_secret admin.id "$BOT_ADMIN_ID"; fi
+	{
+		printf 'plain %s %s\n' PANEL_ORIGIN "https://$DOMAIN" PANEL_BASE "$WEB_PATH" SUB_PREFIX "https://$DOMAIN$SUB_PATH" \
+			CF_ZONE_ID "$BOT_ZONE" DNS_NAME "$DOMAIN" ENTRY_USER root ENTRY_SSH_PORT "$SSH_PORT" SELF_ORIGIN "$BOT_ORIGIN" \
+			VPN_BOT_INSTALLER 1
+		printf 'secret CF_API_TOKEN @%s\nsecret SELFTEST_SECRET @%s\n' "$BOT_DIR/cf.token" "$BOT_DIR/selftest.secret"
+		bot_secret_or_inherit BOT_TOKEN tg.token
+		bot_secret_or_inherit WEBHOOK_SECRET webhook.secret
+		bot_secret_or_inherit ADMIN_ID admin.id
+		bot_secret_or_inherit PANEL_TOKEN panel.token
+		bot_secret_or_inherit ENTRY_SSH_KEY id
+		cat "$BOT_DIR/exit.list"
+	} > "$BOT_DIR/bindings.list" || return 1
+	(umask 077 && python3 -I -c '
+import json, sys
+lst, kv, settings, managed, out = sys.argv[1:6]
+managed = set(managed.split())
+b = [{"type": "kv_namespace", "name": "STATE", "namespace_id": kv}]
+seen = {"STATE"}
+for line in open(lst, encoding="utf-8"):
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    kind, name, *rest = line.split(" ", 2)
+    val = rest[0] if rest else ""
+    if kind == "plain":
+        b.append({"type": "plain_text", "name": name, "text": val})
+    elif kind == "secret":
+        b.append({"type": "secret_text", "name": name, "text": open(val[1:], encoding="utf-8").read()})
+    elif kind == "inherit":
+        b.append({"type": "inherit", "name": name})
+    seen.add(name)
+if settings:
+    for x in (json.load(open(settings)).get("result") or {}).get("bindings") or []:
+        n = x.get("name")
+        if n and n not in seen and n not in managed and x.get("type") in ("secret_text", "plain_text"):
+            b.append({"type": "inherit", "name": n})
+            seen.add(n)
+json.dump({"main_module": "worker.js", "compatibility_date": "2026-10-20", "bindings": b}, open(out, "w"))' \
+		"$BOT_DIR/bindings.list" "$BOT_KV_ID" "$([ "${BOT_EXISTING:-}" = ours ] && echo "$BOT_DIR/settings.json")" "$BOT_MANAGED" "$BOT_DIR/metadata.json") ||
+		{ BOT_ERR="не собрать настройки воркера"; return 1; }
+	bot_extract_bundle || { BOT_ERR="не распаковать код бота"; return 1; }
+	body=$(cf_api PUT "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER?bindings_inherit=strict" \
+		-F "metadata=@$BOT_DIR/metadata.json;type=application/json" \
+		-F "worker.js=@$BOT_DIR/worker.js;type=application/javascript+module") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	cf_ok <<< "$body" || { BOT_ERR="Cloudflare не принял воркер — $(cf_err <<< "$body")"; return 1; }
+	echo '{"enabled":true,"previews_enabled":false}' > "$BOT_DIR/req.json"
+	body=$(cf_api POST "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER/subdomain" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	cf_ok <<< "$body" || { BOT_ERR="не включить адрес workers.dev — $(cf_err <<< "$body")"; return 1; }
+	printf '[{"cron":"%s"}]' "$BOT_CRON" > "$BOT_DIR/req.json"
+	body=$(cf_api PUT "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER/schedules" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	cf_ok <<< "$body" || { BOT_ERR="не поставить расписание — $(cf_err <<< "$body")"; return 1; }
+	# Отпечатки ключей этого сервера: по ним бот узнаёт его при входе по SSH.
+	# shellcheck disable=SC2086
+	for f in $BOT_HOST_KEYS; do [ -f "$f" ] && ssh-keygen -lf "$f" | awk '{print $2}'; done |
+		python3 -I -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))' > "$BOT_DIR/fpr.json"
+	[ "$(cat "$BOT_DIR/fpr.json")" != "[]" ] || { BOT_ERR="не найдены ключи SSH этого сервера ($BOT_HOST_KEYS)"; return 1; }
+	body=$(cf_api PUT "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/entry%3Afpr" --data-binary @"$BOT_DIR/fpr.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	cf_ok <<< "$body" || { BOT_ERR="не записать отпечаток сервера в KV — $(cf_err <<< "$body")"; return 1; }
+	# Первый бэкап — сразу в хранилище: переезд работает с первой минуты. Не вышло — не беда, бот снимет сам.
+	if [ -x "$BOT_BACKUP_CMD" ] && p=$("$BOT_BACKUP_CMD" 2> /dev/null | tail -1) && [ -f "$p" ]; then
+		python3 -I -c 'import json, os, sys, time; print(json.dumps({"name": os.path.basename(sys.argv[1]), "size": os.path.getsize(sys.argv[1]), "createdAt": int(time.time() * 1000)}))' "$p" > "$BOT_DIR/backup.meta"
+		kb=$(($(stat -c %s "$p") / 1024))
+		if body=$(cf_api PUT "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/backup%3Abytes" -F "value=@$p" -F "metadata=<$BOT_DIR/backup.meta") && cf_ok <<< "$body"; then
+			BOT_REPORT+="бэкап в хранилище Cloudflare: $kb КБ ✓"$'\n'
+		else
+			BOT_REPORT+="⚠ первый бэкап в хранилище не лёг — бот снимет его сам ночью или по кнопке «Бэкап»"$'\n'
+		fi
+	fi
+	if [ -s "$BOT_DIR/tg.token" ]; then
+		(umask 077 && python3 -I -c 'import json, sys
+print(json.dumps({"url": sys.argv[1] + "/tg", "secret_token": open(sys.argv[2]).read(), "allowed_updates": ["message", "callback_query"],
+                  "drop_pending_updates": sys.argv[3] == "none"}))' "$BOT_ORIGIN" "$BOT_DIR/webhook.secret" "${BOT_EXISTING:-none}" > "$BOT_DIR/hook.json")
+		body=$(tg_api setWebhook "$BOT_DIR/hook.json") || { BOT_ERR="Телеграм не отвечает"; return 1; }
+		[ "$(jget ok <<< "$body")" = true ] || { BOT_ERR="Телеграм не принял вебхук — $(jget description <<< "$body")"; return 1; }
+	fi
+	for f in $(seq 1 15); do
+		[ "$(bot_http /healthz 2> /dev/null)" = ok ] && break
+		[ "$f" = 15 ] && { BOT_ERR="воркер не отвечает на $BOT_ORIGIN/healthz"; return 1; }
+		sleep 2
+	done
+	res=$(python3 -I -c '
+import json, sys
+def load(s):
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+base, entry, ex = (load(x) for x in sys.argv[1:4])
+chain = sys.argv[4] == "chain"
+out, bad = [], []
+def line(ok, good, fail):
+    out.append(good if ok else "⚠ " + fail)
+    if not ok:
+        bad.append(fail)
+p = base.get("panel") or {}
+line(p.get("ok"), "панель: клиентов %s ✓" % p.get("clients"), "бот не видит панель: %s" % p.get("error"))
+d = base.get("dns") or {}
+line(d.get("ok"), "A-запись: %s ✓" % d.get("ip"), "бот не видит A-запись: %s" % d.get("error"))
+w = base.get("webhook") or {}
+line(w.get("ok"), "вебхук Телеграма ✓" + (" (последняя ошибка доставки: %s)" % w["error"] if w.get("error") else ""), "вебхук Телеграма не стоит: %s" % w.get("error"))
+line((base.get("admin") or {}).get("ok"), "владелец бота назначен ✓", "владелец бота не назначен")
+line(entry.get("ok"), "вход по SSH на этот сервер ✓", "вход по SSH на этот сервер не прошёл: %s" % entry.get("error"))
+if ex.get("ok"):
+    out.append("выход по SSH ✓")
+elif ex.get("skipped"):
+    if chain:
+        out.append("выход: при переезде порт новому входу открывать руками (у бота нет входа на выход)")
+else:
+    out.append("⚠ выход по SSH не прошёл (%s) — при переезде порт новому входу открывать руками" % ex.get("error"))
+print("\n".join(out))
+print("RESULT " + ("; ".join(bad) if bad else "ok"))' "$(bot_http '/selftest?part=base')" "$(bot_http '/selftest?part=entry')" "$(bot_http '/selftest?part=exit')" "${EXIT_MODE:-}")
+	BOT_REPORT+=$(grep -v '^RESULT ' <<< "$res")
+	res=$(sed -n 's/^RESULT //p' <<< "$res")
+	[ "$res" = ok ] || { BOT_ERR=$res; return 1; }
 }
