@@ -202,6 +202,7 @@ CHAIN_SID=$(state_val CHAIN_SID || true)
 CHAIN_SNI=$(state_val CHAIN_SNI || true)
 CHAIN_SSH_USER=$(state_val CHAIN_SSH_USER || true)
 CHAIN_SSH_PORT=$(state_val CHAIN_SSH_PORT || true)
+CHAIN_FW=$(state_val CHAIN_FW || true)
 EXIT_SSH_USER_ARG=$EXIT_SSH_USER   # заданы опциями (пусто — нет): другой сервер-выход прошлые не наследует
 EXIT_SSH_PORT_ARG=$EXIT_SSH_PORT
 exit_ssh_defaults
@@ -1050,6 +1051,7 @@ CHAIN_SID='${CHAIN_SID:-}'
 CHAIN_SNI='${CHAIN_SNI:-}'
 CHAIN_SSH_USER='${CHAIN_SSH_USER:-}'
 CHAIN_SSH_PORT='${CHAIN_SSH_PORT:-}'
+CHAIN_FW='${CHAIN_FW:-}'
 EOF
 	# Файл потом читается через «.»: значение с кавычкой исполнилось бы как команда — такой не сохранять.
 	if grep -v '^#' "$tmp" | grep -q "^[A-Z_0-9]*='.*'.*'"; then rm -f "$tmp"; die "в настройках оказалась кавычка — $STATE не записан"; fi
@@ -1417,6 +1419,20 @@ elif command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -qE 
 else
 	echo "EXIT_UFW=open"
 fi
+# >>> vpn-bot key — ключ Телеграм-бота владельца: бот открывает здесь порт новому входу при переезде
+if [ -n "${BOT_PUBKEY:-}" ]; then
+	bh=$(getent passwd "${BOT_SSH_USER:-root}" | cut -d: -f6)
+	if [ -n "$bh" ] && [ -d "$bh" ]; then
+		install -d -m 700 "$bh/.ssh"
+		ak=$bh/.ssh/authorized_keys
+		{ grep -vE ' vpn-bot$' "$ak" 2> /dev/null || true; printf '%s\n' "$BOT_PUBKEY"; } > "$ak.vpn-bot.tmp"
+		chmod 600 "$ak.vpn-bot.tmp"
+		chown "${BOT_SSH_USER:-root}:" "$bh/.ssh" "$ak.vpn-bot.tmp" 2> /dev/null || true
+		mv -f "$ak.vpn-bot.tmp" "$ak"
+		echo "EXIT_BOTKEY=ok"
+	fi
+fi
+# <<< vpn-bot key
 echo "EXIT_SNI=$SNI"
 echo "EXIT_XUI=$XUISTAT"
 echo "EXIT_RESULT=OK"
@@ -1676,6 +1692,7 @@ setup_chain_exit_try() {
 		printf 'CHAIN_PRIV=%q\nCHAIN_UUID=%q\nCHAIN_SID=%q\nENTRY_IP=%q\nEXIT_PORT=%q\nEXIT_SNI_HINT=%q\nSTOP_XUI=%q\n' \
 			"$CHAIN_PRIV" "$CHAIN_UUID" "$CHAIN_SID" "$PUBLIC_IP" "$CHAIN_PORT" "${REALITY_SNI:-}" "${EXIT_STOP_XUI:-0}"
 		printf 'XUI_VER=%q\nXUI_SHA_AMD64=%q\nXUI_SHA_ARM64=%q\n' "$XUI_VERSION" "$XUI_SHA256_AMD64" "$XUI_SHA256_ARM64"
+		printf 'BOT_PUBKEY=%q\nBOT_SSH_USER=%q\n' "${BOT_PUBKEY:-}" "$EXIT_SSH_USER"   # пусто — без бота
 	} > "$WORK/exit.env")
 	if ! { scp_exit "$WORK/exit-setup.sh" "$stage/exit-setup.sh" && scp_exit "$WORK/exit.env" "$stage/exit.env"; } >/dev/null 2>&1; then
 		rm -f "$WORK/exit.env"
@@ -1706,6 +1723,12 @@ setup_chain_exit_try() {
 		iptables) ok "на старом сервере фаервол iptables (как у Oracle): порт $CHAIN_PORT открыт новому серверу, правило сохранено" ;;
 		iptables-unsaved) warn "на старом сервере фаервол iptables: порт $CHAIN_PORT открыт новому серверу, но правило не переживёт перезагрузку — поставь там iptables-persistent" ;;
 	esac
+	case $(sed -n 's/^EXIT_UFW=//p' <<<"$out" | tail -1) in   # как бот будет пускать новый вход при переезде
+		restricted) CHAIN_FW=ufw ;;
+		iptables | iptables-unsaved) CHAIN_FW=iptables ;;
+		open) CHAIN_FW=open ;;
+	esac
+	if grep -qx 'EXIT_BOTKEY=ok' <<<"$out"; then BOT_EXIT_SETUP=1; fi
 	case $(sed -n 's/^EXIT_XUI=//p' <<<"$out" | tail -1) in
 		running) ok "на старом сервере 3x-ui продолжает работать — цепочке не мешает (выключить: переустанови с --exit-stop-xui)" ;;
 		stopped) [ "${EXIT_STOP_XUI:-0}" = 1 ] && ok "3x-ui на старом сервере выключен (теперь он только выход)" ;;

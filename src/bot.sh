@@ -8,6 +8,8 @@ BOT_CRON='0 */3 * * *'
 CF_API_BASE=${CF_API_BASE:-https://api.cloudflare.com/client/v4}
 TG_API_BASE=${TG_API_BASE:-https://api.telegram.org}
 BOT_DIR=
+BOT_AUTH_KEYS=${BOT_AUTH_KEYS:-/root/.ssh/authorized_keys}   # куда класть ключ бота на этом сервере
+BOT_KNOWN_HOSTS=${BOT_KNOWN_HOSTS:-/etc/x-ui/chain/known_hosts}   # ключ хоста выхода (его запомнила цепочка)
 
 jget() {  # jget ПУТЬ ← JSON на stdin: значение по пути «a.0.b» (числа — индексы списков); нет — пусто
 	python3 -I -c '
@@ -250,5 +252,67 @@ bot_validate() {  # всё, что проверяется до установк�
 		BOT_ADMIN_ID=$VPN_BOT_ADMIN_ID
 	elif ! bot_has_binding ADMIN_ID; then
 		bot_pair || return 1
+	fi
+}
+
+bot_plain() {  # bot_plain ИМЯ → значение plain_text прежней версии нашего воркера (нет — пусто)
+	[ -s "$BOT_DIR/settings.json" ] || return 0
+	python3 -I -c 'import json, sys
+b = (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or []
+print(next((x.get("text", "") for x in b if x.get("name") == sys.argv[2] and x.get("type") == "plain_text"), ""))' "$BOT_DIR/settings.json" "$1"
+}
+
+bot_keys() {  # bot_keys НУЖЕН_ВЫХОД(0|1) → BOT_KEY_NEW; в authorized_keys ровно одна строка «… vpn-bot»
+	local need_exit=${1:-0} f=$BOT_AUTH_KEYS tmp
+	if [ "$need_exit" = 0 ] && [ "${BOT_EXISTING:-}" = ours ] && grep -qE ' vpn-bot$' "$f" 2> /dev/null && bot_has_binding ENTRY_SSH_KEY; then
+		BOT_KEY_NEW=0
+		return 0
+	fi
+	rm -f "$BOT_DIR/id" "$BOT_DIR/id.pub"
+	ssh-keygen -q -t ed25519 -N '' -C vpn-bot -f "$BOT_DIR/id" > /dev/null
+	install -d -m 700 "$(dirname "$f")"
+	tmp=$(mktemp "$f.XXXXXX")
+	{
+		grep -vE ' vpn-bot$' "$f" 2> /dev/null || true
+		cat "$BOT_DIR/id.pub"
+	} > "$tmp"
+	chmod 600 "$tmp"
+	mv -f "$tmp" "$f"
+	BOT_KEY_NEW=1
+}
+
+bot_panel_token() {  # → BOT_PANEL_NEW; в api_tokens ровно одна строка name='vpn-bot', открытый текст — в $BOT_DIR
+	local n out t
+	BOT_ERR=
+	n=$(sqlite3 "$DB" "select count(*) from api_tokens where name='vpn-bot';") || { BOT_ERR="не прочитать базу 3x-ui"; return 1; }
+	if [ "$n" = 1 ] && bot_has_binding PANEL_TOKEN; then
+		BOT_PANEL_NEW=0
+		return 0
+	fi
+	sqlite3 "$DB" "delete from api_tokens where name='vpn-bot';" || { BOT_ERR="не записать базу 3x-ui"; return 1; }
+	out=$("$XUI" setting -getApiToken 2>&1) || true
+	t=$(sed -n 's/^apiToken: *//p' <<< "$out" | tail -1)
+	[ -n "$t" ] || { BOT_ERR="x-ui не выдал API-токен: $(head -c 200 <<< "$out")"; return 1; }
+	sqlite3 "$DB" "update api_tokens set name='vpn-bot' where id=(select max(id) from api_tokens);" || { BOT_ERR="не записать базу 3x-ui"; return 1; }
+	(umask 077 && printf '%s' "$t" > "$BOT_DIR/panel.token")
+	BOT_PANEL_NEW=1
+}
+
+bot_exit_bindings() {  # → $BOT_DIR/exit.list: «plain|secret|inherit ИМЯ [ЗНАЧЕНИЕ|@ФАЙЛ]» про выход цепочки
+	local out=$BOT_DIR/exit.list
+	: > "$out"
+	[ "${EXIT_MODE:-}" = chain ] && [ -n "${CHAIN_IP:-}" ] || return 0
+	printf 'plain %s %s\n' EXIT_HOST "$CHAIN_IP" EXIT_PORT "${CHAIN_SSH_PORT:-22}" EXIT_USER "${CHAIN_SSH_USER:-root}" \
+		CHAIN_PORT "$CHAIN_PORT" EXIT_FW "${CHAIN_FW:-ufw}" >> "$out"
+	# Доступ бота к выходу: новый — если в этом запуске выход настроен с ключом бота и sudo там без пароля;
+	# прежний — если выход тот же; иначе без доступа (при переезде бот покажет команду для ручного запуска).
+	if [ "${BOT_EXIT_SETUP:-0}" = 1 ] && [ "${EXIT_SUDO:-}" != pass ] && [ -s "$BOT_DIR/id" ] && [ -s "$BOT_KNOWN_HOSTS" ]; then
+		ssh-keygen -lf "$BOT_KNOWN_HOSTS" | awk '{print $2}' |
+			python3 -I -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))' > "$BOT_DIR/exit.fpr"
+		if [ "$(cat "$BOT_DIR/exit.fpr")" != "[]" ]; then
+			printf 'secret EXIT_SSH_KEY @%s\nsecret EXIT_HOSTKEY_FPR @%s\n' "$BOT_DIR/id" "$BOT_DIR/exit.fpr" >> "$out"
+		fi
+	elif bot_has_binding EXIT_SSH_KEY && bot_has_binding EXIT_HOSTKEY_FPR && [ "$(bot_plain EXIT_HOST)" = "$CHAIN_IP" ]; then
+		printf 'inherit EXIT_SSH_KEY\ninherit EXIT_HOSTKEY_FPR\n' >> "$out"
 	fi
 }

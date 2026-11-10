@@ -194,13 +194,150 @@ test_validate_rerun_skips_pairing() {
 	! grep -q '^getUpdates' "$WORK/tg.calls" || t_fail "владельца спросили заново"
 }
 
+# ——— Task 6: ключи, токен панели, доступ к выходу ———
+keys_env() {
+	base_env
+	BOT_AUTH_KEYS=$WORK/root.ssh/authorized_keys
+	mkdir -p "$WORK/root.ssh"
+	printf '%s\n' 'ssh-rsa AAAAuser user@laptop' > "$BOT_AUTH_KEYS"
+}
+settings() {  # settings 'привязки JSON' → прежняя версия нашего воркера
+	BOT_EXISTING=ours
+	printf '{"success":true,"result":{"bindings":%s}}' "$1" > "$BOT_DIR/settings.json"
+}
+test_keys_new_when_missing() {
+	keys_env; BOT_EXISTING=none
+	bot_keys 0
+	t_eq 1 "$BOT_KEY_NEW" "ключ новый"
+	t_eq 1 "$(grep -c ' vpn-bot$' "$BOT_AUTH_KEYS")" "строк vpn-bot"
+	grep -qx 'ssh-rsa AAAAuser user@laptop' "$BOT_AUTH_KEYS" || t_fail "чужая строка пропала"
+	t_eq 600 "$(stat -c %a "$BOT_AUTH_KEYS")" "права authorized_keys"
+	[ -s "$BOT_DIR/id" ] && [ -s "$BOT_DIR/id.pub" ] || t_fail "нет ключа в BOT_DIR"
+}
+test_keys_replace_line() {
+	keys_env; BOT_EXISTING=none
+	bot_keys 1; local first; first=$(cat "$BOT_DIR/id.pub")
+	bot_keys 1
+	t_eq 1 "$(grep -c ' vpn-bot$' "$BOT_AUTH_KEYS")" "строк vpn-bot после двух раз"
+	[ "$first" != "$(cat "$BOT_DIR/id.pub")" ] || t_fail "ключ не сменился"
+	grep -qxF "$(cat "$BOT_DIR/id.pub")" "$BOT_AUTH_KEYS" || t_fail "в authorized_keys не новый ключ"
+}
+test_keys_inherit() {
+	keys_env
+	printf '%s\n' 'ssh-ed25519 AAAAold vpn-bot' >> "$BOT_AUTH_KEYS"
+	settings '[{"type":"secret_text","name":"ENTRY_SSH_KEY"}]'
+	bot_keys 0
+	t_eq 0 "$BOT_KEY_NEW" "ключ унаследован"
+	[ ! -e "$BOT_DIR/id" ] || t_fail "лишний новый ключ"
+	grep -qx 'ssh-ed25519 AAAAold vpn-bot' "$BOT_AUTH_KEYS" || t_fail "прежняя строка тронута"
+}
+panel_env() {
+	base_env
+	DB=$WORK/x-ui.db
+	sqlite3 "$DB" "create table api_tokens (id integer primary key autoincrement, name text not null unique, token text not null, enabled numeric default 1, created_at integer);"
+	XUI=$WORK/x-ui
+	cat > "$XUI" <<'X'
+#!/bin/bash
+[ "$1 $2" = "setting -getApiToken" ] || exit 2
+sqlite3 "$DB" "insert into api_tokens (name, token) values ('cli-' || abs(random()), 'hash');"
+echo "apiToken: P$(sqlite3 "$DB" 'select max(id) from api_tokens;')"
+X
+	chmod +x "$XUI"
+	export DB
+}
+test_panel_token_new() {
+	panel_env; BOT_EXISTING=none
+	bot_panel_token || t_fail "не создал: $BOT_ERR"
+	t_eq 1 "$BOT_PANEL_NEW" "новый"
+	t_eq P1 "$(cat "$BOT_DIR/panel.token")" "открытый токен"
+	t_eq 1 "$(sqlite3 "$DB" "select count(*) from api_tokens where name='vpn-bot';")" "строка vpn-bot"
+	t_eq 600 "$(stat -c %a "$BOT_DIR/panel.token")" "права"
+}
+test_panel_token_replaces_row() {
+	panel_env; BOT_EXISTING=none
+	sqlite3 "$DB" "insert into api_tokens (name, token) values ('vpn-bot', 'old');"
+	bot_panel_token || t_fail "не создал: $BOT_ERR"
+	t_eq 1 "$(sqlite3 "$DB" "select count(*) from api_tokens where name='vpn-bot';")" "строк vpn-bot"
+	t_eq 1 "$(sqlite3 "$DB" "select count(*) from api_tokens;")" "старая строка удалена"
+	t_eq hash "$(sqlite3 "$DB" "select token from api_tokens where name='vpn-bot';")" "строка — новая"
+}
+test_panel_token_inherit() {
+	panel_env
+	sqlite3 "$DB" "insert into api_tokens (name, token) values ('vpn-bot', 'old');"
+	settings '[{"type":"secret_text","name":"PANEL_TOKEN"}]'
+	bot_panel_token
+	t_eq 0 "$BOT_PANEL_NEW" "унаследован"
+	t_eq old "$(sqlite3 "$DB" "select token from api_tokens where name='vpn-bot';")" "строка не тронута"
+}
+chain_env() {
+	base_env
+	EXIT_MODE=chain CHAIN_IP=5.6.7.8 CHAIN_PORT=2087 CHAIN_SSH_USER=ubuntu CHAIN_SSH_PORT=22 CHAIN_FW=iptables
+	ssh-keygen -q -t ed25519 -N '' -f "$WORK/hostkey"
+	BOT_KNOWN_HOSTS=$WORK/known_hosts
+	printf '5.6.7.8 %s\n' "$(cut -d' ' -f1-2 "$WORK/hostkey.pub")" > "$BOT_KNOWN_HOSTS"
+}
+test_exit_bindings_none() {
+	base_env; EXIT_MODE=direct
+	bot_exit_bindings
+	[ -f "$BOT_DIR/exit.list" ] || t_fail "нет exit.list"
+	t_eq "" "$(cat "$BOT_DIR/exit.list")" "без цепочки — пусто"
+}
+test_exit_bindings_new_access() {
+	chain_env; BOT_EXISTING=none; BOT_AUTH_KEYS=$WORK/ak; touch "$WORK/ak"
+	bot_keys 1; BOT_EXIT_SETUP=1; EXIT_SUDO=nopass
+	bot_exit_bindings
+	local l; l=$(cat "$BOT_DIR/exit.list")
+	t_has "plain EXIT_HOST 5.6.7.8" "$l" "адрес"; t_has "plain EXIT_USER ubuntu" "$l" "пользователь"
+	t_has "plain CHAIN_PORT 2087" "$l" "порт"; t_has "plain EXIT_FW iptables" "$l" "фаервол"
+	t_has "secret EXIT_SSH_KEY @$BOT_DIR/id" "$l" "ключ"; t_has "secret EXIT_HOSTKEY_FPR @$BOT_DIR/exit.fpr" "$l" "отпечаток"
+	t_eq "[\"$(ssh-keygen -lf "$WORK/hostkey.pub" | awk '{print $2}')\"]" "$(cat "$BOT_DIR/exit.fpr")" "отпечаток ключа выхода"
+}
+test_exit_bindings_sudo_pass() {
+	chain_env; BOT_EXISTING=none; BOT_AUTH_KEYS=$WORK/ak; touch "$WORK/ak"
+	bot_keys 1; BOT_EXIT_SETUP=1; EXIT_SUDO=pass
+	bot_exit_bindings
+	local l; l=$(cat "$BOT_DIR/exit.list")
+	t_has "plain EXIT_HOST 5.6.7.8" "$l" "адрес есть"
+	case $l in *EXIT_SSH_KEY*) t_fail "доступ при sudo с паролем: $l" ;; esac
+}
+test_exit_bindings_inherit() {
+	chain_env; BOT_EXIT_SETUP=0
+	settings '[{"type":"secret_text","name":"EXIT_SSH_KEY"},{"type":"secret_text","name":"EXIT_HOSTKEY_FPR"},{"type":"plain_text","name":"EXIT_HOST","text":"5.6.7.8"}]'
+	bot_exit_bindings
+	local l; l=$(cat "$BOT_DIR/exit.list")
+	t_has "inherit EXIT_SSH_KEY" "$l" "ключ наследуется"; t_has "inherit EXIT_HOSTKEY_FPR" "$l" "отпечаток наследуется"
+}
+test_exit_bindings_host_changed() {
+	chain_env; BOT_EXIT_SETUP=0
+	settings '[{"type":"secret_text","name":"EXIT_SSH_KEY"},{"type":"secret_text","name":"EXIT_HOSTKEY_FPR"},{"type":"plain_text","name":"EXIT_HOST","text":"9.9.9.9"}]'
+	bot_exit_bindings
+	local l; l=$(cat "$BOT_DIR/exit.list")
+	case $l in *EXIT_SSH_KEY* | *EXIT_HOSTKEY_FPR*) t_fail "доступ к старому выходу перенесён на новый: $l" ;; esac
+	t_has "plain EXIT_HOST 5.6.7.8" "$l" "новый адрес"
+}
+test_exit_setup_bot_key() {  # блок шаблона, который кладёт ключ бота на выходе
+	local code h
+	code=$(sed -n '/^# >>> vpn-bot key/,/^# <<< vpn-bot key/p' "$ROOT/src/install-vpn.sh.in")
+	[ -n "$code" ] || t_fail "в шаблоне нет блока vpn-bot key"
+	h=$WORK/home/u; mkdir -p "$h/.ssh"; printf '%s\n' 'ssh-rsa AAAAu u@x' 'ssh-ed25519 AAAAold vpn-bot' > "$h/.ssh/authorized_keys"
+	mkdir -p "$WORK/bin"; printf '#!/bin/bash\necho "u:x:0:0::%s:/bin/bash"\n' "$h" > "$WORK/bin/getent"; chmod +x "$WORK/bin/getent"
+	(
+		PATH="$WORK/bin:$PATH" BOT_PUBKEY='ssh-ed25519 AAAAnew vpn-bot' BOT_SSH_USER=root
+		eval "$code"
+	) > "$WORK/out"
+	grep -qx 'EXIT_BOTKEY=ok' "$WORK/out" || t_fail "нет EXIT_BOTKEY=ok"
+	t_eq $'ssh-rsa AAAAu u@x\nssh-ed25519 AAAAnew vpn-bot' "$(cat "$h/.ssh/authorized_keys")" "ключ бота заменён, чужой цел"
+	t_eq 600 "$(stat -c %a "$h/.ssh/authorized_keys")" "права"
+}
+
 # ——— прогон ———
 PASS=0
 FAILN=0
 want=" $* "
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do
 	[ $# -eq 0 ] || [[ $want == *" $t "* ]] || continue
-	if (
+	# Подоболочка — отдельной командой, не в условии if: там bash молча выключает set -e.
+	(
 		set -euo pipefail
 		WORK=$(mktemp -d)
 		export WORK FIX
@@ -208,7 +345,9 @@ for t in $(declare -F | awk '{print $3}' | grep '^test_'); do
 		# shellcheck source=../src/bot.sh
 		. "$ROOT/src/bot.sh"
 		"$t"
-	); then
+	)
+	rc=$?
+	if [ "$rc" = 0 ]; then
 		PASS=$((PASS + 1))
 		echo "ok   $t"
 	else
