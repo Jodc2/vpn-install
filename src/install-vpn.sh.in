@@ -474,6 +474,7 @@ S_BOT_ORIGIN=$(state_val S_BOT_ORIGIN || true)
 S_BOT_WORKER=$(state_val S_BOT_WORKER || true)
 S_BOT_SSH_PORT=$(state_val S_BOT_SSH_PORT || true)
 [ -n "${VPN_BOT_WORKER:-}" ] || BOT_WORKER=${S_BOT_WORKER:-vpn-bot}
+[ -z "${S_BOT_WORKER:-}" ] || BOT_WORKER_AUTO=0   # воркер прошлой установки молча не меняем
 SSH_PORT_NOW=$(sshd -T 2> /dev/null | awk '$1 == "port" {print $2; exit}' || true)
 BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_SKIP='' BOT_RESULT=''
 if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then

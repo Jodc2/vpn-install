@@ -205,7 +205,9 @@ exit_ssh_defaults() {  # пользователь и порт SSH старого
 # файл в install-vpn.sh (__EMBED_BOT_FUNCS__); здесь только функции и значения по умолчанию.
 # Секреты — только в файлах $BOT_DIR (600), в argv процессов их нет: curl берёт заголовок с токеном
 # Cloudflare из файла (-H @файл), адрес с токеном бота — из своего конфига (-K файл).
-BOT_WORKER=${VPN_BOT_WORKER:-vpn-bot}   # другое имя — второй бот в том же аккаунте Cloudflare (и проверка скрипта)
+BOT_WORKER=${VPN_BOT_WORKER:-vpn-bot}   # имя воркера; занято VPN другого сервера — свой воркер (bot_validate)
+BOT_WORKER_AUTO=1   # имя не задано явно (VPN_BOT_WORKER) и не запомнено прошлой установкой — его можно сменить
+[ -z "${VPN_BOT_WORKER:-}" ] || BOT_WORKER_AUTO=0
 BOT_CRON='0 */3 * * *'
 CF_API_BASE=${CF_API_BASE:-https://api.cloudflare.com/client/v4}
 TG_API_BASE=${TG_API_BASE:-https://api.telegram.org}
@@ -714,19 +716,31 @@ b = (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or []
 sys.exit(0 if any(x.get("name") == sys.argv[2] for x in b) else 1)' "$BOT_DIR/settings.json" "$1"
 }
 
-bot_other_server_ok() {  # наш воркер управляет VPN другого сервера (второй сервер в том же аккаунте)? — только с «да»
+bot_other_server() {  # наш воркер управляет VPN другого сервера (второй сервер в том же аккаунте)? → 0, BOT_OTHER_DN/IP
 	local dn zone ip='' body
-	[ "${BOT_EXISTING:-}" = ours ] || return 0
+	BOT_OTHER_DN='' BOT_OTHER_IP=''
+	[ "${BOT_EXISTING:-}" = ours ] || return 1
 	dn=$(bot_plain DNS_NAME)
-	[ -n "$dn" ] && [ "$dn" != "$DOMAIN" ] || return 0
+	[ -n "$dn" ] && [ "$dn" != "$DOMAIN" ] || return 1
 	zone=$(bot_plain CF_ZONE_ID)
 	if body=$(cf_api GET "/zones/${zone:-$BOT_ZONE}/dns_records?type=A&name=$dn") && cf_ok <<< "$body"; then
 		ip=$(jget result.0.content <<< "$body")
 	fi
-	[ "$ip" != "$PUBLIC_IP" ] || return 0   # тот же сервер, сменился только домен
-	bot_consent "Воркер $BOT_WORKER в этом аккаунте Cloudflare управляет VPN на $dn${ip:+ ($ip)} — перенастроить его на этот сервер? Тот VPN останется без бота, а его бэкап в Cloudflare заменится бэкапом этого" && return 0
-	BOT_ERR="воркер $BOT_WORKER уже управляет VPN на $dn — не трогаю. Второму серверу нужен свой бот: другой токен от @BotFather и VPN_BOT_WORKER=другое-имя"
+	[ "$ip" != "$PUBLIC_IP" ] || return 1   # тот же сервер, сменился только домен
+	BOT_OTHER_DN=$dn BOT_OTHER_IP=$ip
+}
+bot_other_server_ok() {  # имя воркера задано явно, а он управляет VPN другого сервера — забрать только с «да»
+	bot_other_server || return 0
+	bot_consent "Воркер $BOT_WORKER в этом аккаунте Cloudflare управляет VPN на $BOT_OTHER_DN${BOT_OTHER_IP:+ ($BOT_OTHER_IP)} — перенастроить его на этот сервер? Тот VPN останется без бота, а его бэкап в Cloudflare заменится бэкапом этого" && return 0
+	BOT_ERR="воркер $BOT_WORKER уже управляет VPN на $BOT_OTHER_DN — не трогаю. Для этого сервера запустите без VPN_BOT_WORKER: скрипт заведёт отдельный воркер"
 	return 1
+}
+bot_worker_name() {  # bot_worker_name N → имя отдельного воркера для этого домена: vpn-bot-<домен>[-N], до 63 символов
+	local w
+	w=vpn-bot-$(printf '%s' "$DOMAIN" | tr 'A-Z.' 'a-z-' | tr -cd 'a-z0-9-')
+	if [ "$1" -gt 1 ]; then w=${w:0:$((62 - ${#1}))}; w="${w%%-}-$1"; else w=${w:0:63}; fi
+	while [ "${w%-}" != "$w" ]; do w=${w%-}; done
+	printf '%s' "$w"
 }
 
 bot_kv_admin() {  # владелец из KV нашего воркера (admin:id — так его хранит бот, поставленный руками) → id или пусто
@@ -737,8 +751,25 @@ bot_kv_admin() {  # владелец из KV нашего воркера (admin:
 }
 
 bot_validate() {  # всё, что проверяется до установки: токены, чужой воркер и вебхук, бот другого сервера, владелец
+	local n=0 was why
 	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ADMIN_ID='' BOT_ADMIN_NAME=''
 	bot_cf_check || return 1
+	# Имя не задано явно, а воркер с ним — чужой или управляет VPN другого сервера: этому серверу — свой воркер.
+	while [ "${BOT_WORKER_AUTO:-0}" = 1 ]; do
+		if [ "$BOT_EXISTING" = foreign ]; then
+			why="в аккаунте уже есть и он не от установщика"
+		elif bot_other_server; then
+			why="управляет VPN на $BOT_OTHER_DN"
+		else
+			break
+		fi
+		n=$((n + 1))
+		[ "$n" -le 5 ] || { BOT_ERR="не нашлось свободного имени воркера — задайте своё: VPN_BOT_WORKER=имя"; return 1; }
+		was=$BOT_WORKER
+		BOT_WORKER=$(bot_worker_name "$n")
+		printf '  …     воркер %s %s — для этого сервера отдельный бот: воркер %s\n' "$was" "$why" "$BOT_WORKER"
+		bot_cf_check || return 1
+	done
 	if [ "$BOT_EXISTING" = foreign ] && ! bot_consent "Воркер $BOT_WORKER в аккаунте Cloudflare уже есть, и он не от установщика — перезаписать?"; then
 		BOT_ERR="воркер $BOT_WORKER в аккаунте Cloudflare не от установщика — не трогаю"
 		return 1
@@ -748,7 +779,7 @@ bot_validate() {  # всё, что проверяется до установк�
 		bot_tg_check || return 1
 		# Чужой вебхук (вставили токен рабочего бота) — только с явного «да», будет привязка или нет.
 		if ! bot_hook_is_ours && ! bot_consent "Бот @$BOT_USERNAME сейчас подключён к $(bot_hook_host) — перенастроить его на этот сервер?"; then
-			BOT_ERR="бот @$BOT_USERNAME подключён к другому адресу ($(bot_hook_host)) — его не трогаю"
+			BOT_ERR="бот @$BOT_USERNAME подключён к другому адресу ($(bot_hook_host)) — его не трогаю; для этого VPN нужен отдельный бот: @BotFather → /newbot"
 			return 1
 		fi
 	elif [ "$BOT_EXISTING" != ours ]; then
@@ -2308,6 +2339,7 @@ S_BOT_ORIGIN=$(state_val S_BOT_ORIGIN || true)
 S_BOT_WORKER=$(state_val S_BOT_WORKER || true)
 S_BOT_SSH_PORT=$(state_val S_BOT_SSH_PORT || true)
 [ -n "${VPN_BOT_WORKER:-}" ] || BOT_WORKER=${S_BOT_WORKER:-vpn-bot}
+[ -z "${S_BOT_WORKER:-}" ] || BOT_WORKER_AUTO=0   # воркер прошлой установки молча не меняем
 SSH_PORT_NOW=$(sshd -T 2> /dev/null | awk '$1 == "port" {print $2; exit}' || true)
 BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_SKIP='' BOT_RESULT=''
 if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then

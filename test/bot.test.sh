@@ -172,8 +172,8 @@ test_pair_timeout() {
 	! bot_pair 1 || t_fail "привязал без сообщений"
 	t_has "не дождался" "$BOT_ERR" "причина"
 }
-test_validate_foreign_worker_declined() {
-	base_env; good_cf
+test_validate_foreign_worker_declined() {  # имя воркера задано явно — чужой перезаписывается только с «да»
+	base_env; good_cf; BOT_WORKER_AUTO=0
 	cf_set "GET /accounts/A1/workers/scripts/vpn-bot/settings" '{"success":true,"result":{"bindings":[]}}'
 	answers n
 	! bot_validate || t_fail "прошла с чужим воркером"
@@ -616,8 +616,8 @@ other_server_env() {  # наш воркер, но управляет он VPN н
 	cf_set "GET /accounts/A1/workers/scripts/vpn-bot/settings" '{"success":true,"result":{"bindings":[{"type":"plain_text","name":"VPN_BOT_INSTALLER","text":"1"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.other.org"},{"type":"plain_text","name":"CF_ZONE_ID","text":"Z2"}]}}'
 	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://vpn-bot.sub1.workers.dev/tg"}}'
 }
-test_validate_bot_of_other_server_needs_consent() {  # C2: второй сервер в том же аккаунте
-	other_server_env
+test_validate_bot_of_other_server_needs_consent() {  # C2, имя задано явно: забрать бота другого сервера — только с «да»
+	other_server_env; BOT_WORKER_AUTO=0
 	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.other.org" '{"success":true,"result":[{"id":"R2","content":"9.9.9.9","proxied":false}]}'
 	answers n
 	! bot_validate || t_fail "забрал бота другого сервера без вопроса"
@@ -625,13 +625,13 @@ test_validate_bot_of_other_server_needs_consent() {  # C2: второй серв
 	t_has "vpn.other.org" "$BOT_ERR" "причина называет тот домен"
 }
 test_validate_bot_of_other_server_enter_is_no() {
-	other_server_env
+	other_server_env; BOT_WORKER_AUTO=0
 	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.other.org" '{"success":true,"result":[{"id":"R2","content":"9.9.9.9","proxied":false}]}'
 	answers ''
 	! bot_validate || t_fail "Enter сошёл за согласие"
 }
 test_validate_bot_of_unknown_server_asks() {  # A-запись того домена не прочитать — считаем, что сервер другой
-	other_server_env
+	other_server_env; BOT_WORKER_AUTO=0
 	answers n
 	! bot_validate || t_fail "без проверки решил, что сервер тот же"
 }
@@ -642,6 +642,68 @@ test_validate_same_server_new_domain_no_question() {  # домен сменил�
 	bot_validate || t_fail "не прошла: $BOT_ERR"
 	[ ! -s "$WORK/tty.out" ] || t_fail "лишний вопрос: $(cat "$WORK/tty.out")"
 }
+second_env() {  # имя vpn-bot занято ботом VPN другого сервера; токен бота — новый (вебхука нет)
+	validate_env
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot/settings" '{"success":true,"result":{"bindings":[{"type":"plain_text","name":"VPN_BOT_INSTALLER","text":"1"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.other.org"},{"type":"plain_text","name":"CF_ZONE_ID","text":"Z2"}]}}'
+	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.other.org" '{"success":true,"result":[{"id":"R2","content":"9.9.9.9","proxied":false}]}'
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot-vpn-example-com/settings" '{"success":false,"errors":[{"code":10007,"message":"This Worker does not exist on your account."}]}'
+	VPN_BOT_ADMIN_ID=42
+	answers ''
+}
+test_validate_other_server_gets_own_worker() {  # второй сервер в том же аккаунте — свой воркер, без вопросов
+	second_env
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq vpn-bot-vpn-example-com "$BOT_WORKER" "отдельный воркер под этот домен"
+	t_eq none "$BOT_EXISTING" "воркер новый"
+	! grep -q '\[y/N\]' "$WORK/tty.out" 2> /dev/null || t_fail "спросил, хотя мог завести свой воркер: $(cat "$WORK/tty.out")"
+}
+test_validate_foreign_default_worker_gets_own_worker() {  # имя vpn-bot занято чужим воркером — тоже свой воркер
+	second_env
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot/settings" '{"success":true,"result":{"bindings":[]}}'
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq vpn-bot-vpn-example-com "$BOT_WORKER" "отдельный воркер"
+	! grep -q '\[y/N\]' "$WORK/tty.out" 2> /dev/null || t_fail "спросил про чужой воркер"
+}
+test_validate_auto_worker_name_taken_too() {  # и vpn-bot-<домен> занят ботом третьего сервера — номер
+	second_env
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot-vpn-example-com/settings" '{"success":true,"result":{"bindings":[{"type":"plain_text","name":"VPN_BOT_INSTALLER","text":"1"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.third.org"},{"type":"plain_text","name":"CF_ZONE_ID","text":"Z2"}]}}'
+	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.third.org" '{"success":true,"result":[{"id":"R3","content":"8.8.8.8","proxied":false}]}'
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot-vpn-example-com-2/settings" '{"success":false,"errors":[{"code":10007,"message":"This Worker does not exist on your account."}]}'
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq vpn-bot-vpn-example-com-2 "$BOT_WORKER" "следующее свободное имя"
+}
+test_validate_auto_reuses_worker_of_this_domain() {  # повтор на том же сервере: vpn-bot-<домен> уже его — остаётся
+	second_env
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot-vpn-example-com/settings" '{"success":true,"result":{"bindings":[{"type":"plain_text","name":"VPN_BOT_INSTALLER","text":"1"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.example.com"}]}}'
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://vpn-bot-vpn-example-com.sub1.workers.dev/tg"}}'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq vpn-bot-vpn-example-com "$BOT_WORKER" "свой воркер"; t_eq ours "$BOT_EXISTING" "наш"
+}
+test_validate_second_worker_with_first_bots_token() {  # для второго воркера вставили токен уже работающего бота
+	second_env
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://vpn-bot.sub1.workers.dev/tg"}}'
+	! bot_validate || t_fail "перехватил вебхук работающего бота"
+	t_eq vpn-bot-vpn-example-com "$BOT_WORKER" "воркер — отдельный"
+	t_has "подключён к другому адресу" "$BOT_ERR" "причина — вебхук бота, а не воркер"
+	t_has "@BotFather" "$BOT_ERR" "подсказка: нужен другой бот"
+	! grep -qE '^(deleteWebhook|setWebhook)' "$WORK/tg.calls" || t_fail "вебхук тронут"
+}
+test_worker_name_valid() {  # имя воркера: строчные, цифры, дефис; до 63 символов; без дефиса на краях
+	DOMAIN=Very-Long-Subdomain-Name-That-Goes-On.and-another-quite-long-label.example.com
+	local n w
+	for n in 1 2 12; do
+		w=$(bot_worker_name "$n")
+		[ "${#w}" -le 63 ] || t_fail "длиннее 63: $w"
+		[[ $w =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || t_fail "недопустимые символы или дефис на краю: $w"
+		case $w in vpn-bot-*) ;; *) t_fail "не с vpn-bot-: $w" ;; esac
+	done
+	[ "$(bot_worker_name 1)" != "$(bot_worker_name 2)" ] || t_fail "номер не меняет имя"
+	case $(bot_worker_name 12) in *-12) ;; *) t_fail "номер не в конце: $(bot_worker_name 12)" ;; esac
+}
+
 manual_bot_env() {  # бот, поставленный руками: наш по KV, владелец — в KV admin:id, секрета ADMIN_ID нет
 	base_env; good_cf
 	cf_set "GET /accounts/A1/storage/kv/namespaces?per_page=100" '{"success":true,"result":[{"id":"K1","title":"vpn-bot-state"}]}'
