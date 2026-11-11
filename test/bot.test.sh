@@ -724,6 +724,46 @@ test_validate_manual_bot_no_owner_no_token() {
 	! bot_validate || t_fail "прошла без владельца и без токена бота"
 	t_has "токен бота" "$BOT_ERR" "понятная причина"
 }
+test_validate_admins_list_from_kv() {  # бот уже ведёт список админов (KV admins) — первый из него, без привязки
+	manual_bot_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins" '[{"id":555,"name":"Оля"},{"id":123456789,"name":"Антон"}]'
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admin%3Aid" '{"success":false,"errors":[{"code":10009,"message":"key not found"}]}'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq 555 "$BOT_ADMIN_ID" "админ из списка бота"
+	t_eq 0 "${BOT_ADMIN_GRANT:-0}" "из KV — не «явно задан»: в список не дописываем"
+	! grep -q '^getUpdates' "$WORK/tg.calls" 2> /dev/null || t_fail "привязывал заново"
+}
+test_validate_explicit_admin_is_granted() {  # VPN_BOT_ADMIN_ID — явное «этот человек — админ»: попадёт и в список бота
+	validate_env; VPN_BOT_ADMIN_ID=42
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq 42 "$BOT_ADMIN_ID" "админ"
+	t_eq 1 "${BOT_ADMIN_GRANT:-0}" "дописать в список бота"
+}
+test_deploy_grants_explicit_admin_into_bot_list() {  # бот уже ведёт список — ADMIN_ID его не меняет, дописываем сами
+	deploy_env; BOT_ADMIN_GRANT=1 BOT_ADMIN_NAME="Аня (@anya)"
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins" '[{"id":7,"name":"Антон"}]'
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	grep -qx 'PUT /accounts/A1/storage/kv/namespaces/K1/values/admins' "$WORK/cf.calls" || t_fail "список админов не записан"
+	t_eq "7:Антон 42:Аня (@anya)" "$(python3 -I -c 'import json, sys; print(" ".join("%d:%s" % (a["id"], a["name"]) for a in json.load(open(sys.argv[1]))))' "$(ls "$WORK"/cap.*.admins.json | tail -1)")" "список: прежние + новый"
+}
+test_deploy_grant_keeps_list_when_admin_already_there() {
+	deploy_env; BOT_ADMIN_GRANT=1
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins" '[{"id":42,"name":"Аня"}]'
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	! grep -q 'values/admins$' <(grep '^PUT' "$WORK/cf.calls") || t_fail "переписал список, где админ уже есть"
+}
+test_deploy_no_grant_without_bot_list() {  # списка ещё нет — бот возьмёт первого админа из ADMIN_ID сам
+	deploy_env; BOT_ADMIN_GRANT=1
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins" '{"success":false,"errors":[{"code":10009,"message":"key not found"}]}'
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	! grep -q '^PUT .*values/admins$' "$WORK/cf.calls" || t_fail "завёл список вместо бота"
+}
+test_deploy_no_grant_when_admin_not_explicit() {  # ADMIN_ID унаследован — список бота не трогаем совсем
+	deploy_env; BOT_ADMIN_GRANT=0
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	! grep -q 'values/admins$' "$WORK/cf.calls" || t_fail "трогал список админов"
+}
 test_validate_admin_id_must_be_number() {  # I6: @имя вместо id дало бы немого бота при «✓»
 	validate_env; VPN_BOT_ADMIN_ID=@ann
 	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'

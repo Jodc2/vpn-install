@@ -58,7 +58,8 @@
 #   --exit-stop-xui   выключить 3x-ui на старом сервере (если он теперь только выход); --exit-keep-xui — оставить
 #   --bot             (с доменом в Cloudflare) поставить или обновить Телеграм-бота для управления VPN: клиенты,
 #                     статистика, проверка блокировки, бэкапы, переезд. Токены — CF_API_TOKEN и VPN_BOT_TOKEN в
-#                     окружении или спросит; владелец — VPN_BOT_ADMIN_ID или привязка в терминале (написать боту)
+#                     окружении или спросит; первый админ — VPN_BOT_ADMIN_ID или привязка в терминале (написать
+#                     боту); остальных админов добавляют в самом боте, повтор с VPN_BOT_ADMIN_ID дописывает этот id
 #   --no-bot          не ставить бота и не спрашивать про него (запоминается)
 # Повторный запуск безопасен: ключи, пароли, клиенты и выбранный выход сохраняются (/etc/vpn-install.env).
 set -euo pipefail
@@ -494,7 +495,8 @@ if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
 		cat > /dev/tty <<'EOF'
 
 Телеграм-бот для управления VPN: клиенты (создать — ссылка на подписку, выключить, удалить),
-статистика, проверка блокировки в России раз в 3 часа, бэкапы и переезд на новый сервер кнопкой.
+статистика, проверка блокировки в России раз в 3 часа, бэкапы, переезд на новый сервер кнопкой
+и несколько админов (приглашение ссылкой).
 Бесплатно, на вашем аккаунте Cloudflare. Нужны домен в Cloudflare и бот от @BotFather.
 EOF
 		if bot_consent "Поставить бота?"; then BOT_DO=1; else S_BOT=0; fi
@@ -2254,7 +2256,7 @@ if [ "$BOT_DO" = 1 ]; then
 		BOT_TRY=$((BOT_TRY + 1))
 	done
 	if [ "$BOT_DO" = 1 ]; then
-		ok "бот${BOT_USERNAME:+ @$BOT_USERNAME}: домен $DOMAIN в Cloudflare${BOT_ADMIN_NAME:+, владелец — $BOT_ADMIN_NAME}"
+		ok "бот${BOT_USERNAME:+ @$BOT_USERNAME}: домен $DOMAIN в Cloudflare${BOT_ADMIN_NAME:+, админ — $BOT_ADMIN_NAME}"
 		bot_keys "$([ "$EXIT_MODE" = chain ] && [ -n "$EXIT_HOST" ] && echo 1 || echo 0)"
 		if [ "$BOT_KEY_NEW" = 1 ]; then BOT_PUBKEY=$(cat "$BOT_DIR/id.pub"); fi
 	else

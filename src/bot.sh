@@ -457,7 +457,7 @@ bot_consent() {  # bot_consent ВОПРОС → 0 только на явное �
 bot_pair() {  # bot_pair [СЕКУНД=300] → BOT_ADMIN_ID BOT_ADMIN_NAME: кто написал боту и подтвердил «это я»
 	local secs=${1:-300} deadline left offset=0 body uid fid fname uname ctype try
 	BOT_ADMIN_ID='' BOT_ADMIN_NAME='' BOT_ERR=''
-	bot_tty_ok || { BOT_ERR="привязать владельца можно только в терминале (или задайте VPN_BOT_ADMIN_ID)"; return 1; }
+	bot_tty_ok || { BOT_ERR="привязать первого админа бота можно только в терминале (или задайте VPN_BOT_ADMIN_ID)"; return 1; }
 	if [ -n "${BOT_HOOK_URL:-}" ]; then   # чужой вебхук доходит сюда только с явного «да» (bot_validate)
 		echo '{"drop_pending_updates":false}' > "$BOT_DIR/req.json"
 		body=$(tg_api deleteWebhook "$BOT_DIR/req.json") || { BOT_ERR="Телеграм не отвечает"; return 1; }
@@ -542,16 +542,43 @@ bot_worker_name() {  # bot_worker_name N → имя отдельного вор�
 	printf '%s' "$w"
 }
 
-bot_kv_admin() {  # владелец из KV нашего воркера (admin:id — так его хранит бот, поставленный руками) → id или пусто
+bot_kv_admin() {  # админ из KV нашего воркера: первый из списка admins (его ведёт бот) или admin:id (бот, поставленный руками) → id или пусто
 	local v
 	[ "${BOT_EXISTING:-}" = ours ] && [ -n "${BOT_KV_ID:-}" ] || return 0
+	v=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admins" 2> /dev/null) || v=
+	v=$(python3 -I -c 'import json, sys
+try:
+    a = json.loads(sys.argv[1])
+    print(next(x["id"] for x in a if isinstance(x, dict) and type(x.get("id")) is int and x["id"] > 0))
+except Exception:
+    pass' "$v")
+	if [[ $v =~ ^[0-9]+$ ]]; then printf '%s' "$v"; return 0; fi
 	v=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admin%3Aid" 2> /dev/null) || return 0
 	if [[ $v =~ ^[0-9]+$ ]]; then printf '%s' "$v"; fi
+}
+bot_kv_grant() {  # админ, заданный явно (VPN_BOT_ADMIN_ID, «это ты?»), — в список админов бота, если бот его уже ведёт
+	local body
+	[ "${BOT_ADMIN_GRANT:-0}" = 1 ] && [ -n "${BOT_ADMIN_ID:-}" ] && [ -n "${BOT_KV_ID:-}" ] || return 0
+	body=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admins" 2> /dev/null) || return 0
+	# Списка нет — бот возьмёт первого админа из ADMIN_ID сам; админ уже в списке — писать нечего.
+	python3 -I -c 'import json, sys
+try:
+    a = json.loads(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+uid = int(sys.argv[2])
+if not isinstance(a, list) or not a or any(isinstance(x, dict) and x.get("id") == uid for x in a):
+    sys.exit(1)
+a.append({"id": uid, "name": sys.argv[3]})
+print(json.dumps(a, ensure_ascii=False))' "$body" "$BOT_ADMIN_ID" "${BOT_ADMIN_NAME:-}" > "$BOT_DIR/admins.json" || return 0
+	body=$(cf_api PUT "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admins" --data-binary @"$BOT_DIR/admins.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
+	cf_ok <<< "$body" || { BOT_ERR="не дописать админа в список бота — $(cf_err <<< "$body")"; return 1; }
+	BOT_REPORT+="админ ${BOT_ADMIN_NAME:-$BOT_ADMIN_ID} добавлен в список админов бота ✓"$'\n'
 }
 
 bot_validate() {  # всё, что проверяется до установки: токены, чужой воркер и вебхук, бот другого сервера, владелец
 	local n=0 was why
-	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ADMIN_ID='' BOT_ADMIN_NAME=''
+	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ADMIN_ID='' BOT_ADMIN_NAME='' BOT_ADMIN_GRANT=0
 	bot_cf_check || return 1
 	# Имя не задано явно, а воркер с ним — чужой или управляет VPN другого сервера: этому серверу — свой воркер.
 	while [ "${BOT_WORKER_AUTO:-0}" = 1 ]; do
@@ -590,16 +617,17 @@ bot_validate() {  # всё, что проверяется до установк�
 			BOT_ERR="VPN_BOT_ADMIN_ID — числовой id в Телеграме (вида 123456789), а не @имя"
 			return 1
 		fi
-		BOT_ADMIN_ID=$VPN_BOT_ADMIN_ID
+		BOT_ADMIN_ID=$VPN_BOT_ADMIN_ID BOT_ADMIN_GRANT=1
 	elif bot_has_binding ADMIN_ID; then
 		:   # владелец прежний
 	elif BOT_ADMIN_ID=$(bot_kv_admin) && [ -n "$BOT_ADMIN_ID" ]; then
 		:   # бот, поставленный руками: владелец записан в его KV — сохраняется
 	elif [ ! -s "$BOT_DIR/tg.token" ]; then
-		BOT_ERR="у бота нет владельца, а привязать его можно только по токену бота — дай токен бота (или VPN_BOT_ADMIN_ID)"
+		BOT_ERR="у бота нет админа, а привязать первого можно только по токену бота — дай токен бота (или VPN_BOT_ADMIN_ID)"
 		return 1
 	else
 		bot_pair || return 1
+		BOT_ADMIN_GRANT=1
 	fi
 }
 
@@ -815,6 +843,7 @@ for x in (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or [
 	[ "$(cat "$BOT_DIR/fpr.json")" != "[]" ] || { BOT_ERR="не найдены ключи SSH этого сервера ($BOT_HOST_KEYS)"; return 1; }
 	body=$(cf_api PUT "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/entry%3Afpr" --data-binary @"$BOT_DIR/fpr.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
 	cf_ok <<< "$body" || { BOT_ERR="не записать отпечаток сервера в KV — $(cf_err <<< "$body")"; return 1; }
+	bot_kv_grant || return 1
 	# Первый бэкап — сразу в хранилище: переезд работает с первой минуты. Не вышло — не беда, бот снимет сам.
 	if [ -x "$BOT_BACKUP_CMD" ] && p=$("$BOT_BACKUP_CMD" 2> /dev/null | tail -1) && [ -f "$p" ]; then
 		python3 -I -c 'import json, os, sys, time; print(json.dumps({"name": os.path.basename(sys.argv[1]), "size": os.path.getsize(sys.argv[1]), "createdAt": int(time.time() * 1000)}))' "$p" > "$BOT_DIR/backup.meta"
@@ -865,7 +894,7 @@ d = base.get("dns") or {}
 line(d.get("ok"), "A-запись: %s ✓" % d.get("ip"), "бот не видит A-запись: %s" % d.get("error"))
 w = base.get("webhook") or {}
 line(w.get("ok"), "вебхук Телеграма ✓" + (" (последняя ошибка доставки: %s)" % w["error"] if w.get("error") else ""), "вебхук Телеграма не стоит: %s" % w.get("error"))
-line((base.get("admin") or {}).get("ok"), "владелец бота назначен ✓", "владелец бота не назначен")
+line((base.get("admin") or {}).get("ok"), "админ бота назначен ✓", "у бота нет админа")
 line(entry.get("ok"), "вход по SSH на этот сервер ✓", "вход по SSH на этот сервер не прошёл: %s" % entry.get("error"))
 if ex.get("ok"):
     out.append("выход по SSH ✓")

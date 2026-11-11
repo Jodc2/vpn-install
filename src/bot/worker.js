@@ -1,4 +1,8 @@
 // src/telegram.ts
+function userName(u) {
+  const name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim() || `id ${u.id}`;
+  return (u.username ? `${name} (@${u.username})` : name).slice(0, 80);
+}
 function markup(kb) {
   if (!kb) return void 0;
   return {
@@ -39,6 +43,10 @@ var Telegram = class {
       link_preview_options: { is_disabled: true },
       reply_markup: markup(kb)
     });
+  }
+  // Имя бота — для ссылки-приглашения t.me/<имя>?start=…
+  me() {
+    return this.call("getMe", {});
   }
   // Куда Телеграм шлёт обновления и была ли ошибка доставки (для самопроверки).
   webhookInfo() {
@@ -206,7 +214,69 @@ function mainMenu() {
       [{ text: "\u{1F4CA} \u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0430", data: "st" }],
       [{ text: "\u{1F30D} \u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u0431\u0430\u043D\u0430", data: "bn" }],
       [{ text: "\u{1F4BE} \u0411\u044D\u043A\u0430\u043F", data: "bk" }],
-      [{ text: "\u{1F69A} \u041F\u0435\u0440\u0435\u0435\u0437\u0434", data: "mg" }]
+      [{ text: "\u{1F69A} \u041F\u0435\u0440\u0435\u0435\u0437\u0434", data: "mg" }],
+      [{ text: "\u{1F46E} \u0410\u0434\u043C\u0438\u043D\u044B", data: "ad" }]
+    ]
+  };
+}
+var adminLabel = (a) => a.name || `id ${a.id}`;
+function adminList(admins, me) {
+  const lines = admins.map((a) => `\u2022 ${esc(adminLabel(a))}${a.id === me ? " \u2014 \u044D\u0442\u043E \u0442\u044B" : ""}`);
+  const kb = [];
+  if (admins.length > 1) {
+    for (const a of admins) {
+      kb.push([{ text: (a.id === me ? "\u{1F6AA} \u0412\u044B\u0439\u0442\u0438 \u0438\u0437 \u0430\u0434\u043C\u0438\u043D\u043E\u0432" : `\u{1F5D1} ${adminLabel(a)}`).slice(0, 60), data: `ax:${a.id}` }]);
+    }
+  }
+  kb.push([{ text: "\u2795 \u041F\u0440\u0438\u0433\u043B\u0430\u0441\u0438\u0442\u044C \u0430\u0434\u043C\u0438\u043D\u0430", data: "ai" }]);
+  kb.push([{ text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]);
+  const note = admins.length > 1 ? "\u0412\u0441\u0435 \u0430\u0434\u043C\u0438\u043D\u044B \u0440\u0430\u0432\u043D\u044B: \u043B\u044E\u0431\u043E\u0439 \u043C\u043E\u0436\u0435\u0442 \u043F\u0440\u0438\u0433\u043B\u0430\u0448\u0430\u0442\u044C \u0438 \u0443\u0431\u0438\u0440\u0430\u0442\u044C \u0434\u0440\u0443\u0433\u0438\u0445, \u0432 \u0442\u043E\u043C \u0447\u0438\u0441\u043B\u0435 \u0442\u0435\u0431\u044F." : "\u0422\u044B \u043F\u043E\u043A\u0430 \u0435\u0434\u0438\u043D\u0441\u0442\u0432\u0435\u043D\u043D\u044B\u0439 \u0430\u0434\u043C\u0438\u043D.";
+  return { text: `<b>\u0410\u0434\u043C\u0438\u043D\u044B \u0431\u043E\u0442\u0430</b> \u2014 ${admins.length}
+
+${lines.join("\n")}
+
+${note}`, kb };
+}
+function inviteScreen(link) {
+  return {
+    text: `<b>\u041F\u0440\u0438\u0433\u043B\u0430\u0448\u0435\u043D\u0438\u0435 \u0432 \u0430\u0434\u043C\u0438\u043D\u044B</b>
+
+\u041E\u0442\u043F\u0440\u0430\u0432\u044C \u044D\u0442\u0443 \u0441\u0441\u044B\u043B\u043A\u0443 \u0442\u043E\u043C\u0443, \u043A\u043E\u0433\u043E \u0445\u043E\u0447\u0435\u0448\u044C \u0441\u0434\u0435\u043B\u0430\u0442\u044C \u0430\u0434\u043C\u0438\u043D\u043E\u043C. \u041E\u043D\u0430 \u043E\u0434\u043D\u043E\u0440\u0430\u0437\u043E\u0432\u0430\u044F \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0441\u0443\u0442\u043A\u0438. \u041A\u043E\u0433\u0434\u0430 \u0447\u0435\u043B\u043E\u0432\u0435\u043A \u043E\u0442\u043A\u0440\u043E\u0435\u0442 \u0435\u0451 \u0438 \u043D\u0430\u0436\u043C\u0451\u0442 Start, \u044F \u0441\u043F\u0440\u043E\u0448\u0443 \u0442\u0435\u0431\u044F, \u0434\u043E\u0431\u0430\u0432\u043B\u044F\u0442\u044C \u043B\u0438 \u0435\u0433\u043E.
+
+<code>${esc(link)}</code>`,
+    kb: [[{ text: "\u2190 \u0410\u0434\u043C\u0438\u043D\u044B", data: "ad" }]]
+  };
+}
+function adminRequest(r) {
+  return {
+    text: `\u{1F46E} <b>${esc(r.name)}</b> (id ${r.id}) \u043E\u0442\u043A\u0440\u044B\u043B(\u0430) \u0442\u0432\u043E\u044E \u0441\u0441\u044B\u043B\u043A\u0443-\u043F\u0440\u0438\u0433\u043B\u0430\u0448\u0435\u043D\u0438\u0435. \u0421\u0434\u0435\u043B\u0430\u0442\u044C \u0430\u0434\u043C\u0438\u043D\u043E\u043C? \u0410\u0434\u043C\u0438\u043D \u043C\u043E\u0436\u0435\u0442 \u0432\u0441\u0451: \u043A\u043B\u0438\u0435\u043D\u0442\u044B, \u0431\u044D\u043A\u0430\u043F, \u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u0438 \u0434\u0440\u0443\u0433\u0438\u0435 \u0430\u0434\u043C\u0438\u043D\u044B \u2014 \u0432 \u0442\u043E\u043C \u0447\u0438\u0441\u043B\u0435 \u0443\u0431\u0440\u0430\u0442\u044C \u0442\u0435\u0431\u044F.`,
+    kb: [
+      [
+        { text: "\u2705 \u0421\u0434\u0435\u043B\u0430\u0442\u044C \u0430\u0434\u043C\u0438\u043D\u043E\u043C", data: `aa:${r.id}` },
+        { text: "\u2716\uFE0F \u041E\u0442\u043A\u0430\u0437\u0430\u0442\u044C", data: `ar:${r.id}` }
+      ]
+    ]
+  };
+}
+function confirmRemoveAdmin(a, self) {
+  if (self) {
+    return {
+      text: "\u0412\u044B\u0439\u0442\u0438 \u0438\u0437 \u0430\u0434\u043C\u0438\u043D\u043E\u0432? \u0423\u043F\u0440\u0430\u0432\u043B\u044F\u0442\u044C \u0431\u043E\u0442\u043E\u043C \u0442\u044B \u0431\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u0441\u043C\u043E\u0436\u0435\u0448\u044C \u2014 \u0432\u0435\u0440\u043D\u0443\u0442\u044C \u0442\u0435\u0431\u044F \u0441\u043C\u043E\u0436\u0435\u0442 \u0442\u043E\u043B\u044C\u043A\u043E \u0434\u0440\u0443\u0433\u043E\u0439 \u0430\u0434\u043C\u0438\u043D.",
+      kb: [
+        [
+          { text: "\u{1F6AA} \u0414\u0430, \u0432\u044B\u0439\u0442\u0438", data: `ax!:${a.id}` },
+          { text: "\u041E\u0442\u043C\u0435\u043D\u0430", data: "ad" }
+        ]
+      ]
+    };
+  }
+  return {
+    text: `\u0423\u0431\u0440\u0430\u0442\u044C <b>${esc(adminLabel(a))}</b> \u0438\u0437 \u0430\u0434\u043C\u0438\u043D\u043E\u0432? \u0423\u043F\u0440\u0430\u0432\u043B\u044F\u0442\u044C \u0431\u043E\u0442\u043E\u043C \u0431\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0441\u044F.`,
+    kb: [
+      [
+        { text: "\u{1F5D1} \u0414\u0430, \u0443\u0431\u0440\u0430\u0442\u044C", data: `ax!:${a.id}` },
+        { text: "\u041E\u0442\u043C\u0435\u043D\u0430", data: "ad" }
+      ]
     ]
   };
 }
@@ -347,14 +417,13 @@ function errorScreen(msg, back = "m") {
 }
 
 // src/state.ts
-var DIALOG_KEY = "dialog";
-async function getDialog(env) {
-  const v = await env.STATE.get(DIALOG_KEY, "json");
+async function getDialog(env, uid) {
+  const v = await env.STATE.get(`dialog:${uid}`, "json");
   return v || { mode: "idle" };
 }
-async function setDialog(env, d) {
-  if (d.mode === "idle") await env.STATE.delete(DIALOG_KEY);
-  else await env.STATE.put(DIALOG_KEY, JSON.stringify(d), { expirationTtl: 3600 });
+async function setDialog(env, uid, d) {
+  if (d.mode === "idle") await env.STATE.delete(`dialog:${uid}`);
+  else await env.STATE.put(`dialog:${uid}`, JSON.stringify(d), { expirationTtl: 3600 });
 }
 async function putBackup(env, name, bytes2) {
   const meta = { name, size: bytes2.byteLength, createdAt: Date.now() };
@@ -395,13 +464,67 @@ async function getEntryFpr(env) {
 async function setEntryFpr(env, fprs) {
   await env.STATE.put("entry:fpr", JSON.stringify(fprs));
 }
-async function getAdmin(env) {
-  if (env.ADMIN_ID && env.ADMIN_ID.trim()) return Number(env.ADMIN_ID);
-  const v = await env.STATE.get("admin:id");
-  return v ? Number(v) : null;
+var isId = (n) => typeof n === "number" && Number.isSafeInteger(n) && n > 0;
+async function storedAdmins(env) {
+  const v = await env.STATE.get("admins", "json");
+  if (!Array.isArray(v)) return [];
+  return v.filter((a) => a && isId(a.id)).map((a) => ({ id: a.id, name: String(a.name || "") }));
 }
-async function claimAdmin(env, id) {
-  await env.STATE.put("admin:id", String(id));
+async function listAdmins(env) {
+  const stored = await storedAdmins(env);
+  if (stored.length) return stored;
+  const seed = env.ADMIN_ID?.trim() || await env.STATE.get("admin:id") || "";
+  const id = Number(seed);
+  return isId(id) && String(id) === seed.trim() ? [{ id, name: "" }] : [];
+}
+async function claimable(env) {
+  return !(await storedAdmins(env)).length && !env.ADMIN_ID?.trim() && !await env.STATE.get("admin:id");
+}
+async function saveAdmins(env, list) {
+  await env.STATE.put("admins", JSON.stringify(list));
+}
+async function claimAdmin(env, a) {
+  await saveAdmins(env, [a]);
+  await env.STATE.put("admin:id", String(a.id));
+}
+async function addAdmin(env, a) {
+  const list = await listAdmins(env);
+  if (!list.some((x) => x.id === a.id)) await saveAdmins(env, [...list, a]);
+}
+async function removeAdmin(env, id) {
+  const list = await listAdmins(env);
+  if (!list.some((x) => x.id === id)) return "absent";
+  if (list.length < 2) return "last";
+  await saveAdmins(env, list.filter((x) => x.id !== id));
+  return "ok";
+}
+async function rememberName(env, list, id, name) {
+  const me = list.find((x) => x.id === id);
+  if (!me || me.name || !name) return;
+  me.name = name;
+  await saveAdmins(env, list);
+}
+var INVITE_TTL = 86400;
+async function createInvite(env, by) {
+  const token = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  await env.STATE.put(`inv:${token}`, JSON.stringify({ by, at: Date.now() }), { expirationTtl: INVITE_TTL });
+  return token;
+}
+async function peekInvite(env, token) {
+  if (!/^[0-9a-f]{32}$/.test(token)) return null;
+  return await env.STATE.get(`inv:${token}`, "json");
+}
+async function dropInvite(env, token) {
+  await env.STATE.delete(`inv:${token}`);
+}
+async function putRequest(env, r) {
+  await env.STATE.put(`areq:${r.id}`, JSON.stringify(r), { expirationTtl: INVITE_TTL });
+}
+async function getRequest(env, id) {
+  return await env.STATE.get(`areq:${id}`, "json");
+}
+async function dropRequest(env, id) {
+  await env.STATE.delete(`areq:${id}`);
 }
 async function getLastBan(env) {
   return await env.STATE.get("ban:last") || "";
@@ -1427,14 +1550,14 @@ async function parsePrivateKey(text, passphrase = "") {
     }
     throw new Error("no PEM private key was found in the text");
   }
-  const [, label, body = ""] = match;
-  if (/Proc-Type:\s*4,ENCRYPTED/.test(body) || label === "ENCRYPTED PRIVATE KEY") {
+  const [, label2, body = ""] = match;
+  if (/Proc-Type:\s*4,ENCRYPTED/.test(body) || label2 === "ENCRYPTED PRIVATE KEY") {
     throw new Error(
       "the PEM key is encrypted, which only OpenSSH files are here; ssh-keygen -p -f <file> rewrites it as one"
     );
   }
   const der = fromBase64(body.replace(/^[A-Za-z-]+:.*$/gm, ""));
-  switch (label) {
+  switch (label2) {
     case "OPENSSH PRIVATE KEY":
       return parseOpenSshKey(der, passphrase);
     case "RSA PRIVATE KEY":
@@ -1444,7 +1567,7 @@ async function parsePrivateKey(text, passphrase = "") {
     case "PRIVATE KEY":
       return isOpenSshKey(der) ? parseOpenSshKey(der, passphrase) : pkcs8(der);
     default:
-      throw new Error(`a "${label}" is not a private key this client reads`);
+      throw new Error(`a "${label2}" is not a private key this client reads`);
   }
 }
 
@@ -3690,8 +3813,8 @@ function sanitizeLabel(input) {
 function uniqueLabel(base, existing) {
   const taken = /* @__PURE__ */ new Set();
   for (const e of existing) taken.add(e.toLowerCase());
-  let label = base || "client";
-  if (!taken.has(label.toLowerCase())) return label;
+  let label2 = base || "client";
+  if (!taken.has(label2.toLowerCase())) return label2;
   for (let i = 2; i < 1e4; i++) {
     const cand = `${base}-${i}`;
     if (!taken.has(cand.toLowerCase())) return cand;
@@ -3850,6 +3973,13 @@ async function onDone(env, mig, rc, reportedIp, confirmedFpr) {
   };
 }
 
+// src/notify.ts
+async function notifyAdmins(env, text, kb, to) {
+  const tg = new Telegram(env);
+  const list = to ?? await listAdmins(env);
+  await Promise.allSettled(list.map((a) => tg.send(a.id, text, kb)));
+}
+
 // src/handlers.ts
 async function findClient(env, id) {
   const list = await listClients(env);
@@ -3871,44 +4001,68 @@ async function handleUpdate(env, update) {
   if (update.message) return onMessage(env, tg, update.message);
 }
 async function onMessage(env, tg, msg) {
-  const from = msg.from?.id;
+  const from = msg.from;
+  if (!from) return;
   const chat = msg.chat.id;
   const text = (msg.text || "").trim();
-  const admin = await getAdmin(env);
-  if (admin === null) {
-    if ((text === "/start" || text.toLowerCase() === "\u043C\u0435\u043D\u044E") && from !== void 0) {
-      await claimAdmin(env, from);
-      await setDialog(env, { mode: "idle" });
+  const admins = await listAdmins(env);
+  if (!admins.some((a) => a.id === from.id)) {
+    if (!admins.length && (text === "/start" || text.toLowerCase() === "\u043C\u0435\u043D\u044E") && await claimable(env)) {
+      await claimAdmin(env, { id: from.id, name: userName(from) });
+      await setDialog(env, from.id, { mode: "idle" });
       await tg.send(chat, "\u0413\u043E\u0442\u043E\u0432\u043E \u2014 \u0442\u0435\u043F\u0435\u0440\u044C \u044D\u0442\u043E\u0442 \u0431\u043E\u0442 \u0442\u0432\u043E\u0439. " + mainMenu().text, mainMenu().kb);
+      return;
     }
+    const inv = /^\/start\s+(\S+)$/.exec(text);
+    if (inv) return onInvite(env, tg, from, chat, inv[1], admins);
     return;
   }
-  if (from !== admin) return;
-  if (text === "/start" || text.toLowerCase() === "\u043C\u0435\u043D\u044E") {
-    await setDialog(env, { mode: "idle" });
+  await rememberName(env, admins, from.id, userName(from));
+  if (text === "/start" || text.startsWith("/start ") || text.toLowerCase() === "\u043C\u0435\u043D\u044E") {
+    await setDialog(env, from.id, { mode: "idle" });
     await tg.send(chat, mainMenu().text, mainMenu().kb);
     return;
   }
-  const dialog = await getDialog(env);
+  const uid = from.id;
+  const dialog = await getDialog(env, uid);
   switch (dialog.mode) {
     case "add_name":
-      return addClientFromName(env, tg, chat, text);
+      return addClientFromName(env, tg, chat, uid, text);
     case "mig_host":
-      return migGotHost(env, tg, chat, text);
+      return migGotHost(env, tg, chat, uid, text);
     case "mig_user":
-      return migGotUser(env, tg, chat, dialog.host, text);
+      return migGotUser(env, tg, chat, uid, dialog.host, text);
     case "mig_pass":
-      return migGotPass(env, tg, chat, dialog.host, dialog.user, text);
+      return migGotPass(env, tg, chat, uid, dialog.host, dialog.user, text);
     default:
       await tg.send(chat, "\u041D\u0435 \u043F\u043E\u043D\u044F\u043B. \u041E\u0442\u043A\u0440\u043E\u0439 \u043C\u0435\u043D\u044E: /start", mainMenu().kb);
   }
 }
+async function onInvite(env, tg, from, chat, token, admins) {
+  const inv = await peekInvite(env, token);
+  if (!inv || !admins.some((a) => a.id === inv.by)) {
+    return void tg.send(chat, "\u0421\u0441\u044B\u043B\u043A\u0430-\u043F\u0440\u0438\u0433\u043B\u0430\u0448\u0435\u043D\u0438\u0435 \u043D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u0430: \u043E\u043D\u0430 \u043E\u0434\u043D\u043E\u0440\u0430\u0437\u043E\u0432\u0430\u044F \u0438 \u0436\u0438\u0432\u0451\u0442 \u0441\u0443\u0442\u043A\u0438. \u041F\u043E\u043F\u0440\u043E\u0441\u0438 \u043D\u043E\u0432\u0443\u044E.");
+  }
+  await dropInvite(env, token);
+  const req = { id: from.id, name: userName(from), by: inv.by, at: Date.now() };
+  await putRequest(env, req);
+  const ask = adminRequest(req);
+  try {
+    await tg.send(inv.by, ask.text, ask.kb);
+  } catch {
+    await notifyAdmins(env, ask.text, ask.kb, admins);
+  }
+  await tg.send(chat, "\u0417\u0430\u043F\u0440\u043E\u0441 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D. \u041A\u043E\u0433\u0434\u0430 \u0435\u0433\u043E \u043F\u043E\u0434\u0442\u0432\u0435\u0440\u0434\u044F\u0442, \u044F \u043D\u0430\u043F\u0438\u0448\u0443.");
+}
 async function onCallback(env, tg, cq) {
-  const admin = await getAdmin(env);
-  if (admin === null || cq.from.id !== admin) {
+  const admins = await listAdmins(env);
+  const me = admins.find((a) => a.id === cq.from.id);
+  if (!me) {
     await tg.answer(cq.id, "\u041D\u0435\u043B\u044C\u0437\u044F", true);
     return;
   }
+  await rememberName(env, admins, me.id, userName(cq.from));
+  const uid = me.id;
   const chat = cq.message?.chat.id ?? cq.from.id;
   const mid = cq.message?.message_id;
   const data = cq.data || "";
@@ -3958,7 +4112,7 @@ async function onCallback(env, tg, cq) {
       }
       case "ca":
         await tg.answer(cq.id);
-        await setDialog(env, { mode: "add_name" });
+        await setDialog(env, uid, { mode: "add_name" });
         return show(tg, chat, mid, {
           text: "\u041A\u0430\u043A \u043D\u0430\u0437\u0432\u0430\u0442\u044C \u043D\u043E\u0432\u043E\u0433\u043E \u043A\u043B\u0438\u0435\u043D\u0442\u0430? \u041F\u0440\u0438\u0448\u043B\u0438 \u0438\u043C\u044F (\u043D\u0430\u043F\u0440\u0438\u043C\u0435\u0440, \xAB\u0412\u0430\u0441\u044F\xBB).",
           kb: [[{ text: "\u041E\u0442\u043C\u0435\u043D\u0430", data: "cl" }]]
@@ -3975,11 +4129,38 @@ async function onCallback(env, tg, cq) {
         await tg.answer(cq.id, "\u0421\u043D\u0438\u043C\u0430\u044E \u0431\u044D\u043A\u0430\u043F\u2026");
         return runBackup(env, tg, chat, mid);
       }
-      case "mg":
+      case "mg": {
+        const busy = await migBusy(env);
+        if (busy) {
+          await tg.answer(cq.id);
+          return show(tg, chat, mid, errorScreen(busy, "m"));
+        }
         await tg.answer(cq.id, "\u0421\u043D\u0438\u043C\u0430\u044E \u0441\u0432\u0435\u0436\u0438\u0439 \u0431\u044D\u043A\u0430\u043F\u2026");
-        return migStart(env, tg, chat, mid);
+        return migStart(env, tg, chat, mid, uid);
+      }
       case "mgo":
-        return migConfirm(env, tg, cq, chat, mid);
+        return migConfirm(env, tg, cq, chat, mid, uid);
+      case "ad":
+        await tg.answer(cq.id);
+        return show(tg, chat, mid, adminList(admins, uid));
+      case "ai": {
+        await tg.answer(cq.id);
+        const token = await createInvite(env, uid);
+        const bot = await tg.me();
+        return show(tg, chat, mid, inviteScreen(`https://t.me/${bot.username}?start=${token}`));
+      }
+      case "ax": {
+        await tg.answer(cq.id);
+        const a = admins.find((x) => x.id === Number(arg));
+        if (!a) return show(tg, chat, mid, adminList(admins, uid));
+        return show(tg, chat, mid, confirmRemoveAdmin(a, a.id === uid));
+      }
+      case "ax!":
+        return removeAdmin2(env, tg, cq.id, chat, mid, admins, me, Number(arg));
+      case "aa":
+        return approveAdmin(env, tg, cq.id, chat, mid, admins, me, Number(arg));
+      case "ar":
+        return rejectAdmin(env, tg, cq.id, chat, mid, Number(arg));
       default:
         await tg.answer(cq.id);
     }
@@ -3988,6 +4169,69 @@ async function onCallback(env, tg, cq) {
     });
     await show(tg, chat, mid, errorScreen(e.message || "\u043E\u0448\u0438\u0431\u043A\u0430", "m"));
   }
+}
+var label = (a) => esc(a.name || `id ${a.id}`);
+async function removeAdmin2(env, tg, cqId, chat, mid, admins, me, id) {
+  const target = admins.find((a) => a.id === id);
+  const r = await removeAdmin(env, id);
+  if (r === "last") {
+    await tg.answer(cqId, "\u041D\u0435\u043B\u044C\u0437\u044F \u0443\u0431\u0440\u0430\u0442\u044C \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u0435\u0433\u043E \u0430\u0434\u043C\u0438\u043D\u0430 \u2014 \u0431\u043E\u0442 \u043E\u0441\u0442\u0430\u043D\u0435\u0442\u0441\u044F \u0431\u0435\u0437 \u0445\u043E\u0437\u044F\u0438\u043D\u0430", true);
+    return show(tg, chat, mid, adminList(admins, me.id));
+  }
+  const left = admins.filter((a) => a.id !== id);
+  if (r === "absent" || !target) {
+    await tg.answer(cqId, "\u0423\u0436\u0435 \u043D\u0435 \u0430\u0434\u043C\u0438\u043D");
+    return show(tg, chat, mid, adminList(left, me.id));
+  }
+  await setDialog(env, id, { mode: "idle" });
+  if (id === me.id) {
+    await tg.answer(cqId, "\u0413\u043E\u0442\u043E\u0432\u043E");
+    await show(tg, chat, mid, { text: "\u0422\u044B \u0431\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u0430\u0434\u043C\u0438\u043D \u044D\u0442\u043E\u0433\u043E \u0431\u043E\u0442\u0430.", kb: [] });
+    return notifyAdmins(env, `\u{1F46E} \u0411\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u0430\u0434\u043C\u0438\u043D \u0431\u043E\u0442\u0430: <b>${label(target)}</b> (\u043F\u043E \u0441\u0432\u043E\u0435\u043C\u0443 \u0440\u0435\u0448\u0435\u043D\u0438\u044E).`, void 0, left);
+  }
+  await tg.answer(cqId, "\u0423\u0431\u0440\u0430\u043D");
+  await show(tg, chat, mid, adminList(left, me.id));
+  await tg.send(id, "\u0422\u0435\u0431\u044F \u0443\u0431\u0440\u0430\u043B\u0438 \u0438\u0437 \u0430\u0434\u043C\u0438\u043D\u043E\u0432 \u0431\u043E\u0442\u0430.").catch(() => {
+  });
+  await notifyAdmins(
+    env,
+    `\u{1F46E} <b>${label(me)}</b> \u0443\u0431\u0440\u0430\u043B(\u0430) \u0438\u0437 \u0430\u0434\u043C\u0438\u043D\u043E\u0432: <b>${label(target)}</b>.`,
+    void 0,
+    left.filter((a) => a.id !== me.id)
+  );
+}
+async function approveAdmin(env, tg, cqId, chat, mid, admins, me, id) {
+  const req = await getRequest(env, id);
+  if (!req) {
+    await tg.answer(cqId, "\u0417\u0430\u043F\u0440\u043E\u0441 \u0443\u0441\u0442\u0430\u0440\u0435\u043B \u0438\u043B\u0438 \u0443\u0436\u0435 \u0440\u0430\u0437\u043E\u0431\u0440\u0430\u043D");
+    return show(tg, chat, mid, adminList(admins, me.id));
+  }
+  await addAdmin(env, { id: req.id, name: req.name });
+  await dropRequest(env, id);
+  await tg.answer(cqId, "\u0414\u043E\u0431\u0430\u0432\u043B\u0435\u043D");
+  await show(tg, chat, mid, {
+    text: `\u2705 <b>${esc(req.name)}</b> \u0442\u0435\u043F\u0435\u0440\u044C \u0430\u0434\u043C\u0438\u043D \u0431\u043E\u0442\u0430.`,
+    kb: [[{ text: "\u{1F46E} \u0410\u0434\u043C\u0438\u043D\u044B", data: "ad" }, { text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]]
+  });
+  await tg.send(req.id, "\u2705 \u0422\u0435\u0431\u044F \u0434\u043E\u0431\u0430\u0432\u0438\u043B\u0438 \u0432 \u0430\u0434\u043C\u0438\u043D\u044B \u0431\u043E\u0442\u0430.\n\n" + mainMenu().text, mainMenu().kb).catch(() => {
+  });
+  await notifyAdmins(
+    env,
+    `\u{1F46E} <b>${label(me)}</b> \u0434\u043E\u0431\u0430\u0432\u0438\u043B(\u0430) \u0432 \u0430\u0434\u043C\u0438\u043D\u044B: <b>${esc(req.name)}</b>.`,
+    void 0,
+    admins.filter((a) => a.id !== me.id && a.id !== req.id)
+  );
+}
+async function rejectAdmin(env, tg, cqId, chat, mid, id) {
+  const req = await getRequest(env, id);
+  await dropRequest(env, id);
+  await tg.answer(cqId, "\u041E\u0442\u043A\u0430\u0437\u0430\u043D\u043E");
+  await show(tg, chat, mid, {
+    text: req ? `\u2716\uFE0F \u041E\u0442\u043A\u0430\u0437\u0430\u043D\u043E: <b>${esc(req.name)}</b> \u043D\u0435 \u0441\u0442\u0430\u043D\u0435\u0442 \u0430\u0434\u043C\u0438\u043D\u043E\u043C.` : "\u0417\u0430\u043F\u0440\u043E\u0441 \u0443\u0436\u0435 \u0440\u0430\u0437\u043E\u0431\u0440\u0430\u043D.",
+    kb: [[{ text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]]
+  });
+  if (req) await tg.send(req.id, "\u0417\u0430\u043F\u0440\u043E\u0441 \u0432 \u0430\u0434\u043C\u0438\u043D\u044B \u043D\u0435 \u043F\u043E\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u043B\u0438.").catch(() => {
+  });
 }
 async function showCard(env, tg, chat, mid, id) {
   const [c, online] = await Promise.all([findClient(env, id), onlineEmails(env)]);
@@ -4023,16 +4267,16 @@ async function runBackup(env, tg, chat, mid) {
     await show(tg, chat, mid, errorScreen(`\u0431\u044D\u043A\u0430\u043F \u043D\u0435 \u0432\u044B\u0448\u0435\u043B: ${e.message}`, "m"));
   }
 }
-async function addClientFromName(env, tg, chat, name) {
-  await setDialog(env, { mode: "idle" });
+async function addClientFromName(env, tg, chat, uid, name) {
+  await setDialog(env, uid, { mode: "idle" });
   if (!name) return void tg.send(chat, "\u041F\u0443\u0441\u0442\u043E\u0435 \u0438\u043C\u044F. \u041D\u0430\u0436\u043C\u0438 \u2795 \u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0435\u0449\u0451 \u0440\u0430\u0437.", mainMenu().kb);
   const base = sanitizeLabel(name) || "client";
   const existing = await listClients(env);
-  const label = uniqueLabel(base, existing.map((c) => c.email));
+  const label2 = uniqueLabel(base, existing.map((c) => c.email));
   const inboundId = await firstInboundId(env);
-  await createClient(env, inboundId, label, name.slice(0, 80));
+  await createClient(env, inboundId, label2, name.slice(0, 80));
   const after = await listClients(env);
-  const created = after.find((c) => c.email === label);
+  const created = after.find((c) => c.email === label2);
   if (!created) return void tg.send(chat, "\u041A\u043B\u0438\u0435\u043D\u0442 \u0441\u043E\u0437\u0434\u0430\u043D, \u043D\u043E \u043D\u0435 \u043D\u0430\u0448\u0451\u043B\u0441\u044F \u043F\u0440\u0438 \u043F\u0435\u0440\u0435\u0447\u0438\u0442\u044B\u0432\u0430\u043D\u0438\u0438 \u2014 \u043E\u0442\u043A\u0440\u043E\u0439 \u0441\u043F\u0438\u0441\u043E\u043A.", mainMenu().kb);
   await tg.send(
     chat,
@@ -4042,7 +4286,12 @@ async function addClientFromName(env, tg, chat, name) {
     [[{ text: "\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0443", data: `c:${created.id}` }], [{ text: "\u2190 \u041A\u043B\u0438\u0435\u043D\u0442\u044B", data: "cl" }]]
   );
 }
-async function migStart(env, tg, chat, mid) {
+async function migBusy(env) {
+  const cur = await currentMigration(env);
+  if (!cur || cur.status === "done" || cur.status === "failed") return "";
+  return `\u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u0443\u0436\u0435 \u0438\u0434\u0451\u0442 \u2014 \u043D\u0430 ${cur.host}, \u0437\u0430\u043F\u0443\u0449\u0435\u043D ${ago(cur.startedAt)}. \u0414\u043E\u0436\u0434\u0438\u0441\u044C, \u043F\u043E\u043A\u0430 \u043E\u043D \u0437\u0430\u043A\u043E\u043D\u0447\u0438\u0442\u0441\u044F`;
+}
+async function migStart(env, tg, chat, mid, uid) {
   await show(tg, chat, mid, working("\u0421\u043D\u0438\u043C\u0430\u044E \u0441\u0432\u0435\u0436\u0438\u0439 \u0431\u044D\u043A\u0430\u043F \u0441\u043E \u0441\u0442\u0430\u0440\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430"));
   let pick2;
   try {
@@ -4051,12 +4300,12 @@ async function migStart(env, tg, chat, mid) {
       () => backupMeta(env)
     );
   } catch (e) {
-    await setDialog(env, { mode: "idle" });
+    await setDialog(env, uid, { mode: "idle" });
     return show(tg, chat, mid, errorScreen(`\u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u043D\u0435 \u043D\u0430\u0447\u0430\u0442: ${e.message}`, "m"));
   }
   const kb = (pick2.size / 1024).toFixed(0);
   const line = pick2.source === "fresh" ? `\u2705 \u0421\u0432\u0435\u0436\u0438\u0439 \u0431\u044D\u043A\u0430\u043F \u0441\u043D\u044F\u0442 (${kb} \u041A\u0411).` : `\u26A0\uFE0F \u0421\u0442\u0430\u0440\u044B\u0439 \u0441\u0435\u0440\u0432\u0435\u0440 \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B (${esc(pick2.error || "")}) \u2014 \u043F\u0435\u0440\u0435\u043D\u0435\u0441\u0443 \u0438\u0437 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u043E\u0433\u043E \u0431\u044D\u043A\u0430\u043F\u0430 (\u0441\u043D\u044F\u0442 ${ago(pick2.createdAt)}, ${kb} \u041A\u0411). \u041A\u043B\u0438\u0435\u043D\u0442\u044B, \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D\u043D\u044B\u0435 \u043F\u043E\u0441\u043B\u0435 \u043D\u0435\u0433\u043E, \u043D\u0435 \u043F\u0435\u0440\u0435\u043D\u0435\u0441\u0443\u0442\u0441\u044F.`;
-  await setDialog(env, { mode: "mig_host" });
+  await setDialog(env, uid, { mode: "mig_host" });
   return show(tg, chat, mid, {
     text: `<b>\u041F\u0435\u0440\u0435\u0435\u0437\u0434 \u043D\u0430 \u043D\u043E\u0432\u044B\u0439 \u0441\u0435\u0440\u0432\u0435\u0440</b>
 
@@ -4073,23 +4322,23 @@ function manualExitLine(env, ip, why2) {
 <code>${esc(manualAllowCmd(env, ip))}</code>
 AWS, Oracle \u2014 \u0435\u0449\u0451 \u0438 \u0432 \u043F\u0430\u043D\u0435\u043B\u0438 \u0445\u043E\u0441\u0442\u0435\u0440\u0430.`;
 }
-async function migGotHost(env, tg, chat, host) {
+async function migGotHost(env, tg, chat, uid, host) {
   const ip = host.trim();
   if (!/^[0-9a-zA-Z.:-]{3,100}$/.test(ip)) {
     return void tg.send(chat, "\u042D\u0442\u043E \u043D\u0435 \u043F\u043E\u0445\u043E\u0436\u0435 \u043D\u0430 IP \u0438\u043B\u0438 \u0438\u043C\u044F. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437 \u0438\u043B\u0438 /start \u0434\u043B\u044F \u043E\u0442\u043C\u0435\u043D\u044B.");
   }
-  await setDialog(env, { mode: "mig_user", host: ip });
+  await setDialog(env, uid, { mode: "mig_user", host: ip });
   await tg.send(chat, `\u0421\u0435\u0440\u0432\u0435\u0440: <code>${esc(ip)}</code>
 \u041F\u043E\u0434 \u043A\u0430\u043A\u0438\u043C \u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u0435\u043C \u0437\u0430\u0445\u043E\u0434\u0438\u0442\u044C? \u041F\u0440\u0438\u0448\u043B\u0438 <code>root</code> (\u0438\u043B\u0438 \u0434\u0440\u0443\u0433\u043E\u0433\u043E \u0441 \u0435\u0433\u043E \u043F\u0430\u0440\u043E\u043B\u0435\u043C).`);
 }
-async function migGotUser(env, tg, chat, host, user) {
+async function migGotUser(env, tg, chat, uid, host, user) {
   const u = user.trim() || "root";
   if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(u)) return void tg.send(chat, "\u0418\u043C\u044F \u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044F \u0441\u0442\u0440\u0430\u043D\u043D\u043E\u0435. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437.");
-  await setDialog(env, { mode: "mig_pass", host, user: u });
+  await setDialog(env, uid, { mode: "mig_pass", host, user: u });
   await tg.send(chat, `\u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044C: <code>${esc(u)}</code>
 \u0422\u0435\u043F\u0435\u0440\u044C \u043F\u0440\u0438\u0448\u043B\u0438 \u043F\u0430\u0440\u043E\u043B\u044C \u043E\u0442 \u043D\u043E\u0432\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430. \u042F \u0443\u0434\u0430\u043B\u044E \u044D\u0442\u043E \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u0438\u0437 \u0434\u0438\u0430\u043B\u043E\u0433\u0430 \u043F\u043E\u0441\u043B\u0435 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0438.`);
 }
-async function migGotPass(env, tg, chat, host, user, pass) {
+async function migGotPass(env, tg, chat, uid, host, user, pass) {
   if (!pass) return void tg.send(chat, "\u041F\u0443\u0441\u0442\u043E\u0439 \u043F\u0430\u0440\u043E\u043B\u044C. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437.");
   const port = 22;
   await tg.send(chat, "\u23F3 \u041F\u0440\u043E\u0432\u0435\u0440\u044F\u044E \u0441\u0435\u0440\u0432\u0435\u0440 \u0438 \u0441\u043D\u0438\u043C\u0430\u044E \u043E\u0442\u043F\u0435\u0447\u0430\u0442\u043E\u043A \u043A\u043B\u044E\u0447\u0430\u2026");
@@ -4100,7 +4349,7 @@ async function migGotPass(env, tg, chat, host, user, pass) {
     fpr = pf.fpr;
     serverVersion = pf.serverVersion;
   } catch (e) {
-    await setDialog(env, { mode: "idle" });
+    await setDialog(env, uid, { mode: "idle" });
     return void tg.send(chat, `\u041D\u0435 \u0434\u043E\u0441\u0442\u0443\u0447\u0430\u043B\u0441\u044F \u0434\u043E ${esc(host)}:${port} \u2014 ${esc(e.message)}. \u041F\u0440\u043E\u0432\u0435\u0440\u044C IP \u0438 \u0447\u0442\u043E \u0441\u0435\u0440\u0432\u0435\u0440 \u0432\u043A\u043B\u044E\u0447\u0451\u043D. /start`);
   }
   let exitLine = "";
@@ -4124,7 +4373,7 @@ async function migGotPass(env, tg, chat, host, user, pass) {
       exitLine = manualExitLine(env, ip || "IP_\u041D\u041E\u0412\u041E\u0413\u041E_\u0421\u0415\u0420\u0412\u0415\u0420\u0410", ip ? "" : "\u043D\u0435 \u0443\u0437\u043D\u0430\u043B \u0435\u0433\u043E IPv4");
     }
   }
-  await setDialog(env, { mode: "mig_confirm", host, user, pass, port, fpr, serverVersion });
+  await setDialog(env, uid, { mode: "mig_confirm", host, user, pass, port, fpr, serverVersion });
   await tg.send(
     chat,
     `\u0421\u0435\u0440\u0432\u0435\u0440 <code>${esc(host)}</code> \u043F\u0440\u0435\u0434\u0441\u0442\u0430\u0432\u0438\u043B\u0441\u044F:
@@ -4135,14 +4384,20 @@ async function migGotPass(env, tg, chat, host, user, pass) {
     [[{ text: "\u2705 \u041F\u043E\u0435\u0445\u0430\u043B\u0438", data: "mgo" }], [{ text: "\u041E\u0442\u043C\u0435\u043D\u0430", data: "m" }]]
   );
 }
-async function migConfirm(env, tg, cq, chat, mid) {
-  const dialog = await getDialog(env);
+async function migConfirm(env, tg, cq, chat, mid, uid) {
+  const dialog = await getDialog(env, uid);
   if (dialog.mode !== "mig_confirm") {
     await tg.answer(cq.id);
     return show(tg, chat, mid, errorScreen("\u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u0443\u0436\u0435 \u043D\u0435 \u0432 \u0442\u043E\u043C \u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u0438, \u043D\u0430\u0447\u043D\u0438 \u0437\u0430\u043D\u043E\u0432\u043E", "m"));
   }
+  const busy = await migBusy(env);
+  if (busy) {
+    await tg.answer(cq.id);
+    await setDialog(env, uid, { mode: "idle" });
+    return show(tg, chat, mid, errorScreen(busy, "m"));
+  }
   await tg.answer(cq.id, "\u0417\u0430\u043F\u0443\u0441\u043A\u0430\u044E\u2026");
-  await setDialog(env, { mode: "idle" });
+  await setDialog(env, uid, { mode: "idle" });
   await show(tg, chat, mid, working("\u0417\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u043F\u0435\u0440\u0435\u043D\u043E\u0441 \u043D\u0430 \u043D\u043E\u0432\u043E\u043C \u0441\u0435\u0440\u0432\u0435\u0440\u0435"));
   try {
     if (!await backupMeta(env)) throw new Error("\u043D\u0435\u0442 \u0431\u044D\u043A\u0430\u043F\u0430 \u2014 \u043D\u0430\u0447\u043D\u0438 \u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u0437\u0430\u043D\u043E\u0432\u043E");
@@ -4210,7 +4465,7 @@ async function runSelftest(env, part) {
         (w) => ({ ok: Boolean(w.url), url: w.url, ...w.last_error_message ? { error: w.last_error_message } : {} }),
         (e) => ({ ok: false, error: why(e) })
       ),
-      getAdmin(env).then((a) => ({ ok: a !== null }))
+      listAdmins(env).then((a) => ({ ok: a.length > 0 }))
     ]);
     return { panel, dns, webhook, admin };
   }
@@ -4283,8 +4538,10 @@ var index_default = {
         await handleUpdate(env, update);
       } catch (e) {
         try {
-          const admin = await getAdmin(env);
-          if (admin !== null) await new Telegram(env).send(admin, `\u26A0\uFE0F \u041E\u0448\u0438\u0431\u043A\u0430: ${e.message}`.slice(0, 300));
+          const actor = update?.message?.from?.id ?? update?.callback_query?.from?.id;
+          const admins = await listAdmins(env);
+          const own = admins.filter((a) => a.id === actor);
+          await notifyAdmins(env, `\u26A0\uFE0F \u041E\u0448\u0438\u0431\u043A\u0430: ${e.message}`.slice(0, 300), void 0, own.length ? own : admins);
         } catch {
         }
       }
@@ -4316,15 +4573,14 @@ var index_default = {
 };
 async function completeMigration(env, token, rc, ip) {
   const mig = await currentMigration(env);
-  const tg = new Telegram(env);
   if (!mig || mig.token !== token) return;
   const fpr = await env.STATE.get(`migfpr:${token}`) || "";
   try {
     const res = await onDone(env, mig, rc, ip, fpr);
-    await tg.send(mig.chatId, res.message, [[{ text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]]);
+    await notifyAdmins(env, res.message, [[{ text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]]);
     mig.status = res.ok ? "done" : "failed";
   } catch (e) {
-    await tg.send(mig.chatId, `\u26A0\uFE0F \u041F\u0435\u0440\u0435\u043D\u043E\u0441 \u043F\u043E\u0447\u0442\u0438 \u043F\u0440\u043E\u0448\u0451\u043B, \u043D\u043E \u043D\u0430 \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u0435\u043C \u0448\u0430\u0433\u0435 \u043E\u0448\u0438\u0431\u043A\u0430: ${e.message}`);
+    await notifyAdmins(env, `\u26A0\uFE0F \u041F\u0435\u0440\u0435\u043D\u043E\u0441 \u043F\u043E\u0447\u0442\u0438 \u043F\u0440\u043E\u0448\u0451\u043B, \u043D\u043E \u043D\u0430 \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u0435\u043C \u0448\u0430\u0433\u0435 \u043E\u0448\u0438\u0431\u043A\u0430: ${e.message}`);
     mig.status = "failed";
   } finally {
     await finishMigration(env, mig);
@@ -4332,9 +4588,8 @@ async function completeMigration(env, token, rc, ip) {
   }
 }
 async function runCron(env, now) {
-  const tg = new Telegram(env);
-  const admin = await getAdmin(env);
-  if (admin === null) return;
+  const admins = await listAdmins(env);
+  if (!admins.length) return;
   try {
     const ip = await currentDnsIp(env);
     if (ip) {
@@ -4347,12 +4602,14 @@ async function runCron(env, now) {
       }
       const verdict = verdictOf(res);
       if (verdict === "RU_BLOCKED" && !alerted) {
-        await tg.send(admin, `\u{1F534} \u041F\u043E\u0445\u043E\u0436\u0435, IP \u0432\u0445\u043E\u0434\u0430 \u0437\u0430\u0431\u043B\u043E\u043A\u0438\u0440\u043E\u0432\u0430\u043B\u0438 \u0432 \u0420\u043E\u0441\u0441\u0438\u0438.
+        await notifyAdmins(
+          env,
+          `\u{1F534} \u041F\u043E\u0445\u043E\u0436\u0435, IP \u0432\u0445\u043E\u0434\u0430 \u0437\u0430\u0431\u043B\u043E\u043A\u0438\u0440\u043E\u0432\u0430\u043B\u0438 \u0432 \u0420\u043E\u0441\u0441\u0438\u0438.
 
-${banResult(res).text}`, [
-          [{ text: "\u{1F69A} \u041F\u0435\u0440\u0435\u0435\u0445\u0430\u0442\u044C", data: "mg" }],
-          [{ text: "\u{1F30D} \u041F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \u0435\u0449\u0451 \u0440\u0430\u0437", data: "bn" }]
-        ]);
+${banResult(res).text}`,
+          [[{ text: "\u{1F69A} \u041F\u0435\u0440\u0435\u0435\u0445\u0430\u0442\u044C", data: "mg" }], [{ text: "\u{1F30D} \u041F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \u0435\u0449\u0451 \u0440\u0430\u0437", data: "bn" }]],
+          admins
+        );
       }
       if (CONCLUSIVE.has(verdict)) await setLastBan(env, `${ip} ${verdict}`);
     }
@@ -4362,7 +4619,7 @@ ${banResult(res).text}`, [
     try {
       await doBackup(env);
     } catch (e) {
-      await tg.send(admin, `\u26A0\uFE0F \u0421\u0443\u0442\u043E\u0447\u043D\u044B\u0439 \u0431\u044D\u043A\u0430\u043F \u043D\u0435 \u0441\u043D\u044F\u043B\u0441\u044F: ${e.message}`.slice(0, 300));
+      await notifyAdmins(env, `\u26A0\uFE0F \u0421\u0443\u0442\u043E\u0447\u043D\u044B\u0439 \u0431\u044D\u043A\u0430\u043F \u043D\u0435 \u0441\u043D\u044F\u043B\u0441\u044F: ${e.message}`.slice(0, 300), void 0, admins);
     }
   }
 }
