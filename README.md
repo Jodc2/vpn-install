@@ -20,11 +20,11 @@
 На новом сервере под root — две команды:
 
 ```bash
-curl -fsSL -o install-vpn.sh https://raw.githubusercontent.com/Jodc2/vpn-installer/main/install-vpn.sh
+curl -fsSL -o install-vpn.sh https://raw.githubusercontent.com/Jodc2/vpn-install/main/install-vpn.sh
 bash install-vpn.sh
 ```
 
-- Нет curl — то же через wget: `wget -O install-vpn.sh https://raw.githubusercontent.com/Jodc2/vpn-installer/main/install-vpn.sh`
+- Нет curl — то же через wget: `wget -O install-vpn.sh https://raw.githubusercontent.com/Jodc2/vpn-install/main/install-vpn.sh`
 - Зашли не под root — запускать `sudo bash install-vpn.sh`.
 - Не запускайте через `curl … | bash`: скрипт должен лежать файлом — он кладёт свою копию для команд
   `vpn-check` и `vpn-warp`.
@@ -134,7 +134,8 @@ bash install-vpn.sh
 
 Чтобы VPN работал на весь дом, на роутер с прошивкой OpenWrt 22.03+ ставится PassWall2: в нём ядро Xray, а
 оно нужно для XHTTP (Podkop и HomeProxy на sing-box с этим сервером не работают). `install-passwall2.sh` ставит
-его одной командой с компьютера — файл в текущей папке, пароль root роутера спросит ssh:
+его одной командой с компьютера — файл в текущей папке, пароль root роутера спросит ssh. Скачать:
+`curl -fsSL -o install-passwall2.sh https://raw.githubusercontent.com/Jodc2/vpn-install/main/install-passwall2.sh`
 
 - Mac, Linux: `ssh root@192.168.1.1 sh < install-passwall2.sh`
 - Windows (командная строка cmd): `type install-passwall2.sh | ssh root@192.168.1.1 sh`
