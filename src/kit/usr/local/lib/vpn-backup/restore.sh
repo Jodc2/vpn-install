@@ -701,8 +701,6 @@ elif [ "$HARDEN_SSH" = 1 ] && [ -s /root/.ssh/authorized_keys ] && [ -f "$F/etc/
 		rm -f /etc/ssh/sshd_config.d/00-disable-password.conf
 		bad "sshd -t не прошёл — вход по паролю оставлен как был"
 	fi
-else
-	warn "вход по паролю не трогали"
 fi
 # fail2ban (ставит install-vpn.sh) — если был на старом сервере.
 if [ -f "$F/etc/fail2ban/jail.d/vpn-sshd.local" ] && command -v sshd >/dev/null; then

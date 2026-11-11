@@ -1206,6 +1206,15 @@ test_all_input_visible() {  # решение владельца 11.11: всё, �
 	done
 }
 
+test_no_password_login_nag() {  # решение владельца 11.11: без напоминания «вход по паролю не трогали»
+	local f
+	for f in "$ROOT/src/install-vpn.sh.in" "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh"; do
+		! grep -n 'вход по паролю не трогали' "$f" || t_fail "в $(basename "$f") осталось напоминание про вход по паролю"
+	done
+	# Раздел «SSH» установщика — только когда есть что сказать (нет sshd или --ssh-key-only), без пустого заголовка.
+	! grep -nx 'say "SSH"' "$ROOT/src/install-vpn.sh.in" || t_fail "заголовок «SSH» печатается всегда"
+}
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.

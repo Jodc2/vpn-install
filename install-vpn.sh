@@ -4790,10 +4790,12 @@ fi
 ln -sfn "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime && echo "$TZ_NAME" > /etc/timezone
 ok "часовой пояс $TZ_NAME$([ "$MODE" = domain ] && echo " (по нему cron продлевает сертификат)")"
 
-say "SSH"
+# Раздел «SSH» — только когда есть что сказать: вход по паролю без --ssh-key-only не трогаем и не напоминаем.
 if ! command -v sshd >/dev/null; then
+	say "SSH"
 	warn "sshd не установлен — пропущено"
 elif [ "$SSH_KEY_ONLY" = 1 ]; then
+	say "SSH"
 	SSH_HOW=$(ssh_login_method)
 	if [ "$SSH_HOW" = password ] || [ "$SSH_HOW" = keyboard-interactive ]; then
 		bad "вы сами вошли сейчас по паролю — выключать его нельзя, иначе после выхода не войдёте. Войдите по ключу и запустите скрипт ещё раз с --ssh-key-only"
@@ -4814,8 +4816,6 @@ EOF
 	else
 		warn "у root нет своего ключа в /root/.ssh/authorized_keys (ключ бота не в счёт) — вход по паролю оставлен, иначе вы потеряете доступ"
 	fi
-else
-	warn "вход по паролю не трогали. Безопаснее: добавить свой SSH-ключ и запустить скрипт с --ssh-key-only"
 fi
 SSH_PORTS=$(ssh_ports)
 SSH_PORT=${SSH_PORTS%% *}
@@ -5798,8 +5798,6 @@ elif [ "$HARDEN_SSH" = 1 ] && [ -s /root/.ssh/authorized_keys ] && [ -f "$F/etc/
 		rm -f /etc/ssh/sshd_config.d/00-disable-password.conf
 		bad "sshd -t не прошёл — вход по паролю оставлен как был"
 	fi
-else
-	warn "вход по паролю не трогали"
 fi
 # fail2ban (ставит install-vpn.sh) — если был на старом сервере.
 if [ -f "$F/etc/fail2ban/jail.d/vpn-sshd.local" ] && command -v sshd >/dev/null; then
