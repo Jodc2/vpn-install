@@ -348,10 +348,10 @@ dns_ask_token() {  # токен Cloudflare (из окружения или сп�
 		bot_say "  ✗ токен из окружения: $BOT_ERR"
 	fi
 	bot_tty_ok || { BOT_ERR=${BOT_ERR:-"спросить токен Cloudflare некого (нет терминала)"}; return 1; }
-	bot_say "Токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
+	bot_say "Нужен токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
 	bot_say "  $(bot_template_url)"
 	for try in 1 2 3; do
-		bot_ask_secret "Токен Cloudflare (не отобразится): " || return 1
+		bot_ask_secret "Токен Cloudflare: " || return 1
 		if [ -z "$BOT_ANSWER" ]; then BOT_ERR="токен Cloudflare не введён"; continue; fi
 		BOT_CF_TOKEN=$BOT_ANSWER
 		bot_init_secrets
@@ -1103,16 +1103,15 @@ bot_decide() {  # → BOT_DO (разворачивать сейчас), BOT_KEEP
 	fi
 }
 
-bot_ask_secret() {  # bot_ask_secret ВОПРОС → BOT_ANSWER (ввод не отображается); 1 — спросить некого
+bot_ask_secret() {  # bot_ask_secret ВОПРОС → BOT_ANSWER без пробелов; ввод виден (решение владельца); 1 — спросить некого
 	BOT_ANSWER=
 	bot_tty_ok || return 1
 	if [ -n "${BOT_TTY_FD:-}" ]; then
 		printf '%s' "$1" >> "$WORK/tty.out"
-		IFS= read -rs BOT_ANSWER <&"$BOT_TTY_FD" || BOT_ANSWER=
+		IFS= read -r BOT_ANSWER <&"$BOT_TTY_FD" || BOT_ANSWER=
 	else
 		printf '%s' "$1" > /dev/tty
-		IFS= read -rs BOT_ANSWER < /dev/tty || BOT_ANSWER=
-		echo > /dev/tty
+		IFS= read -r BOT_ANSWER < /dev/tty || BOT_ANSWER=
 	fi
 	BOT_ANSWER=$(printf '%s' "$BOT_ANSWER" | tr -d '[:space:]')   # вставка из буфера несёт пробелы и \r
 }
@@ -1130,7 +1129,7 @@ bot_read_tokens() {  # спросить недостающие токены; б�
 	if ! bot_have_cf_token && bot_tty_ok; then
 		bot_say "1) Токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
 		bot_say "   $(bot_template_url)"
-		bot_ask_secret "   Токен Cloudflare (не отобразится): " || true
+		bot_ask_secret "   Токен Cloudflare: " || true
 		BOT_CF_TOKEN=$BOT_ANSWER
 	fi
 	if [ -z "${BOT_TG_TOKEN:-}" ] && ! { [ -n "${BOT_DIR:-}" ] && [ -s "$BOT_DIR/tg.token" ]; } && bot_tty_ok; then
@@ -1138,7 +1137,7 @@ bot_read_tokens() {  # спросить недостающие токены; б�
 			bot_ask_secret "2) Токен бота (Enter — прежний бот): " || true
 		else
 			bot_say "2) Токен бота: в Телеграме открой @BotFather → /newbot → придумай имя → скопируй токен вида 123456789:AAE…"
-			bot_ask_secret "   Токен бота (не отобразится): " || true
+			bot_ask_secret "   Токен бота: " || true
 		fi
 		BOT_TG_TOKEN=$BOT_ANSWER
 	fi
@@ -2235,7 +2234,7 @@ read_key_rest() {  # $1 — первая строка вставленного �
 	local line n=1 end='-----END*PRIVATE KEY-----' what='-----END … PRIVATE KEY-----'
 	[[ $1 == PuTTY-User-Key-File* ]] && { end='Private-MAC:*'; what='Private-MAC: …'; }
 	EXIT_KEY_TEXT=$1
-	while [ "$n" -lt 300 ] && IFS= read -rs line < /dev/tty; do
+	while [ "$n" -lt 300 ] && IFS= read -r line < /dev/tty; do
 		line=$(key_line "$line")
 		n=$((n + 1))
 		EXIT_KEY_TEXT+=$'\n'"$line"
@@ -2243,8 +2242,7 @@ read_key_rest() {  # $1 — первая строка вставленного �
 		[[ $line == $end ]] && break
 	done
 	# Хвост вставки (лишний перевод строки после \r\n) дочитать, иначе его получит следующий вопрос.
-	while IFS= read -rs -t 0.3 _ < /dev/tty; do :; done
-	echo > /dev/tty
+	while IFS= read -r -t 0.3 _ < /dev/tty; do :; done
 	# shellcheck disable=SC2053
 	[[ ${EXIT_KEY_TEXT##*$'\n'} == $end ]] || die "ключ вставлен не целиком: нет последней строки «$what»"
 	EXIT_KEY_TEXT=$(normalize_key <<<"$EXIT_KEY_TEXT")
@@ -2255,12 +2253,11 @@ ask_exit_auth() {  # доступ к старому серверу: пароль
 	printf 'Вход на старый сервер под %s: 1) по паролю, 2) по SSH-ключу [1]: ' "$EXIT_SSH_USER" > /dev/tty
 	read -r ans < /dev/tty || ans=
 	if [ "$ans" = 2 ]; then
-		printf 'Вставьте приватный ключ целиком (от -----BEGIN до -----END, на экране не отобразится)\nили путь к файлу ключа на этом сервере: ' > /dev/tty
+		printf 'Вставьте приватный ключ целиком (от -----BEGIN до -----END)\nили путь к файлу ключа на этом сервере: ' > /dev/tty
 	else
-		printf 'Пароль %s на старом сервере (не отобразится; можно вставить и SSH-ключ целиком): ' "$EXIT_SSH_USER" > /dev/tty
+		printf 'Пароль %s на старом сервере (можно вставить и SSH-ключ целиком): ' "$EXIT_SSH_USER" > /dev/tty
 	fi
-	IFS= read -rs first < /dev/tty || first=
-	echo > /dev/tty
+	IFS= read -r first < /dev/tty || first=
 	clean=$(key_line "$first")
 	if [[ $clean == -----BEGIN*PRIVATE\ KEY----- || $clean == PuTTY-User-Key-File* ]]; then
 		read_key_rest "$clean"
@@ -3253,8 +3250,8 @@ prepare_exit_key() {  # ключ (вставленный или файл) → $W
 		if ! grep -q '^Encryption: none' "$src"; then
 			if [ -z "$pp" ] && { : > /dev/tty; } 2>/dev/null; then
 				tty_flush
-				printf 'Ключ защищён парольной фразой — введите её (не отобразится): ' > /dev/tty
-				IFS= read -rs pp < /dev/tty || true; echo > /dev/tty
+				printf 'Ключ защищён парольной фразой — введите её: ' > /dev/tty
+				IFS= read -r pp < /dev/tty || true
 			fi
 			[ -n "$pp" ] || { CHAIN_ERR="ключ PuTTY защищён парольной фразой — передайте её в EXIT_KEY_PASS"; return 1; }
 			printf '%s' "$pp" > "$ppf"
@@ -3271,8 +3268,8 @@ prepare_exit_key() {  # ключ (вставленный или файл) → $W
 		if grep -qi passphrase <<<"$err"; then
 			if [ -z "$pp" ] && { : > /dev/tty; } 2>/dev/null; then
 				tty_flush
-				printf 'Ключ защищён парольной фразой — введите её (не отобразится): ' > /dev/tty
-				IFS= read -rs pp < /dev/tty || true; echo > /dev/tty
+				printf 'Ключ защищён парольной фразой — введите её: ' > /dev/tty
+				IFS= read -r pp < /dev/tty || true
 			fi
 			[ -n "$pp" ] || { CHAIN_ERR="ключ защищён парольной фразой — передайте её в EXIT_KEY_PASS"; return 1; }
 			ssh-keygen -p -P "$pp" -N "" -f "$k" >/dev/null 2>&1 || { CHAIN_ERR="парольная фраза к ключу не подошла"; return 1; }
@@ -3644,9 +3641,8 @@ setup_chain_exit_try() {
 			local spw=${EXIT_SUDO_PASS:-${EXIT_PASS:-}} serr=""
 			if [ -z "$spw" ] && { : > /dev/tty; } 2>/dev/null; then
 				tty_flush
-				printf 'Пароль sudo для %s на старом сервере (не отобразится): ' "$EXIT_SSH_USER" > /dev/tty
-				IFS= read -rs spw < /dev/tty || true
-				echo > /dev/tty
+				printf 'Пароль sudo для %s на старом сервере: ' "$EXIT_SSH_USER" > /dev/tty
+				IFS= read -r spw < /dev/tty || true
 			fi
 			if [ -n "$spw" ] && serr=$(printf '%s\n' "$spw" | ssh_exit_in "sudo -S -p '' true" 2>&1); then
 				EXIT_SUDO=pass

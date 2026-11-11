@@ -147,10 +147,10 @@ dns_ask_token() {  # токен Cloudflare (из окружения или сп�
 		bot_say "  ✗ токен из окружения: $BOT_ERR"
 	fi
 	bot_tty_ok || { BOT_ERR=${BOT_ERR:-"спросить токен Cloudflare некого (нет терминала)"}; return 1; }
-	bot_say "Токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
+	bot_say "Нужен токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
 	bot_say "  $(bot_template_url)"
 	for try in 1 2 3; do
-		bot_ask_secret "Токен Cloudflare (не отобразится): " || return 1
+		bot_ask_secret "Токен Cloudflare: " || return 1
 		if [ -z "$BOT_ANSWER" ]; then BOT_ERR="токен Cloudflare не введён"; continue; fi
 		BOT_CF_TOKEN=$BOT_ANSWER
 		bot_init_secrets
@@ -902,16 +902,15 @@ bot_decide() {  # → BOT_DO (разворачивать сейчас), BOT_KEEP
 	fi
 }
 
-bot_ask_secret() {  # bot_ask_secret ВОПРОС → BOT_ANSWER (ввод не отображается); 1 — спросить некого
+bot_ask_secret() {  # bot_ask_secret ВОПРОС → BOT_ANSWER без пробелов; ввод виден (решение владельца); 1 — спросить некого
 	BOT_ANSWER=
 	bot_tty_ok || return 1
 	if [ -n "${BOT_TTY_FD:-}" ]; then
 		printf '%s' "$1" >> "$WORK/tty.out"
-		IFS= read -rs BOT_ANSWER <&"$BOT_TTY_FD" || BOT_ANSWER=
+		IFS= read -r BOT_ANSWER <&"$BOT_TTY_FD" || BOT_ANSWER=
 	else
 		printf '%s' "$1" > /dev/tty
-		IFS= read -rs BOT_ANSWER < /dev/tty || BOT_ANSWER=
-		echo > /dev/tty
+		IFS= read -r BOT_ANSWER < /dev/tty || BOT_ANSWER=
 	fi
 	BOT_ANSWER=$(printf '%s' "$BOT_ANSWER" | tr -d '[:space:]')   # вставка из буфера несёт пробелы и \r
 }
@@ -929,7 +928,7 @@ bot_read_tokens() {  # спросить недостающие токены; б�
 	if ! bot_have_cf_token && bot_tty_ok; then
 		bot_say "1) Токен Cloudflare: открой ссылку (права уже отмечены) → «Continue to summary» → «Create Token» → скопируй токен:"
 		bot_say "   $(bot_template_url)"
-		bot_ask_secret "   Токен Cloudflare (не отобразится): " || true
+		bot_ask_secret "   Токен Cloudflare: " || true
 		BOT_CF_TOKEN=$BOT_ANSWER
 	fi
 	if [ -z "${BOT_TG_TOKEN:-}" ] && ! { [ -n "${BOT_DIR:-}" ] && [ -s "$BOT_DIR/tg.token" ]; } && bot_tty_ok; then
@@ -937,7 +936,7 @@ bot_read_tokens() {  # спросить недостающие токены; б�
 			bot_ask_secret "2) Токен бота (Enter — прежний бот): " || true
 		else
 			bot_say "2) Токен бота: в Телеграме открой @BotFather → /newbot → придумай имя → скопируй токен вида 123456789:AAE…"
-			bot_ask_secret "   Токен бота (не отобразится): " || true
+			bot_ask_secret "   Токен бота: " || true
 		fi
 		BOT_TG_TOKEN=$BOT_ANSWER
 	fi

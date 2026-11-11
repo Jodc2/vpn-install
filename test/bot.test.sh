@@ -1032,7 +1032,7 @@ test_dns_ask_token_retries() {  # первый токен не подошёл �
 	}
 	answers bad good
 	dns_ask_token || t_fail "не принял второй токен: $BOT_ERR"
-	t_eq 2 "$(grep -o 'Токен Cloudflare (не отобразится)' "$WORK/tty.out" | wc -l)" "спросил дважды"
+	t_eq 2 "$(grep -o 'Токен Cloudflare: ' "$WORK/tty.out" | wc -l)" "спросил дважды"
 	grep -q 'Invalid API Token' "$WORK/tty.out" || t_fail "не сказал, почему первый не подошёл"
 	grep -q 'permissionGroupKeys' "$WORK/tty.out" || t_fail "нет ссылки на токен"
 }
@@ -1041,7 +1041,7 @@ test_dns_ask_token_from_env() {  # токен дан окружением (CF_AP
 	cf_set "GET /zones?per_page=50" '{"success":true,"result":[{"id":"Z1","name":"example.com","status":"active"}]}'
 	answers never-asked
 	dns_ask_token || t_fail "не принял токен из окружения: $BOT_ERR"
-	! grep -q 'не отобразится' "$WORK/tty.out" 2> /dev/null || t_fail "спросил токен, хотя он дан"
+	! grep -q 'Токен Cloudflare: ' "$WORK/tty.out" 2> /dev/null || t_fail "спросил токен, хотя он дан"
 	t_has example.com "$DNS_ZONES" "домены прочитаны"
 }
 test_dns_wait_until_visible() {
@@ -1196,6 +1196,14 @@ test_dns_verify_strict_without_own_write() {  # запись ставил не �
 	resolve() { [ "$2" = A ] && echo 9.9.9.9; true; }
 	! ( dns_verify ) || t_fail "прошёл с чужой A-записью"
 	grep -q '^DIE.*9.9.9.9' "$WORK/out" || t_fail "нет понятной остановки: $(cat "$WORK/out")"
+}
+
+test_all_input_visible() {  # решение владельца 11.11: всё, что вводят, видно на экране — ни одного скрытого ввода
+	local f
+	for f in "$ROOT/src/bot.sh" "$ROOT/src/install-vpn.sh.in" "$ROOT/install-passwall2.sh"; do
+		! grep -n 'не отобраз' "$f" || t_fail "в $(basename "$f") осталось «не отобразится»"
+		! grep -nE 'read +(-[a-zA-Z]*s[a-zA-Z]*|-s)( |$)' "$f" || t_fail "в $(basename "$f") остался скрытый ввод (read -s)"
+	done
 }
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
