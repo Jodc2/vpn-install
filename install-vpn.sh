@@ -2094,6 +2094,19 @@ exit_ssh_defaults
 DO_UFW=${DO_UFW:-$(state_val S_DO_UFW || true)}; DO_UFW=${DO_UFW:-1}
 DO_F2B=${DO_F2B:-$(state_val S_DO_F2B || true)}; DO_F2B=${DO_F2B:-1}
 TZ_NAME=${TZ_NAME:-$(state_val S_TZ || true)}; TZ_NAME=${TZ_NAME:-Europe/Moscow}
+foreign_xui_check() {  # 3x-ui здесь ставили без этого скрипта: сказать, что будет, и спросить сразу — до любых вопросов и изменений
+	local n
+	[ -f "$DB" ] && [ ! -f "$STATE" ] || return 0
+	! compgen -G "$STATE.failed-*" > /dev/null || return 0   # следы неудачной попытки этого скрипта — 3x-ui его
+	n=$(python3 -I -c 'import sqlite3, sys; print(sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select count(*) from inbounds").fetchone()[0])' "$DB" 2> /dev/null ||
+		sqlite3 -readonly "$DB" 'select count(*) from inbounds;' 2> /dev/null || echo '?')
+	warn "здесь уже есть 3x-ui, поставленный не этим скриптом (подключений: $n). Удалять его скрипт не будет: подключения и клиенты останутся, их порты фаервол не закроет. Заменятся логин, пароль, порт и путь панели, шаблон Xray (маршрутизация), адреса подписок и сама программа — на 3x-ui $XUI_VERSION. Копия базы останется рядом с ней"
+	bot_tty_ok || die "здесь уже есть 3x-ui, поставленный не этим скриптом: запустите скрипт в терминале (он спросит) или поставьте VPN на чистый сервер"
+	bot_consent "Продолжить?" || die "ничего не менял. Для нового VPN лучше чистый сервер"
+	FOREIGN_XUI=1
+}
+FOREIGN_XUI=0
+[ "$CHECK_ONLY" = 1 ] || [ -n "$WARP_CMD" ] || foreign_xui_check
 if [ "$CHECK_ONLY" = 1 ] || [ -n "$WARP_CMD" ]; then
 	[ -n "$S_MODE" ] || die "VPN этим скриптом здесь ещё не ставился (нет $STATE) — сначала bash $0"
 	MODE=$S_MODE
@@ -2193,8 +2206,7 @@ reset_failed_attempt() {  # смена варианта после неудач�
 		[ ! -x /root/.acme.sh/acme.sh ] || /root/.acme.sh/acme.sh --remove -d "$ip" --ecc >/dev/null 2>&1 || true
 		rm -rf "/root/.acme.sh/${ip}_ecc" /etc/x-ui/ip-cert
 	fi
-	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"
-	OWN_XUI=1   # 3x-ui прошлой попытки поставил этот скрипт — не чужой
+	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"   # по этому следу foreign_xui_check потом узнает свой 3x-ui
 	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
 	exit_ssh_defaults
 }
@@ -4128,18 +4140,7 @@ if [ -f "$STATE" ]; then
 	# shellcheck source=/dev/null
 	. "$STATE"
 	ok "найдены настройки прошлой установки ($STATE): ключи, пароли и клиенты остаются прежними"
-elif [ -f "$DB" ] && [ "${OWN_XUI:-0}" != 1 ]; then
-	# 3x-ui здесь ставили без этого скрипта: панель получит новые логин, пароль, порт и путь, шаблон Xray — схему скрипта.
-	n=$(sqlite3 -readonly "$DB" 'select count(*) from inbounds;' 2>/dev/null || echo '?')
-	warn "здесь уже есть 3x-ui, поставленный не этим скриптом (подключений: $n): логин, пароль, порт и путь панели и шаблон Xray будут заменены, подключения и клиенты останутся"
-	if { : > /dev/tty; } 2>/dev/null; then
-		tty_flush
-		printf 'Продолжить? [y/N]: ' > /dev/tty
-		read -r ans < /dev/tty || ans=
-		case $ans in y | Y | yes | да | Да) ;; *) die "ничего не менял. Для нового VPN лучше чистый сервер" ;; esac
-	else
-		die "здесь уже есть 3x-ui, поставленный не этим скриптом: запустите скрипт в терминале (он спросит) или поставьте VPN на чистый сервер"
-	fi
+elif [ "$FOREIGN_XUI" = 1 ]; then   # чужой 3x-ui (согласие — в самом начале, foreign_xui_check): копия базы до первых изменений
 	cp -a "$DB" "$DB.before-install-$(date +%Y%m%d-%H%M%S)"
 	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
 fi
@@ -4864,8 +4865,48 @@ else
 	fi
 fi
 
+xui_inbound_ports() {  # «порт/протокол» включённых подключений панели, которые слушают не только localhost
+	[ -f "$DB" ] || return 0
+	python3 -I - "$DB" <<'PY' 2>/dev/null || true
+import json, sqlite3, sys
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+out = set()
+for port, listen, proto, settings, stream, enable in db.execute(
+        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
+    listen = (listen or "").strip()
+    if not enable or not port or listen.startswith(("127.", "/", "@")) or listen in ("::1", "[::1]", "localhost"):
+        continue
+    try:
+        st = json.loads(settings or "{}")
+    except ValueError:
+        st = {}
+    try:
+        ss = json.loads(stream or "{}")
+    except ValueError:
+        ss = {}
+    proto = (proto or "").lower()
+    net = str(ss.get("network") or "tcp").lower()
+    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
+        kinds = {"udp"}
+    elif proto in ("shadowsocks", "dokodemo-door", "tunnel"):
+        n = str(st.get("network") or "tcp").lower()
+        kinds = {k for k in ("tcp", "udp") if k in n} or {"tcp"}
+    elif proto in ("mixed", "socks"):
+        kinds = {"tcp", "udp"} if st.get("udp") else {"tcp"}
+    else:
+        kinds = {"tcp"}
+    out.update((int(port), k) for k in kinds)
+for port, kind in sorted(out):
+    print("%d/%s" % (port, kind))
+PY
+}
+fw_kept_ports() {  # фаервол ещё выключен — подключения панели снаружи доступны; их порты включённый ufw не должен закрыть
+	! ufw status 2>/dev/null | grep -q '^Status: active' || return 0   # уже включён — его правила остаются как есть
+	xui_inbound_ports
+}
 say "Фаервол ufw"
 if [ "$DO_UFW" = 1 ]; then
+	KEEP=$(fw_kept_ports)
 	OPEN=$( {
 		for p in $SSH_PORTS; do echo "$p/tcp"; done
 		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
@@ -4873,9 +4914,11 @@ if [ "$DO_UFW" = 1 ]; then
 		if [ "$PANEL_PUBLIC" = 1 ]; then echo "$WEB_PORT/tcp"; fi
 		if [ "${SUB_TLS:-0}" = 1 ]; then echo 80/tcp; echo "$SUB_PORT/tcp"; fi   # :80 — продление сертификата на IP
 		echo "$REALITY_PORT/tcp"
-		for pp in $OTHER_VPN_PORTS; do echo "$pp"; done
+		for pp in $OTHER_VPN_PORTS $KEEP; do echo "$pp"; done
 	} | sort -u | sort -t/ -k1,1n -k2,2)
 	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
+	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || printf '%s ' "$pp"; done)
+	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
 	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ]; then
 		ufw delete allow "$MOVED_FROM/tcp" >/dev/null 2>&1 || true
 		ok "старый порт подключения $MOVED_FROM закрыт в ufw"

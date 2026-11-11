@@ -1215,6 +1215,103 @@ test_no_password_login_nag() {  # решение владельца 11.11: бе�
 	! grep -nx 'say "SSH"' "$ROOT/src/install-vpn.sh.in" || t_fail "заголовок «SSH» печатается всегда"
 }
 
+# ——— Чужой 3x-ui: вопрос в самом начале, порты его подключений фаервол не закрывает ———
+xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports / fw_kept_ports; die/ok/warn — строками в $WORK/out
+	eval "$(awk '/^(foreign_xui_check|xui_inbound_ports|fw_kept_ports)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
+	ok() { echo "OK $*" >> "$WORK/out"; }
+	warn() { echo "WARN $*" >> "$WORK/out"; }
+	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0
+	: > "$WORK/out"
+}
+mkdb() {  # mkdb "порт|listen|протокол|settings|stream|enable" … → $DB с таблицей inbounds, как у 3x-ui
+	python3 -I - "$DB" "$@" <<'EOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("create table inbounds (id integer primary key, port integer, listen text, protocol text, settings text, stream_settings text, enable integer)")
+for row in sys.argv[2:]:
+    port, listen, proto, settings, stream, enable = row.split("|")
+    db.execute("insert into inbounds (port, listen, protocol, settings, stream_settings, enable) values (?, ?, ?, ?, ?, ?)",
+               (int(port), listen, proto, settings, stream, int(enable)))
+db.commit()
+EOF
+}
+test_foreign_xui_none_no_question() {  # 3x-ui нет — не спрашивает
+	xui_fns; answers y
+	foreign_xui_check
+	t_eq 0 "$FOREIGN_XUI" "не чужой"
+	! grep -q '\[y/N\]' "$WORK/tty.out" 2> /dev/null || t_fail "спросил без 3x-ui"
+}
+test_foreign_xui_own_install_no_question() {  # 3x-ui ставил этот скрипт (есть его настройки или следы неудачной попытки)
+	xui_fns; answers y y
+	mkdb '2083||vless|{}|{}|1'
+	: > "$STATE"
+	foreign_xui_check
+	rm -f "$STATE"; : > "$STATE.failed-20261111-000000"
+	foreign_xui_check
+	t_eq 0 "$FOREIGN_XUI" "свой"
+	! grep -q '\[y/N\]' "$WORK/tty.out" 2> /dev/null || t_fail "спросил про свой 3x-ui"
+}
+test_foreign_xui_asks_and_continues_on_yes() {
+	xui_fns; answers y
+	mkdb '443||vless|{}|{}|1' '8443||vmess|{}|{}|1'
+	foreign_xui_check
+	t_eq 1 "$FOREIGN_XUI" "согласие запомнено"
+	grep -q 'Продолжить? \[y/N\]' "$WORK/tty.out" || t_fail "не спросил"
+	t_has "подключений: 2" "$(cat "$WORK/out")" "число подключений"
+	t_has "останутся" "$(cat "$WORK/out")" "что останется"
+	t_has "фаервол не закроет" "$(cat "$WORK/out")" "порты подключений"
+}
+test_foreign_xui_no_stops_without_changes() {
+	xui_fns; answers n
+	mkdb '443||vless|{}|{}|1'
+	! ( foreign_xui_check ) || t_fail "продолжил после «n»"
+	t_has "DIE ничего не менял" "$(cat "$WORK/out")" "остановка"
+}
+test_foreign_xui_without_tty_stops() {
+	xui_fns
+	bot_tty_ok() { return 1; }
+	mkdb '443||vless|{}|{}|1'
+	! ( foreign_xui_check ) || t_fail "продолжил без терминала"
+	t_has "в терминале" "$(cat "$WORK/out")" "подсказка"
+}
+test_foreign_xui_asked_before_any_question() {  # вопрос — раньше домена, токенов, DNS, бота и пакетов
+	local f=$ROOT/src/install-vpn.sh.in call q
+	call=$(grep -n 'foreign_xui_check$' "$f" | grep -v '()' | head -1 | cut -d: -f1)
+	[ -n "$call" ] || t_fail "foreign_xui_check не вызывается"
+	for q in 'Есть ли у вас свой домен' '^dns_step$' 'until bot_validate' '^say "Пакеты"' '^say "Проверка сервера"'; do
+		[ "$call" -lt "$(grep -n -m1 "$q" "$f" | cut -d: -f1)" ] || t_fail "вопрос про 3x-ui позже, чем «$q»"
+	done
+	t_eq 1 "$(grep -c 'Продолжить? \[y/N\]\|bot_consent "Продолжить?"' "$f")" "вопрос про чужой 3x-ui — один, в foreign_xui_check"
+}
+test_inbound_ports_by_protocol() {  # порты включённых подключений панели, слушающих не только localhost
+	xui_fns
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' \
+		'8443|0.0.0.0|vmess|{}|{"network":"ws"}|1' \
+		'1080||shadowsocks|{"network":"tcp,udp"}|{}|1' \
+		'51820||wireguard|{}|{}|1' \
+		'4443||vless|{}|{"network":"kcp"}|1' \
+		'1081||mixed|{"udp":true}|{}|1' \
+		'9000|127.0.0.1|vless|{}|{"network":"ws"}|1' \
+		'9001||trojan|{}|{}|0' \
+		'9002|::1|vless|{}|{}|1'
+	t_eq "1080/tcp 1080/udp 1081/tcp 1081/udp 2083/tcp 4443/udp 8443/tcp 51820/udp" "$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "порты"
+}
+test_inbound_ports_no_db() {
+	xui_fns
+	declare -F xui_inbound_ports > /dev/null || t_fail "нет xui_inbound_ports в шаблоне"
+	t_eq "" "$(xui_inbound_ports)" "без базы — ничего"
+}
+test_fw_kept_ports_only_when_ufw_was_off() {  # фаервол уже включён — его правила остаются как есть, лишнего не открываем
+	xui_fns
+	mkdb '8443||vmess|{}|{"network":"ws"}|1'
+	ufw() { echo "Status: inactive"; }
+	t_eq "8443/tcp" "$(fw_kept_ports)" "ufw выключен — порты подключений остаются открытыми"
+	ufw() { printf 'Status: active\n\nTo Action From\n'; }
+	t_eq "" "$(fw_kept_ports)" "ufw включён — не трогаем"
+	grep -q 'OTHER_VPN_PORTS \$KEEP' "$ROOT/src/install-vpn.sh.in" || t_fail "шаг фаервола не открывает порты подключений панели"
+}
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.
