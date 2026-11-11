@@ -1,7 +1,52 @@
+// src/format.ts
+function bytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0 \u0411";
+  const u = ["\u0411", "\u041A\u0411", "\u041C\u0411", "\u0413\u0411", "\u0422\u0411", "\u041F\u0411"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < u.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  const s = v >= 100 || i === 0 ? Math.round(v).toString() : v.toFixed(v >= 10 ? 1 : 2);
+  return `${s} ${u[i]}`;
+}
+function dur(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor(s % 86400 / 3600);
+  const m = Math.floor(s % 3600 / 60);
+  if (d > 0) return h > 0 ? `${d} \u0434 ${h} \u0447` : `${d} \u0434`;
+  if (h > 0) return m > 0 ? `${h} \u0447 ${m} \u043C\u0438\u043D` : `${h} \u0447`;
+  if (m > 0) return `${m} \u043C\u0438\u043D`;
+  return `${s} \u0441`;
+}
+function ago(msEpoch, now = Date.now()) {
+  if (!msEpoch || msEpoch <= 0) return "\u043D\u0438\u043A\u043E\u0433\u0434\u0430";
+  const diff = Math.floor((now - msEpoch) / 1e3);
+  if (diff < 0) return "\u0442\u043E\u043B\u044C\u043A\u043E \u0447\u0442\u043E";
+  if (diff < 60) return "\u0442\u043E\u043B\u044C\u043A\u043E \u0447\u0442\u043E";
+  return `${dur(diff)} \u043D\u0430\u0437\u0430\u0434`;
+}
+function expiry(msEpoch, now = Date.now()) {
+  if (!msEpoch || msEpoch === 0) return "\u0431\u0435\u0441\u0441\u0440\u043E\u0447\u043D\u043E";
+  if (msEpoch < 0) return "\u043F\u043E \u0442\u0440\u0430\u0444\u0438\u043A\u0443";
+  if (msEpoch <= now) return "\u0438\u0441\u0442\u0451\u043A";
+  const left = Math.floor((msEpoch - now) / 1e3);
+  return `${dur(left)} \u043E\u0441\u0442\u0430\u043B\u043E\u0441\u044C`;
+}
+function clip(s, n) {
+  const a = Array.from(s);
+  return a.length > n ? a.slice(0, n).join("") : s;
+}
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 // src/telegram.ts
 function userName(u) {
   const name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim() || `id ${u.id}`;
-  return (u.username ? `${name} (@${u.username})` : name).slice(0, 80);
+  return clip(u.username ? `${name} (@${u.username})` : name, 80);
 }
 function markup(kb) {
   if (!kb) return void 0;
@@ -164,47 +209,6 @@ function subLink(env, subId) {
   return `${env.SUB_PREFIX}${subId}`;
 }
 
-// src/format.ts
-function bytes(n) {
-  if (!Number.isFinite(n) || n <= 0) return "0 \u0411";
-  const u = ["\u0411", "\u041A\u0411", "\u041C\u0411", "\u0413\u0411", "\u0422\u0411", "\u041F\u0411"];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  const s = v >= 100 || i === 0 ? Math.round(v).toString() : v.toFixed(v >= 10 ? 1 : 2);
-  return `${s} ${u[i]}`;
-}
-function dur(seconds) {
-  const s = Math.max(0, Math.floor(seconds));
-  const d = Math.floor(s / 86400);
-  const h = Math.floor(s % 86400 / 3600);
-  const m = Math.floor(s % 3600 / 60);
-  if (d > 0) return h > 0 ? `${d} \u0434 ${h} \u0447` : `${d} \u0434`;
-  if (h > 0) return m > 0 ? `${h} \u0447 ${m} \u043C\u0438\u043D` : `${h} \u0447`;
-  if (m > 0) return `${m} \u043C\u0438\u043D`;
-  return `${s} \u0441`;
-}
-function ago(msEpoch, now = Date.now()) {
-  if (!msEpoch || msEpoch <= 0) return "\u043D\u0438\u043A\u043E\u0433\u0434\u0430";
-  const diff = Math.floor((now - msEpoch) / 1e3);
-  if (diff < 0) return "\u0442\u043E\u043B\u044C\u043A\u043E \u0447\u0442\u043E";
-  if (diff < 60) return "\u0442\u043E\u043B\u044C\u043A\u043E \u0447\u0442\u043E";
-  return `${dur(diff)} \u043D\u0430\u0437\u0430\u0434`;
-}
-function expiry(msEpoch, now = Date.now()) {
-  if (!msEpoch || msEpoch === 0) return "\u0431\u0435\u0441\u0441\u0440\u043E\u0447\u043D\u043E";
-  if (msEpoch < 0) return "\u043F\u043E \u0442\u0440\u0430\u0444\u0438\u043A\u0443";
-  if (msEpoch <= now) return "\u0438\u0441\u0442\u0451\u043A";
-  const left = Math.floor((msEpoch - now) / 1e3);
-  return `${dur(left)} \u043E\u0441\u0442\u0430\u043B\u043E\u0441\u044C`;
-}
-function esc(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 // src/render.ts
 function mainMenu() {
   return {
@@ -225,7 +229,7 @@ function adminList(admins, me) {
   const kb = [];
   if (admins.length > 1) {
     for (const a of admins) {
-      kb.push([{ text: (a.id === me ? "\u{1F6AA} \u0412\u044B\u0439\u0442\u0438 \u0438\u0437 \u0430\u0434\u043C\u0438\u043D\u043E\u0432" : `\u{1F5D1} ${adminLabel(a)}`).slice(0, 60), data: `ax:${a.id}` }]);
+      kb.push([{ text: clip(a.id === me ? "\u{1F6AA} \u0412\u044B\u0439\u0442\u0438 \u0438\u0437 \u0430\u0434\u043C\u0438\u043D\u043E\u0432" : `\u{1F5D1} ${adminLabel(a)}`, 60), data: `ax:${a.id}` }]);
     }
   }
   kb.push([{ text: "\u2795 \u041F\u0440\u0438\u0433\u043B\u0430\u0441\u0438\u0442\u044C \u0430\u0434\u043C\u0438\u043D\u0430", data: "ai" }]);
@@ -289,7 +293,7 @@ function clientList(clients, online, page = 0) {
   const rows = slice.map((c) => {
     const mark = !c.enable ? "\u23F8" : online.has(c.email) ? "\u{1F7E2}" : "\u26AA\uFE0F";
     const name = c.comment || c.email;
-    return [{ text: `${mark} ${name}`.slice(0, 60), data: `c:${c.id}` }];
+    return [{ text: clip(`${mark} ${name}`, 60), data: `c:${c.id}` }];
   });
   const nav = [];
   if (p > 0) nav.push({ text: "\u2039", data: `cl:${p - 1}` });
@@ -376,7 +380,7 @@ var VERDICT_RU = {
   UNKNOWN: "\u26AA\uFE0F \u043F\u0440\u043E\u0432\u0435\u0440\u044F\u043B\u043A\u0438 \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B\u0438 \u2014 \u043F\u043E\u043F\u0440\u043E\u0431\u0443\u0439 \u043F\u043E\u0437\u0436\u0435"
 };
 function cut(s, n) {
-  return s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
+  return Array.from(s).length > n ? clip(s, n - 1) + "\u2026" : s;
 }
 function banResult(r) {
   const head2 = `<b>\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u0431\u0430\u043D\u0430</b> \u2014 IP \u0432\u0445\u043E\u0434\u0430 <code>${esc(r.ip)}</code>`;
@@ -449,6 +453,11 @@ async function currentMigration(env) {
 async function migrationTokenValid(env, token) {
   return await env.STATE.get(`migtok:${token}`) === token;
 }
+async function markMigrationFailed(env, m) {
+  const cur = await currentMigration(env);
+  if (cur && cur.token !== m.token) return;
+  await env.STATE.put("mig:current", JSON.stringify({ ...m, status: "failed" }), { expirationTtl: 1800 });
+}
 async function finishMigration(env, m) {
   if (m.status === "done" || m.status === "failed") {
     await env.STATE.delete("mig:current");
@@ -465,17 +474,37 @@ async function setEntryFpr(env, fprs) {
   await env.STATE.put("entry:fpr", JSON.stringify(fprs));
 }
 var isId = (n) => typeof n === "number" && Number.isSafeInteger(n) && n > 0;
-async function storedAdmins(env) {
-  const v = await env.STATE.get("admins", "json");
+function parseAdmins(v) {
   if (!Array.isArray(v)) return [];
-  return v.filter((a) => a && isId(a.id)).map((a) => ({ id: a.id, name: String(a.name || "") }));
+  const out = [];
+  for (const a of v) {
+    if (a && isId(a.id) && !out.some((x) => x.id === a.id)) out.push({ id: a.id, name: String(a.name || "") });
+  }
+  return out;
 }
-async function listAdmins(env) {
-  const stored = await storedAdmins(env);
-  if (stored.length) return stored;
+async function storedAdmins(env) {
+  return parseAdmins(await env.STATE.get("admins", "json"));
+}
+async function seedAdmins(env) {
   const seed = env.ADMIN_ID?.trim() || await env.STATE.get("admin:id") || "";
   const id = Number(seed);
   return isId(id) && String(id) === seed.trim() ? [{ id, name: "" }] : [];
+}
+async function listAdmins(env) {
+  let list = await storedAdmins(env);
+  if (!list.length) list = await seedAdmins(env);
+  const grants = parseAdmins(await env.STATE.get("admins:grant", "json"));
+  if (grants.length) {
+    for (const g of grants) {
+      await env.STATE.delete(`admrm:${g.id}`);
+      if (!list.some((a) => a.id === g.id)) list.push(g);
+    }
+    await saveAdmins(env, list);
+    await env.STATE.delete("admins:grant");
+  }
+  const gone = await Promise.all(list.map((a) => env.STATE.get(`admrm:${a.id}`)));
+  const left = list.filter((_, i) => !gone[i]);
+  return left.length ? left : list;
 }
 async function claimable(env) {
   return !(await storedAdmins(env)).length && !env.ADMIN_ID?.trim() && !await env.STATE.get("admin:id");
@@ -488,6 +517,7 @@ async function claimAdmin(env, a) {
   await env.STATE.put("admin:id", String(a.id));
 }
 async function addAdmin(env, a) {
+  await env.STATE.delete(`admrm:${a.id}`);
   const list = await listAdmins(env);
   if (!list.some((x) => x.id === a.id)) await saveAdmins(env, [...list, a]);
 }
@@ -495,6 +525,7 @@ async function removeAdmin(env, id) {
   const list = await listAdmins(env);
   if (!list.some((x) => x.id === id)) return "absent";
   if (list.length < 2) return "last";
+  await env.STATE.put(`admrm:${id}`, String(Date.now()));
   await saveAdmins(env, list.filter((x) => x.id !== id));
   return "ok";
 }
@@ -3977,7 +4008,8 @@ async function onDone(env, mig, rc, reportedIp, confirmedFpr) {
 async function notifyAdmins(env, text, kb, to) {
   const tg = new Telegram(env);
   const list = to ?? await listAdmins(env);
-  await Promise.allSettled(list.map((a) => tg.send(a.id, text, kb)));
+  const res = await Promise.allSettled(list.map((a) => tg.send(a.id, text, kb)));
+  return res.filter((r) => r.status === "fulfilled").length;
 }
 
 // src/handlers.ts
@@ -4041,7 +4073,7 @@ async function onMessage(env, tg, msg) {
 async function onInvite(env, tg, from, chat, token, admins) {
   const inv = await peekInvite(env, token);
   if (!inv || !admins.some((a) => a.id === inv.by)) {
-    return void tg.send(chat, "\u0421\u0441\u044B\u043B\u043A\u0430-\u043F\u0440\u0438\u0433\u043B\u0430\u0448\u0435\u043D\u0438\u0435 \u043D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u0430: \u043E\u043D\u0430 \u043E\u0434\u043D\u043E\u0440\u0430\u0437\u043E\u0432\u0430\u044F \u0438 \u0436\u0438\u0432\u0451\u0442 \u0441\u0443\u0442\u043A\u0438. \u041F\u043E\u043F\u0440\u043E\u0441\u0438 \u043D\u043E\u0432\u0443\u044E.");
+    return void await tg.send(chat, "\u0421\u0441\u044B\u043B\u043A\u0430-\u043F\u0440\u0438\u0433\u043B\u0430\u0448\u0435\u043D\u0438\u0435 \u043D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u0430: \u043E\u043D\u0430 \u043E\u0434\u043D\u043E\u0440\u0430\u0437\u043E\u0432\u0430\u044F \u0438 \u0436\u0438\u0432\u0451\u0442 \u0441\u0443\u0442\u043A\u0438. \u041F\u043E\u043F\u0440\u043E\u0441\u0438 \u043D\u043E\u0432\u0443\u044E.");
   }
   await dropInvite(env, token);
   const req = { id: from.id, name: userName(from), by: inv.by, at: Date.now() };
@@ -4175,7 +4207,7 @@ async function removeAdmin2(env, tg, cqId, chat, mid, admins, me, id) {
   const target = admins.find((a) => a.id === id);
   const r = await removeAdmin(env, id);
   if (r === "last") {
-    await tg.answer(cqId, "\u041D\u0435\u043B\u044C\u0437\u044F \u0443\u0431\u0440\u0430\u0442\u044C \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u0435\u0433\u043E \u0430\u0434\u043C\u0438\u043D\u0430 \u2014 \u0431\u043E\u0442 \u043E\u0441\u0442\u0430\u043D\u0435\u0442\u0441\u044F \u0431\u0435\u0437 \u0445\u043E\u0437\u044F\u0438\u043D\u0430", true);
+    await tg.answer(cqId, "\u041D\u0435\u043B\u044C\u0437\u044F \u0443\u0431\u0440\u0430\u0442\u044C \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u0435\u0433\u043E \u0430\u0434\u043C\u0438\u043D\u0430 \u2014 \u0443 \u0431\u043E\u0442\u0430 \u0432\u0441\u0435\u0433\u0434\u0430 \u0435\u0441\u0442\u044C \u0445\u043E\u0442\u044F \u0431\u044B \u043E\u0434\u0438\u043D", true);
     return show(tg, chat, mid, adminList(admins, me.id));
   }
   const left = admins.filter((a) => a.id !== id);
@@ -4187,7 +4219,8 @@ async function removeAdmin2(env, tg, cqId, chat, mid, admins, me, id) {
   if (id === me.id) {
     await tg.answer(cqId, "\u0413\u043E\u0442\u043E\u0432\u043E");
     await show(tg, chat, mid, { text: "\u0422\u044B \u0431\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u0430\u0434\u043C\u0438\u043D \u044D\u0442\u043E\u0433\u043E \u0431\u043E\u0442\u0430.", kb: [] });
-    return notifyAdmins(env, `\u{1F46E} \u0411\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u0430\u0434\u043C\u0438\u043D \u0431\u043E\u0442\u0430: <b>${label(target)}</b> (\u043F\u043E \u0441\u0432\u043E\u0435\u043C\u0443 \u0440\u0435\u0448\u0435\u043D\u0438\u044E).`, void 0, left);
+    await notifyAdmins(env, `\u{1F46E} \u0411\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u0430\u0434\u043C\u0438\u043D \u0431\u043E\u0442\u0430: <b>${label(target)}</b> (\u043F\u043E \u0441\u0432\u043E\u0435\u043C\u0443 \u0440\u0435\u0448\u0435\u043D\u0438\u044E).`, void 0, left);
+    return;
   }
   await tg.answer(cqId, "\u0423\u0431\u0440\u0430\u043D");
   await show(tg, chat, mid, adminList(left, me.id));
@@ -4269,7 +4302,7 @@ async function runBackup(env, tg, chat, mid) {
 }
 async function addClientFromName(env, tg, chat, uid, name) {
   await setDialog(env, uid, { mode: "idle" });
-  if (!name) return void tg.send(chat, "\u041F\u0443\u0441\u0442\u043E\u0435 \u0438\u043C\u044F. \u041D\u0430\u0436\u043C\u0438 \u2795 \u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0435\u0449\u0451 \u0440\u0430\u0437.", mainMenu().kb);
+  if (!name) return void await tg.send(chat, "\u041F\u0443\u0441\u0442\u043E\u0435 \u0438\u043C\u044F. \u041D\u0430\u0436\u043C\u0438 \u2795 \u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0435\u0449\u0451 \u0440\u0430\u0437.", mainMenu().kb);
   const base = sanitizeLabel(name) || "client";
   const existing = await listClients(env);
   const label2 = uniqueLabel(base, existing.map((c) => c.email));
@@ -4277,7 +4310,7 @@ async function addClientFromName(env, tg, chat, uid, name) {
   await createClient(env, inboundId, label2, name.slice(0, 80));
   const after = await listClients(env);
   const created = after.find((c) => c.email === label2);
-  if (!created) return void tg.send(chat, "\u041A\u043B\u0438\u0435\u043D\u0442 \u0441\u043E\u0437\u0434\u0430\u043D, \u043D\u043E \u043D\u0435 \u043D\u0430\u0448\u0451\u043B\u0441\u044F \u043F\u0440\u0438 \u043F\u0435\u0440\u0435\u0447\u0438\u0442\u044B\u0432\u0430\u043D\u0438\u0438 \u2014 \u043E\u0442\u043A\u0440\u043E\u0439 \u0441\u043F\u0438\u0441\u043E\u043A.", mainMenu().kb);
+  if (!created) return void await tg.send(chat, "\u041A\u043B\u0438\u0435\u043D\u0442 \u0441\u043E\u0437\u0434\u0430\u043D, \u043D\u043E \u043D\u0435 \u043D\u0430\u0448\u0451\u043B\u0441\u044F \u043F\u0440\u0438 \u043F\u0435\u0440\u0435\u0447\u0438\u0442\u044B\u0432\u0430\u043D\u0438\u0438 \u2014 \u043E\u0442\u043A\u0440\u043E\u0439 \u0441\u043F\u0438\u0441\u043E\u043A.", mainMenu().kb);
   await tg.send(
     chat,
     `\u2705 \u041A\u043B\u0438\u0435\u043D\u0442 <b>${esc(name)}</b> \u0441\u043E\u0437\u0434\u0430\u043D. \u0421\u0441\u044B\u043B\u043A\u0430 \u043D\u0430 \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u0443 \u2014 \u043E\u0442\u043F\u0440\u0430\u0432\u044C \u0435\u0451 \u0434\u0440\u0443\u0433\u0443:
@@ -4325,7 +4358,7 @@ AWS, Oracle \u2014 \u0435\u0449\u0451 \u0438 \u0432 \u043F\u0430\u043D\u0435\u04
 async function migGotHost(env, tg, chat, uid, host) {
   const ip = host.trim();
   if (!/^[0-9a-zA-Z.:-]{3,100}$/.test(ip)) {
-    return void tg.send(chat, "\u042D\u0442\u043E \u043D\u0435 \u043F\u043E\u0445\u043E\u0436\u0435 \u043D\u0430 IP \u0438\u043B\u0438 \u0438\u043C\u044F. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437 \u0438\u043B\u0438 /start \u0434\u043B\u044F \u043E\u0442\u043C\u0435\u043D\u044B.");
+    return void await tg.send(chat, "\u042D\u0442\u043E \u043D\u0435 \u043F\u043E\u0445\u043E\u0436\u0435 \u043D\u0430 IP \u0438\u043B\u0438 \u0438\u043C\u044F. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437 \u0438\u043B\u0438 /start \u0434\u043B\u044F \u043E\u0442\u043C\u0435\u043D\u044B.");
   }
   await setDialog(env, uid, { mode: "mig_user", host: ip });
   await tg.send(chat, `\u0421\u0435\u0440\u0432\u0435\u0440: <code>${esc(ip)}</code>
@@ -4333,13 +4366,13 @@ async function migGotHost(env, tg, chat, uid, host) {
 }
 async function migGotUser(env, tg, chat, uid, host, user) {
   const u = user.trim() || "root";
-  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(u)) return void tg.send(chat, "\u0418\u043C\u044F \u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044F \u0441\u0442\u0440\u0430\u043D\u043D\u043E\u0435. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437.");
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(u)) return void await tg.send(chat, "\u0418\u043C\u044F \u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044F \u0441\u0442\u0440\u0430\u043D\u043D\u043E\u0435. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437.");
   await setDialog(env, uid, { mode: "mig_pass", host, user: u });
   await tg.send(chat, `\u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044C: <code>${esc(u)}</code>
 \u0422\u0435\u043F\u0435\u0440\u044C \u043F\u0440\u0438\u0448\u043B\u0438 \u043F\u0430\u0440\u043E\u043B\u044C \u043E\u0442 \u043D\u043E\u0432\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430. \u042F \u0443\u0434\u0430\u043B\u044E \u044D\u0442\u043E \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u0438\u0437 \u0434\u0438\u0430\u043B\u043E\u0433\u0430 \u043F\u043E\u0441\u043B\u0435 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0438.`);
 }
 async function migGotPass(env, tg, chat, uid, host, user, pass) {
-  if (!pass) return void tg.send(chat, "\u041F\u0443\u0441\u0442\u043E\u0439 \u043F\u0430\u0440\u043E\u043B\u044C. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437.");
+  if (!pass) return void await tg.send(chat, "\u041F\u0443\u0441\u0442\u043E\u0439 \u043F\u0430\u0440\u043E\u043B\u044C. \u041F\u0440\u0438\u0448\u043B\u0438 \u0435\u0449\u0451 \u0440\u0430\u0437.");
   const port = 22;
   await tg.send(chat, "\u23F3 \u041F\u0440\u043E\u0432\u0435\u0440\u044F\u044E \u0441\u0435\u0440\u0432\u0435\u0440 \u0438 \u0441\u043D\u0438\u043C\u0430\u044E \u043E\u0442\u043F\u0435\u0447\u0430\u0442\u043E\u043A \u043A\u043B\u044E\u0447\u0430\u2026");
   let fpr;
@@ -4350,7 +4383,7 @@ async function migGotPass(env, tg, chat, uid, host, user, pass) {
     serverVersion = pf.serverVersion;
   } catch (e) {
     await setDialog(env, uid, { mode: "idle" });
-    return void tg.send(chat, `\u041D\u0435 \u0434\u043E\u0441\u0442\u0443\u0447\u0430\u043B\u0441\u044F \u0434\u043E ${esc(host)}:${port} \u2014 ${esc(e.message)}. \u041F\u0440\u043E\u0432\u0435\u0440\u044C IP \u0438 \u0447\u0442\u043E \u0441\u0435\u0440\u0432\u0435\u0440 \u0432\u043A\u043B\u044E\u0447\u0451\u043D. /start`);
+    return void await tg.send(chat, `\u041D\u0435 \u0434\u043E\u0441\u0442\u0443\u0447\u0430\u043B\u0441\u044F \u0434\u043E ${esc(host)}:${port} \u2014 ${esc(e.message)}. \u041F\u0440\u043E\u0432\u0435\u0440\u044C IP \u0438 \u0447\u0442\u043E \u0441\u0435\u0440\u0432\u0435\u0440 \u0432\u043A\u043B\u044E\u0447\u0451\u043D. /start`);
   }
   let exitLine = "";
   if (chainConfigured(env) && exitHasFirewall(env)) {
@@ -4399,16 +4432,12 @@ async function migConfirm(env, tg, cq, chat, mid, uid) {
   await tg.answer(cq.id, "\u0417\u0430\u043F\u0443\u0441\u043A\u0430\u044E\u2026");
   await setDialog(env, uid, { mode: "idle" });
   await show(tg, chat, mid, working("\u0417\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u043F\u0435\u0440\u0435\u043D\u043E\u0441 \u043D\u0430 \u043D\u043E\u0432\u043E\u043C \u0441\u0435\u0440\u0432\u0435\u0440\u0435"));
+  let started = null;
   try {
     if (!await backupMeta(env)) throw new Error("\u043D\u0435\u0442 \u0431\u044D\u043A\u0430\u043F\u0430 \u2014 \u043D\u0430\u0447\u043D\u0438 \u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u0437\u0430\u043D\u043E\u0432\u043E");
     const token = crypto.randomUUID().replace(/-/g, "");
-    await startMigration(env, {
-      token,
-      chatId: String(chat),
-      host: dialog.host,
-      startedAt: Date.now(),
-      status: "running"
-    });
+    started = { token, chatId: String(chat), host: dialog.host, startedAt: Date.now(), status: "running" };
+    await startMigration(env, started);
     await env.STATE.put(`migfpr:${token}`, dialog.fpr, { expirationTtl: 1800 });
     await launch(env, {
       host: dialog.host,
@@ -4424,6 +4453,8 @@ async function migConfirm(env, tg, cq, chat, mid, uid) {
       kb: [[{ text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]]
     });
   } catch (e) {
+    if (started) await markMigrationFailed(env, started).catch(() => {
+    });
     await show(tg, chat, mid, errorScreen(`\u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u043F\u0435\u0440\u0435\u043D\u043E\u0441: ${e.message}`, "m"));
   }
 }
@@ -4540,8 +4571,8 @@ var index_default = {
         try {
           const actor = update?.message?.from?.id ?? update?.callback_query?.from?.id;
           const admins = await listAdmins(env);
-          const own = admins.filter((a) => a.id === actor);
-          await notifyAdmins(env, `\u26A0\uFE0F \u041E\u0448\u0438\u0431\u043A\u0430: ${e.message}`.slice(0, 300), void 0, own.length ? own : admins);
+          const to = actor === void 0 ? admins : admins.filter((a) => a.id === actor);
+          if (to.length) await notifyAdmins(env, `\u26A0\uFE0F \u041E\u0448\u0438\u0431\u043A\u0430: ${e.message}`.slice(0, 300), void 0, to);
         } catch {
         }
       }
@@ -4601,8 +4632,9 @@ async function runCron(env, now) {
         res = await checkBanGlobalping(env, ip, port);
       }
       const verdict = verdictOf(res);
+      let remember = CONCLUSIVE.has(verdict);
       if (verdict === "RU_BLOCKED" && !alerted) {
-        await notifyAdmins(
+        const got = await notifyAdmins(
           env,
           `\u{1F534} \u041F\u043E\u0445\u043E\u0436\u0435, IP \u0432\u0445\u043E\u0434\u0430 \u0437\u0430\u0431\u043B\u043E\u043A\u0438\u0440\u043E\u0432\u0430\u043B\u0438 \u0432 \u0420\u043E\u0441\u0441\u0438\u0438.
 
@@ -4610,8 +4642,9 @@ ${banResult(res).text}`,
           [[{ text: "\u{1F69A} \u041F\u0435\u0440\u0435\u0435\u0445\u0430\u0442\u044C", data: "mg" }], [{ text: "\u{1F30D} \u041F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \u0435\u0449\u0451 \u0440\u0430\u0437", data: "bn" }]],
           admins
         );
+        remember = got > 0;
       }
-      if (CONCLUSIVE.has(verdict)) await setLastBan(env, `${ip} ${verdict}`);
+      if (remember) await setLastBan(env, `${ip} ${verdict}`);
     }
   } catch {
   }

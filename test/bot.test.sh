@@ -730,39 +730,72 @@ test_validate_admins_list_from_kv() {  # бот уже ведёт список �
 	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admin%3Aid" '{"success":false,"errors":[{"code":10009,"message":"key not found"}]}'
 	bot_validate || t_fail "не прошла: $BOT_ERR"
 	t_eq 555 "$BOT_ADMIN_ID" "админ из списка бота"
-	t_eq 0 "${BOT_ADMIN_GRANT:-0}" "из KV — не «явно задан»: в список не дописываем"
+	t_eq "" "$BOT_GRANT_ID" "заявки нет — никого не добавляли"
 	! grep -q '^getUpdates' "$WORK/tg.calls" 2> /dev/null || t_fail "привязывал заново"
 }
-test_validate_explicit_admin_is_granted() {  # VPN_BOT_ADMIN_ID — явное «этот человек — админ»: попадёт и в список бота
+test_validate_explicit_admin_fresh_bot_is_first() {  # VPN_BOT_ADMIN_ID у нового бота — он и есть первый админ
 	validate_env; VPN_BOT_ADMIN_ID=42
 	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
 	bot_validate || t_fail "не прошла: $BOT_ERR"
-	t_eq 42 "$BOT_ADMIN_ID" "админ"
-	t_eq 1 "${BOT_ADMIN_GRANT:-0}" "дописать в список бота"
+	t_eq 42 "$BOT_ADMIN_ID" "первый админ"
+	t_eq "" "$BOT_GRANT_ID" "добавлять не к кому"
 }
-test_deploy_grants_explicit_admin_into_bot_list() {  # бот уже ведёт список — ADMIN_ID его не меняет, дописываем сами
-	deploy_env; BOT_ADMIN_GRANT=1 BOT_ADMIN_NAME="Аня (@anya)"
-	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins" '[{"id":7,"name":"Антон"}]'
-	bot_deploy || t_fail "не развернул: $BOT_ERR"
-	grep -qx 'PUT /accounts/A1/storage/kv/namespaces/K1/values/admins' "$WORK/cf.calls" || t_fail "список админов не записан"
-	t_eq "7:Антон 42:Аня (@anya)" "$(python3 -I -c 'import json, sys; print(" ".join("%d:%s" % (a["id"], a["name"]) for a in json.load(open(sys.argv[1]))))' "$(ls "$WORK"/cap.*.admins.json | tail -1)")" "список: прежние + новый"
+test_validate_explicit_admin_added_not_replacing() {  # у бота уже есть админ (ADMIN_ID) — VPN_BOT_ADMIN_ID добавляется, а не заменяет
+	other_server_env; BOT_WORKER_AUTO=0; VPN_BOT_ADMIN_ID=42
+	cf_set "GET /accounts/A1/workers/scripts/vpn-bot/settings" '{"success":true,"result":{"bindings":[{"type":"plain_text","name":"VPN_BOT_INSTALLER","text":"1"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.example.com"}]}}'
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://vpn-bot.sub1.workers.dev/tg"}}'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq "" "$BOT_ADMIN_ID" "ADMIN_ID прежний — не перезаписывается"
+	t_eq 42 "$BOT_GRANT_ID" "заявка на добавление"
 }
-test_deploy_grant_keeps_list_when_admin_already_there() {
-	deploy_env; BOT_ADMIN_GRANT=1
-	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins" '[{"id":42,"name":"Аня"}]'
-	bot_deploy || t_fail "не развернул: $BOT_ERR"
-	! grep -q 'values/admins$' <(grep '^PUT' "$WORK/cf.calls") || t_fail "переписал список, где админ уже есть"
+test_validate_explicit_admin_manual_bot_keeps_owner() {  # бот, поставленный руками (admin:id в KV), + VPN_BOT_ADMIN_ID
+	manual_bot_env; VPN_BOT_ADMIN_ID=42
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admin%3Aid" '123456789'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq 123456789 "$BOT_ADMIN_ID" "прежний админ остаётся первым"
+	t_eq 42 "$BOT_GRANT_ID" "новый — заявкой"
 }
-test_deploy_no_grant_without_bot_list() {  # списка ещё нет — бот возьмёт первого админа из ADMIN_ID сам
-	deploy_env; BOT_ADMIN_GRANT=1
-	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins" '{"success":false,"errors":[{"code":10009,"message":"key not found"}]}'
-	bot_deploy || t_fail "не развернул: $BOT_ERR"
-	! grep -q '^PUT .*values/admins$' "$WORK/cf.calls" || t_fail "завёл список вместо бота"
+grant_env() {  # повтор у нашего бота с админом: VPN_BOT_ADMIN_ID=42 → заявка admins:grant
+	deploy_env
+	settings '[{"type":"secret_text","name":"BOT_TOKEN"},{"type":"secret_text","name":"WEBHOOK_SECRET"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"secret_text","name":"PANEL_TOKEN"},{"type":"secret_text","name":"ENTRY_SSH_KEY"}]'
+	BOT_EXISTING=ours BOT_ADMIN_ID= BOT_GRANT_ID=42
 }
-test_deploy_no_grant_when_admin_not_explicit() {  # ADMIN_ID унаследован — список бота не трогаем совсем
-	deploy_env; BOT_ADMIN_GRANT=0
+grant_body() { python3 -I -c 'import json, sys; print(" ".join(str(a["id"]) for a in json.load(open(sys.argv[1]))))' "$(ls "$WORK"/cap.*.grant.json | tail -1)"; }
+test_deploy_grant_request_for_bot() {
+	grant_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '{"result":null,"success":false,"errors":[{"code":10009,"message":"get: '"'"'key not found'"'"'"}],"messages":[]}'
 	bot_deploy || t_fail "не развернул: $BOT_ERR"
-	! grep -q 'values/admins$' "$WORK/cf.calls" || t_fail "трогал список админов"
+	grep -qx 'PUT /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant' "$WORK/cf.calls" || t_fail "заявка не записана"
+	t_eq "42" "$(grant_body)" "в заявке — новый админ"
+	t_eq "inherit|" "$(mb ADMIN_ID)" "ADMIN_ID не перезаписан"
+	! grep -q 'values/admins$' "$WORK/cf.calls" || t_fail "трогал сам список админов бота"
+	t_has "добавлен к админам бота" "$BOT_REPORT" "отчёт"
+}
+test_deploy_grant_merges_pending_request() {  # прошлая заявка ещё не влита (бот не получал обновлений) — дописываем
+	grant_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '[{"id":5,"name":""}]'
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_eq "5 42" "$(grant_body)" "обе заявки"
+}
+test_deploy_grant_failure_is_not_fatal() {  # сбой записи заявки — бот всё равно разворачивается до конца (вебхук!)
+	grant_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '[]'
+	cf_set "PUT /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}'
+	tg_push setWebhook '{"ok":true,"result":true}'
+	bot_deploy || t_fail "сбой заявки уронил развёртывание: $BOT_ERR"
+	t_has "⚠ админа 42 не добавил" "$BOT_REPORT" "сказано в отчёте"
+}
+test_deploy_grant_read_error_skips() {  # Cloudflare не отдал заявки (не «ключа нет») — не пишем вслепую
+	grant_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}'
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	! grep -q '^PUT .*values/admins%3Agrant$' "$WORK/cf.calls" || t_fail "записал заявку вслепую"
+	t_has "⚠ админа 42 не добавил" "$BOT_REPORT" "сказано в отчёте"
+}
+test_deploy_no_grant_when_not_requested() {
+	deploy_env
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	! grep -q 'values/admins' "$WORK/cf.calls" || t_fail "трогал админов бота без VPN_BOT_ADMIN_ID"
 }
 test_validate_admin_id_must_be_number() {  # I6: @имя вместо id дало бы немого бота при «✓»
 	validate_env; VPN_BOT_ADMIN_ID=@ann
@@ -1257,7 +1290,7 @@ test_no_password_login_nag() {  # решение владельца 11.11: бе�
 
 # ——— Чужой 3x-ui: вопрос в самом начале, порты его подключений фаервол не закрывает ———
 xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports / fw_kept_ports; die/ok/warn — строками в $WORK/out
-	eval "$(awk '/^(foreign_xui_check|xui_inbound_ports|fw_kept_ports)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(foreign_xui_check|xui_inbound_ports|fw_kept_ports|ufw_active)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1334,8 +1367,18 @@ test_inbound_ports_by_protocol() {  # порты включённых подкл
 		'1081||mixed|{"udp":true}|{}|1' \
 		'9000|127.0.0.1|vless|{}|{"network":"ws"}|1' \
 		'9001||trojan|{}|{}|0' \
-		'9002|::1|vless|{}|{}|1'
-	t_eq "1080/tcp 1080/udp 1081/tcp 1081/udp 2083/tcp 4443/udp 8443/tcp 51820/udp" "$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "порты"
+		'9002|::1|vless|{}|{}|1' \
+		'8444||vless|{}|{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]}}|1'
+	t_eq "1080/tcp 1080/udp 1081/tcp 1081/udp 2083/tcp 4443/udp 8443/tcp 8444/tcp 8444/udp 51820/udp" "$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "порты"
+}
+test_fw_kept_ports_long_active_ufw() {  # длинный вывод включённого ufw: «| grep -q» под pipefail читал его как «выключен»
+	xui_fns
+	mkdb '8443||vmess|{}|{"network":"ws"}|1'
+	ufw() { echo "Status: active"; seq 1 200000 | sed 's/^/22\/tcp ALLOW IN Anywhere # /'; }
+	t_eq "" "$(fw_kept_ports)" "включённый ufw — порты не открываем"
+}
+test_no_ufw_status_pipelines() {  # «ufw status | grep» под pipefail путает «включён» с «выключен» — только через переменную
+	! grep -nE '^[^#]*ufw status[^|#]*\| *grep' "$ROOT/src/install-vpn.sh.in" || t_fail "остался конвейер ufw status | grep"
 }
 test_inbound_ports_no_db() {
 	xui_fns

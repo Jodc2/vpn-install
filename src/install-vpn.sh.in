@@ -517,6 +517,11 @@ case $WARP_CMD in
 esac
 
 # --- Общие проверки и мелочи ---
+ufw_active() {  # ufw включён? Вывод — через переменную: «ufw status | grep -q» под pipefail путает «включён» с «выключен»
+	local s
+	s=$(ufw status 2>/dev/null) || return 1
+	[[ $s == "Status: active"* ]]
+}
 in_container() {
 	if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -cq 2>/dev/null; then return 0; fi
 	[ -f /.dockerenv ] || [ -f /run/.containerenv ] || grep -qa 'container=' /proc/1/environ 2>/dev/null
@@ -1561,7 +1566,9 @@ if [ "$ok" != 1 ]; then
 fi
 rm -f "$DIR/config.bak.json"
 # Фаервол: если ufw активен — пустить новый сервер на порт цепочки (ssh не трогаем). Неактивный ufw не включаем, чтобы не запереть.
-if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+# Состояние ufw — через переменную: «ufw status | grep -q» под pipefail путает «включён» с «выключен».
+UFW_STATUS=$(command -v ufw >/dev/null && ufw status 2>/dev/null || true)
+if [[ $UFW_STATUS == "Status: active"* ]]; then
 	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
 	echo "EXIT_UFW=restricted"
 elif command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -qE -- '-j (REJECT|DROP)|^-P INPUT DROP'; then
@@ -2010,7 +2017,7 @@ issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCER
 		fi
 	fi
 	[ -z "$(port_users 80)" ] || { IPCERT_ERR="порт 80 занят ($(port_users 80)) — Let's Encrypt не сможет проверить сервер"; return 1; }
-	if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active' && ! ufw status | grep -qE '^80/tcp +ALLOW'; then
+	if ufw_active && ! grep -qE '^80/tcp +ALLOW' <<<"$(ufw status 2>/dev/null || true)"; then
 		ufw allow 80/tcp >/dev/null 2>&1 && opened80=1
 	fi
 	# Let's Encrypt проверяет сервер по http://IP/ — на время проверки acme.sh сам слушает :80 (socat).
@@ -3024,8 +3031,11 @@ for port, listen, proto, settings, stream, enable in db.execute(
         ss = {}
     proto = (proto or "").lower()
     net = str(ss.get("network") or "tcp").lower()
+    alpn = (ss.get("tlsSettings") or {}).get("alpn") or []
     if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
         kinds = {"udp"}
+    elif net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
+        kinds = {"tcp", "udp"}
     elif proto in ("shadowsocks", "dokodemo-door", "tunnel"):
         n = str(st.get("network") or "tcp").lower()
         kinds = {k for k in ("tcp", "udp") if k in n} or {"tcp"}
@@ -3039,7 +3049,7 @@ for port, kind in sorted(out):
 PY
 }
 fw_kept_ports() {  # фаервол ещё выключен — подключения панели снаружи доступны; их порты включённый ufw не должен закрыть
-	! ufw status 2>/dev/null | grep -q '^Status: active' || return 0   # уже включён — его правила остаются как есть
+	! ufw_active || return 0   # уже включён — его правила остаются как есть
 	xui_inbound_ports
 }
 say "Фаервол ufw"
@@ -3068,7 +3078,7 @@ if [ "$DO_UFW" = 1 ]; then
 	fi
 	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
 	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
-	if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+	if ! ufw_active; then
 		# Что ещё слушает снаружи, фаервол закроет — назвать, чтобы чужая служба не пропала молча.
 		CLOSING=$(ss -Htuln 2>/dev/null | awk '{print $1, $5}' | while read -r proto addr; do
 			case $addr in 127.* | "[::1]"* | *%lo:*) continue ;; esac

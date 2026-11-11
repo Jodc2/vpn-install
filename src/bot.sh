@@ -556,29 +556,41 @@ except Exception:
 	v=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admin%3Aid" 2> /dev/null) || return 0
 	if [[ $v =~ ^[0-9]+$ ]]; then printf '%s' "$v"; fi
 }
-bot_kv_grant() {  # админ, заданный явно (VPN_BOT_ADMIN_ID, «это ты?»), — в список админов бота, если бот его уже ведёт
+bot_kv_grant() {  # VPN_BOT_ADMIN_ID у бота, где админ уже есть, — заявкой admins:grant: бот вольёт её в список сам, не заменяя прежних
 	local body
-	[ "${BOT_ADMIN_GRANT:-0}" = 1 ] && [ -n "${BOT_ADMIN_ID:-}" ] && [ -n "${BOT_KV_ID:-}" ] || return 0
-	body=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admins" 2> /dev/null) || return 0
-	# Списка нет — бот возьмёт первого админа из ADMIN_ID сам; админ уже в списке — писать нечего.
-	python3 -I -c 'import json, sys
-try:
-    a = json.loads(sys.argv[1])
-except ValueError:
-    sys.exit(1)
+	[ -n "${BOT_GRANT_ID:-}" ] && [ -n "${BOT_KV_ID:-}" ] || return 0
+	body=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admins%3Agrant" 2> /dev/null) || body=
+	# Ответ — сама заявка (список) или конверт ошибки: «ключа нет» (10009) — заявок нет, остальное — сбой, вслепую не пишем.
+	if ! python3 -I -c 'import json, sys
 uid = int(sys.argv[2])
-if not isinstance(a, list) or not a or any(isinstance(x, dict) and x.get("id") == uid for x in a):
-    sys.exit(1)
-a.append({"id": uid, "name": sys.argv[3]})
-print(json.dumps(a, ensure_ascii=False))' "$body" "$BOT_ADMIN_ID" "${BOT_ADMIN_NAME:-}" > "$BOT_DIR/admins.json" || return 0
-	body=$(cf_api PUT "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admins" --data-binary @"$BOT_DIR/admins.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
-	cf_ok <<< "$body" || { BOT_ERR="не дописать админа в список бота — $(cf_err <<< "$body")"; return 1; }
-	BOT_REPORT+="админ ${BOT_ADMIN_NAME:-$BOT_ADMIN_ID} добавлен в список админов бота ✓"$'\n'
+try:
+    v = json.loads(sys.argv[1])
+except ValueError:
+    sys.exit(2)
+if isinstance(v, dict):
+    if v.get("success") is False and any(isinstance(e, dict) and e.get("code") == 10009 for e in v.get("errors") or []):
+        v = []
+    else:
+        sys.exit(2)
+if not isinstance(v, list):
+    sys.exit(2)
+if not any(isinstance(x, dict) and x.get("id") == uid for x in v):
+    v.append({"id": uid, "name": ""})
+print(json.dumps(v))' "$body" "$BOT_GRANT_ID" > "$BOT_DIR/grant.json"; then
+		BOT_REPORT+="⚠ админа $BOT_GRANT_ID не добавил: Cloudflare не отдал заявки бота (повторить: VPN_BOT_ADMIN_ID=$BOT_GRANT_ID bash $0 --bot)"$'\n'
+		return 0
+	fi
+	if body=$(cf_api PUT "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admins%3Agrant" --data-binary @"$BOT_DIR/grant.json") && cf_ok <<< "$body"; then
+		BOT_REPORT+="админ $BOT_GRANT_ID добавлен к админам бота ✓"$'\n'
+	else
+		BOT_REPORT+="⚠ админа $BOT_GRANT_ID не добавил — $(cf_err <<< "${body:-}") (повторить: VPN_BOT_ADMIN_ID=$BOT_GRANT_ID bash $0 --bot)"$'\n'
+	fi
 }
 
 bot_validate() {  # всё, что проверяется до установки: токены, чужой воркер и вебхук, бот другого сервера, владелец
+	local had=''
 	local n=0 was why
-	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ADMIN_ID='' BOT_ADMIN_NAME='' BOT_ADMIN_GRANT=0
+	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ADMIN_ID='' BOT_ADMIN_NAME='' BOT_GRANT_ID=''
 	bot_cf_check || return 1
 	# Имя не задано явно, а воркер с ним — чужой или управляет VPN другого сервера: этому серверу — свой воркер.
 	while [ "${BOT_WORKER_AUTO:-0}" = 1 ]; do
@@ -617,17 +629,23 @@ bot_validate() {  # всё, что проверяется до установк�
 			BOT_ERR="VPN_BOT_ADMIN_ID — числовой id в Телеграме (вида 123456789), а не @имя"
 			return 1
 		fi
-		BOT_ADMIN_ID=$VPN_BOT_ADMIN_ID BOT_ADMIN_GRANT=1
+		had=$(bot_kv_admin)
+		if bot_has_binding ADMIN_ID || [ -n "$had" ]; then
+			# У бота уже есть админ: этот добавится к нему (заявкой admins:grant, bot_kv_grant), а не заменит его.
+			BOT_GRANT_ID=$VPN_BOT_ADMIN_ID
+			bot_has_binding ADMIN_ID || BOT_ADMIN_ID=$had   # бот, поставленный руками: прежний админ — в ADMIN_ID
+		else
+			BOT_ADMIN_ID=$VPN_BOT_ADMIN_ID
+		fi
 	elif bot_has_binding ADMIN_ID; then
-		:   # владелец прежний
+		:   # админ прежний
 	elif BOT_ADMIN_ID=$(bot_kv_admin) && [ -n "$BOT_ADMIN_ID" ]; then
-		:   # бот, поставленный руками: владелец записан в его KV — сохраняется
+		:   # бот, поставленный руками: админ записан в его KV — сохраняется
 	elif [ ! -s "$BOT_DIR/tg.token" ]; then
 		BOT_ERR="у бота нет админа, а привязать первого можно только по токену бота — дай токен бота (или VPN_BOT_ADMIN_ID)"
 		return 1
 	else
 		bot_pair || return 1
-		BOT_ADMIN_GRANT=1
 	fi
 }
 
@@ -843,7 +861,7 @@ for x in (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or [
 	[ "$(cat "$BOT_DIR/fpr.json")" != "[]" ] || { BOT_ERR="не найдены ключи SSH этого сервера ($BOT_HOST_KEYS)"; return 1; }
 	body=$(cf_api PUT "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/entry%3Afpr" --data-binary @"$BOT_DIR/fpr.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
 	cf_ok <<< "$body" || { BOT_ERR="не записать отпечаток сервера в KV — $(cf_err <<< "$body")"; return 1; }
-	bot_kv_grant || return 1
+	bot_kv_grant   # не роняет развёртывание: сбой — строкой ⚠ в отчёте
 	# Первый бэкап — сразу в хранилище: переезд работает с первой минуты. Не вышло — не беда, бот снимет сам.
 	if [ -x "$BOT_BACKUP_CMD" ] && p=$("$BOT_BACKUP_CMD" 2> /dev/null | tail -1) && [ -f "$p" ]; then
 		python3 -I -c 'import json, os, sys, time; print(json.dumps({"name": os.path.basename(sys.argv[1]), "size": os.path.getsize(sys.argv[1]), "createdAt": int(time.time() * 1000)}))' "$p" > "$BOT_DIR/backup.meta"
