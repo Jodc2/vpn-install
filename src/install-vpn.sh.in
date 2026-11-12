@@ -3015,35 +3015,48 @@ xui_inbound_ports() {  # «порт/протокол» включённых по
 	python3 -I - "$DB" <<'PY' 2>/dev/null || true
 import json, sqlite3, sys
 db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+
+
+def obj(text):  # JSON-объект из поля базы; всё остальное (null, список, строка, не JSON) — пустой объект
+    try:
+        v = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def kinds_of(proto, st, ss):  # что слушает подключение: tcp, udp или оба
+    proto = str(proto or "").lower()
+    net = str(ss.get("network") or "tcp").lower()
+    tls = ss.get("tlsSettings")
+    alpn = (tls.get("alpn") if isinstance(tls, dict) else None) or []
+    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
+        return {"udp"}
+    if net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
+        return {"tcp", "udp"}
+    if proto in ("shadowsocks", "dokodemo-door", "tunnel"):
+        n = str(st.get("network") or "tcp").lower()
+        return {k for k in ("tcp", "udp") if k in n} or {"tcp"}
+    if proto in ("mixed", "socks"):
+        return {"tcp", "udp"} if st.get("udp") else {"tcp"}
+    return {"tcp"}
+
+
 out = set()
 for port, listen, proto, settings, stream, enable in db.execute(
         "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
-    listen = (listen or "").strip()
-    if not enable or not port or listen.startswith(("127.", "/", "@")) or listen in ("::1", "[::1]", "localhost"):
+    listen = str(listen or "").strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        continue
+    if not enable or port <= 0 or listen.startswith(("127.", "/", "@")) or listen in ("::1", "[::1]", "localhost"):
         continue
     try:
-        st = json.loads(settings or "{}")
-    except ValueError:
-        st = {}
-    try:
-        ss = json.loads(stream or "{}")
-    except ValueError:
-        ss = {}
-    proto = (proto or "").lower()
-    net = str(ss.get("network") or "tcp").lower()
-    alpn = (ss.get("tlsSettings") or {}).get("alpn") or []
-    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
-        kinds = {"udp"}
-    elif net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
-        kinds = {"tcp", "udp"}
-    elif proto in ("shadowsocks", "dokodemo-door", "tunnel"):
-        n = str(st.get("network") or "tcp").lower()
-        kinds = {k for k in ("tcp", "udp") if k in n} or {"tcp"}
-    elif proto in ("mixed", "socks"):
-        kinds = {"tcp", "udp"} if st.get("udp") else {"tcp"}
-    else:
+        kinds = kinds_of(proto, obj(settings), obj(stream))
+    except Exception:   # строку не разобрать — порт всё равно не терять (считаем его TCP), остальные строки читаем дальше
         kinds = {"tcp"}
-    out.update((int(port), k) for k in kinds)
+    out.update((port, k) for k in kinds)
 for port, kind in sorted(out):
     print("%d/%s" % (port, kind))
 PY

@@ -1420,6 +1420,22 @@ test_passwall_tmp_room_is_free_memory() {  # /tmp роутера — в памя
 	done
 }
 
+# Основной скрипт: функции берутся из шаблона по именам (как в xui_fns), ufw и прочее — заглушки.
+test_inbound_ports_odd_row_keeps_the_rest() {  # settings или stream_settings — не объект (null, [], строка): разбор падал, и список портов молча пустел
+	xui_fns
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' \
+		'8443||vmess|null|null|1' \
+		'8444||trojan|[]|[]|1' \
+		'8445||vless|"x"|"y"|1' \
+		'8446||vless|{}|{"network":"ws","tlsSettings":"не объект"}|1' \
+		'8447||shadowsocks|[1]|{}|1' \
+		'8448||vless|{}|{"network":"xhttp","tlsSettings":{"alpn":"h3"}}|1' \
+		'8449||vless|{не json|{и это тоже|1' \
+		'51820||wireguard|null|null|1'
+	t_eq "2083/tcp 8443/tcp 8444/tcp 8445/tcp 8446/tcp 8447/tcp 8448/tcp 8448/udp 8449/tcp 51820/udp" \
+		"$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "порты: странные строки не теряются и не роняют остальные"
+}
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.
