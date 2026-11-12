@@ -233,10 +233,23 @@ exit_ssh_defaults
 DO_UFW=${DO_UFW:-$(state_val S_DO_UFW || true)}; DO_UFW=${DO_UFW:-1}
 DO_F2B=${DO_F2B:-$(state_val S_DO_F2B || true)}; DO_F2B=${DO_F2B:-1}
 TZ_NAME=${TZ_NAME:-$(state_val S_TZ || true)}; TZ_NAME=${TZ_NAME:-Europe/Moscow}
+foreign_on_port() {  # foreign_on_port ПОРТ [СВОЙ_ID] → id другого подключения панели на этом порту (включённого или нет:
+	# панель не даст создать на нём второе); пусто — порт в панели свободен или базу нечем прочитать
+	[ -f "$DB" ] || return 0
+	python3 -I -c 'import sqlite3, sys
+r = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute(
+    "select id from inbounds where port=? and id<>? order by id limit 1", (int(sys.argv[2]), int(sys.argv[3]))).fetchone()
+print(r[0] if r else "")' "$DB" "$1" "${2:-0}" 2> /dev/null ||
+		sqlite3 -readonly "$DB" "select id from inbounds where port=$(($1)) and id<>$((${2:-0})) order by id limit 1;" 2> /dev/null || true
+}
 foreign_xui_check() {  # 3x-ui здесь ставили без этого скрипта: сказать, что будет, и спросить сразу — до любых вопросов и изменений
-	local n
+	local n p=${PORT_ARG:-2083}
 	[ -f "$DB" ] && [ ! -f "$STATE" ] || return 0
 	! compgen -G "$STATE.failed-*" > /dev/null || return 0   # следы неудачной попытки этого скрипта — 3x-ui его
+	# Своё подключение скрипт создаёт сам, на своём порту, а чужие не трогает. Порт занят чужим — сказать сразу.
+	if [[ $p =~ ^[0-9]{1,5}$ ]] && [ -n "$(foreign_on_port "$p")" ]; then
+		die "здесь уже есть 3x-ui, поставленный не этим скриптом, и на порту $p у него есть подключение. Своё подключение скрипт создаёт на этом порту, а чужие не трогает — запустите с другим портом: bash $0 --port N. Ничего не менял"
+	fi
 	n=$(python3 -I -c 'import sqlite3, sys; print(sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select count(*) from inbounds").fetchone()[0])' "$DB" 2> /dev/null ||
 		sqlite3 -readonly "$DB" 'select count(*) from inbounds;' 2> /dev/null || echo '?')
 	warn "здесь уже есть 3x-ui, поставленный не этим скриптом (подключений: $n). Удалять его скрипт не будет: подключения и клиенты останутся, их порты фаервол не закроет. Заменятся логин, пароль, порт и путь панели, шаблон Xray (маршрутизация), адреса подписок и сама программа — на 3x-ui $XUI_VERSION. Копия базы останется рядом с ней"
@@ -313,23 +326,56 @@ else
 	fi
 fi
 # Порт подключения Reality — как у основного сервера, 2083, с доменом и без (--port меняет).
-# Повторный запуск берёт порт уже созданного подключения из базы: иначе установка прежней версией
-# (без домена ставила 443) получила бы второе подключение.
-existing_reality_port() {
-	[ -f "$DB" ] && command -v python3 >/dev/null 2>&1 || return 0
-	python3 - "$DB" <<'PY' 2>/dev/null || true
+# Своё подключение — то, чей id скрипт записал в настройки установки, когда создал его (S_INBOUND_ID). 0 — ещё не создано:
+# первый запуск (в том числе поверх чужого 3x-ui) или прошлая попытка до него не дошла. Подключения, которые были в панели
+# до скрипта, своими не считаются никогда: он их не переносит и не трогает.
+# В настройках прежних версий id нет — там, как и раньше, своим считается первое VLESS + Reality в базе: иначе установка
+# прежней версией (без домена ставила 443) получила бы второе подключение.
+own_inbound() {  # → «id порт» своего подключения; пусто — его нет
+	[ "$S_INBOUND_ID" != 0 ] && [ -f "$DB" ] && command -v python3 >/dev/null 2>&1 || return 0
+	python3 - "$DB" "$S_INBOUND_ID" <<'PY' 2>/dev/null || true
 import json, sqlite3, sys
 db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-for port, ss in db.execute("select port, stream_settings from inbounds where protocol='vless' order by id"):
+if sys.argv[2]:   # id известен: своё — только оно
+    for row in db.execute("select id, port from inbounds where id=?", (int(sys.argv[2]),)):
+        print(*row)
+    sys.exit()
+for iid, port, ss in db.execute("select id, port, stream_settings from inbounds where protocol='vless' order by id"):
     try:
         if json.loads(ss or "{}").get("security") == "reality":
-            print(port)
+            print(iid, port)
             break
-    except ValueError:
+    except (ValueError, AttributeError):
         pass
 PY
 }
-OLD_REALITY_PORT=$(existing_reality_port)
+find_own_inbound() {  # → S_INBOUND_ID (из настроек), OWN_INBOUND_ID и OLD_REALITY_PORT (id и нынешний порт своего подключения)
+	S_INBOUND_ID=$(state_val S_INBOUND_ID || true)
+	[[ $S_INBOUND_ID =~ ^[0-9]+$ ]] || S_INBOUND_ID=
+	# Настроек установки нет — чистый сервер, чужой 3x-ui или сброшенная неудачная попытка: своего подключения ещё нет.
+	[ -f "$STATE" ] || S_INBOUND_ID=0
+	OWN_INBOUND_ID='' OLD_REALITY_PORT=''
+	read -r OWN_INBOUND_ID OLD_REALITY_PORT <<<"$(own_inbound)" || true
+}
+port_taken_check() {  # порт своего подключения занят в панели другим — остановиться, пока ничего не изменено
+	local other
+	[ -n "$S_INBOUND_ID" ] || return 0   # настройки прежней версии: своё подключение там — по признакам, как раньше
+	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-0}")
+	[ -z "$other" ] || die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N"
+}
+inbound_move() {  # inbound_move ID СТАРЫЙ_ПОРТ НОВЫЙ_ПОРТ — перенести своё подключение, и только его (x-ui остановлен)
+	# Имя подключения 3x-ui содержит порт (in-2083-tcp, в старых версиях inbound-2083) — заменить в нём номер.
+	python3 - "$DB" "$1" "$2" "$3" <<'PY'
+import re, sqlite3, sys
+path, iid, old, new = sys.argv[1:5]
+db = sqlite3.connect(path)
+for iid, tag in db.execute("select id, tag from inbounds where id=?", (int(iid),)).fetchall():
+    newtag = re.sub(r"(?<![0-9])%s(?![0-9])" % re.escape(old), new, tag or "") or "in-%s-tcp" % new
+    db.execute("update inbounds set port=?, listen='0.0.0.0', tag=? where id=?", (int(new), newtag, iid))
+db.commit()
+PY
+}
+find_own_inbound
 S_REALITY_PORT=$(state_val S_REALITY_PORT || true)
 reset_failed_attempt() {  # смена варианта после неудачной первой установки: убрать то, что успела сделать прошлая попытка
 	local d=$S_DOMAIN_OLD ip
@@ -346,7 +392,7 @@ reset_failed_attempt() {  # смена варианта после неудач�
 		rm -rf "/root/.acme.sh/${ip}_ecc" /etc/x-ui/ip-cert
 	fi
 	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"   # по этому следу foreign_xui_check потом узнает свой 3x-ui
-	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
+	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' S_INBOUND_ID=0 CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
 	exit_ssh_defaults
 }
 if [ "${MODE_CHANGED:-0}" = 1 ]; then
@@ -1031,6 +1077,17 @@ sub_list() {  # «подпись|subId» включённых клиентов; 
 	sqlite3 -readonly -separator '|' "$DB" "select replace(coalesce(nullif(comment, ''), email), '|', '/'), sub_id from clients where enable=1 and sub_id<>'' order by id;"
 }
 
+check_sub_id() {  # subId клиента, по ссылке которого проверяется туннель: первый включённый клиент своего подключения.
+	# У чужих подключений панели свои клиенты и свои адреса в ссылках — проверка по ним была бы не о том. Своё подключение
+	# неизвестно (настройки прежних версий) или клиентов у него нет — первый включённый клиент панели, как раньше.
+	local sid=""
+	if [[ ${S_INBOUND_ID:-} =~ ^[1-9][0-9]*$ ]]; then
+		sid=$(sqlite3 -readonly "$DB" "select c.sub_id from clients c join client_inbounds ci on ci.client_id = c.id where ci.inbound_id = $S_INBOUND_ID and c.enable = 1 and c.sub_id <> '' order by c.id limit 1;" 2>/dev/null || true)
+	fi
+	[ -n "$sid" ] || sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;" 2>/dev/null || true)
+	echo "$sid"
+}
+
 sub_fetch() {  # sub_fetch SUBID → строки подписки (ссылки) с сервера подписок
 	local raw
 	if [ "$MODE" = domain ]; then
@@ -1116,7 +1173,7 @@ local_checks() {
 			fi
 		fi
 	fi
-	sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;" 2>/dev/null || true)
+	sid=$(check_sub_id)
 	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" = 1 ] && [ -n "$sid" ]; then
 		# Как приложение: по адресу IP, с проверкой сертификата.
 		code=$(curl -s $IPK -o /dev/null -w '%{http_code}' --max-time 15 --connect-to "$PUBLIC_IP:$SUB_PORT:$LISTEN_IP:$SUB_PORT" "https://$PUBLIC_IP:$SUB_PORT$SUB_PATH$sid" || true)
@@ -1240,6 +1297,7 @@ S_DO_F2B='${DO_F2B:-1}'
 S_TZ='${TZ_NAME:-}'
 S_DONE='${S_DONE:-0}'
 S_REALITY_PORT='$REALITY_PORT'
+S_INBOUND_ID='${S_INBOUND_ID:-}'
 CHAIN_IP='${CHAIN_IP:-}'
 CHAIN_PORT='${CHAIN_PORT:-}'
 CHAIN_UUID='${CHAIN_UUID:-}'
@@ -2262,7 +2320,7 @@ if [ -n "$WARP_CMD" ]; then
 	apply_exit "$TARGET_EXIT" "$WARP_FILE" || warn "x-ui долго поднимается после смены выхода"
 	# Настоящий туннель по ссылке первого клиента: на проверочном адресе (не российском) WARP должен
 	# включиться только в режиме on.
-	sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;")
+	sid=$(check_sub_id)
 	link=$(sub_fetch "$sid" | grep -m1 '^vless://' || true)
 	read -r code exit_ip exit_warp log <<<"$(tunnel_check "$link")"
 	want_warp=off
@@ -2317,6 +2375,7 @@ if [ "$MODE" = domain ]; then
 fi
 u=$(port_users "$REALITY_PORT")
 case $u in "" | xray* | x-ui*) ;; *) die "порт $REALITY_PORT занят: $u— освободите его (на этом сервере не должно быть другого сайта)" ;; esac
+port_taken_check   # слушает xray — а чьё подключение? (python3 уже есть: базу есть чем прочитать)
 if [ "$MODE" = domain ]; then ok "порты 80, 443 и $REALITY_PORT свободны"; else ok "порт $REALITY_PORT свободен"; fi
 
 detect_ips
@@ -2757,16 +2816,7 @@ MOVED_FROM=
 if [ -n "$OLD_REALITY_PORT" ] && [ "$OLD_REALITY_PORT" != "$REALITY_PORT" ]; then
 	[ -z "$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")" ] ||
 		die "на порту $REALITY_PORT в панели уже есть другое подключение — выберите другой --port"
-	# Имя подключения 3x-ui содержит порт (in-2083-tcp, в старых версиях inbound-2083) — заменить в нём номер.
-	python3 - "$DB" "$OLD_REALITY_PORT" "$REALITY_PORT" <<'PY' || die "не удалось перенести подключение на порт $REALITY_PORT"
-import re, sqlite3, sys
-path, old, new = sys.argv[1:4]
-db = sqlite3.connect(path)
-for iid, tag in db.execute("select id, tag from inbounds where port=?", (int(old),)).fetchall():
-    newtag = re.sub(r"(?<![0-9])%s(?![0-9])" % re.escape(old), new, tag or "") or "in-%s-tcp" % new
-    db.execute("update inbounds set port=?, listen='0.0.0.0', tag=? where id=?", (int(new), newtag, iid))
-db.commit()
-PY
+	inbound_move "$OWN_INBOUND_ID" "$OLD_REALITY_PORT" "$REALITY_PORT" || die "не удалось перенести подключение на порт $REALITY_PORT"
 	MOVED_FROM=$OLD_REALITY_PORT
 	ok "подключение перенесено с :$OLD_REALITY_PORT на :$REALITY_PORT (ключи и клиенты те же)"
 	if [ "$MODE" = domain ]; then
@@ -2834,7 +2884,8 @@ wait_port ":$WEB_PORT" 40 || die "панель x-ui не поднялась на
 
 # API панели — по одноразовому токену, после настройки токен удаляется.
 api_open
-INBOUND_ID=$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")
+port_taken_check   # ещё раз, перед самим созданием: панель уже работает, и база с начала запуска могла измениться
+INBOUND_ID=${OWN_INBOUND_ID:-$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")}
 if [ -n "$INBOUND_ID" ]; then
 	ok "подключение на :$REALITY_PORT уже есть (#$INBOUND_ID), клиенты прежние"
 else
@@ -2874,6 +2925,9 @@ PY
 		ok "подключение VLESS + XHTTP + Reality на :$REALITY_PORT под $REALITY_SNI, клиентов: $CLIENTS"
 	fi
 fi
+# Своё подключение дальше узнаётся только по этому id — записать сразу, пока запуск не оборвался.
+S_INBOUND_ID=${INBOUND_ID:-$S_INBOUND_ID}
+save_state
 
 if [ "$EXIT_MODE" != direct ] && [ "$HAVE_WARP" = 0 ]; then
 	if warp_register "$WORK/warp.json"; then

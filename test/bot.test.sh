@@ -1290,11 +1290,11 @@ test_no_password_login_nag() {  # решение владельца 11.11: бе�
 
 # ——— Чужой 3x-ui: вопрос в самом начале, порты его подключений фаервол не закрывает ———
 xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports / fw_kept_ports; die/ok/warn — строками в $WORK/out
-	eval "$(awk '/^(foreign_xui_check|xui_inbound_ports|fw_kept_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(foreign_xui_check|foreign_on_port|xui_inbound_ports|fw_kept_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
-	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0
+	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
 	: > "$WORK/out"
 }
 mkdb() {  # mkdb "порт|listen|протокол|settings|stream|enable" … → $DB с таблицей inbounds, как у 3x-ui
@@ -1774,6 +1774,128 @@ EOF
 	kill "$child" "$parent" 2> /dev/null || true
 	t_eq "2233 " "$n" "только порт самого sshd, без портов, проброшенных его сеансом"
 }
+
+# Своё и чужое подключение (пункт 4). Таблица — как у mkdb, плюс имя подключения (tag), как его даёт 3x-ui.
+REALITY='{"network":"tcp","security":"reality"}'
+own_fns() {
+	eval "$(grep -m1 '^state_val() {' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(own_inbound|find_own_inbound|foreign_on_port|port_taken_check|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
+	ok() { echo "OK $*" >> "$WORK/out"; }
+	warn() { echo "WARN $*" >> "$WORK/out"; }
+	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
+	S_INBOUND_ID='' OWN_INBOUND_ID='' OLD_REALITY_PORT='' REALITY_PORT=2083
+	: > "$WORK/out"; rm -f "$DB" "$STATE" "$STATE".failed-*
+}
+mkdb_tags() {  # mkdb + столбец tag: «in-ПОРТ-tcp»
+	mkdb "$@"
+	python3 -I -c 'import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("alter table inbounds add column tag text")
+db.execute("update inbounds set tag = \"in-\" || port || \"-tcp\"")
+db.commit()' "$DB"
+}
+inbounds() { python3 -I -c 'import sqlite3, sys
+print(" ".join("%s:%s:%s" % r for r in sqlite3.connect(sys.argv[1]).execute("select id, port, tag from inbounds order by id")))' "$DB"; }
+sql() { python3 -I -c 'import sqlite3, sys
+db = sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()' "$DB" "$1"; }
+own() { find_own_inbound; echo "id=$S_INBOUND_ID свой=$OWN_INBOUND_ID порт=$OLD_REALITY_PORT"; }
+
+test_own_inbound_never_a_foreign_one() {  # чужой 3x-ui с VLESS + Reality: его подключение — не своё, ни на первом запуске, ни после
+	own_fns
+	mkdb_tags "443||vless|{}|$REALITY|1" '8443||vmess|{}|{}|1'
+	t_eq "id=0 свой= порт=" "$(own)" "первый запуск поверх чужого 3x-ui (настроек установки нет)"
+	: > "$STATE.failed-20261112-000000"
+	t_eq "id=0 свой= порт=" "$(own)" "после сброшенной неудачной попытки (остался только след)"
+	rm -f "$STATE".failed-*
+	echo "S_INBOUND_ID='0'" > "$STATE"
+	t_eq "id=0 свой= порт=" "$(own)" "прошлая попытка до создания подключения не дошла"
+	sql "insert into inbounds (port, listen, protocol, settings, stream_settings, enable, tag) values (2083, '', 'vless', '{}', '$REALITY', 1, 'in-2083-tcp')"
+	echo "S_INBOUND_ID='3'" > "$STATE"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "своё — то, чей id записан при создании, а не первое VLESS + Reality в базе"
+	sql "update inbounds set port=9443 where id=2; update inbounds set port=8443 where id=3"
+	t_eq "id=3 свой=3 порт=8443" "$(own)" "порт своего подключения поменяли в панели — берётся нынешний"
+	sql "delete from inbounds where id=3"
+	t_eq "id=3 свой= порт=" "$(own)" "своё подключение удалили в панели — чужое вместо него своим не становится"
+}
+test_own_inbound_old_install_as_before() {  # настройки прежней версии (id подключения в них нет): своё — первое VLESS + Reality, как раньше
+	own_fns
+	mkdb_tags '8443||vmess|{}|{}|1' "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1"
+	printf "%s\n" "S_MODE='nodomain'" "S_DONE='1'" > "$STATE"
+	t_eq "id= свой=2 порт=443" "$(own)" "прежняя версия без домена ставила 443 — второго подключения не будет"
+	printf "%s\n" "S_MODE='nodomain'" "S_INBOUND_ID='мусор'" > "$STATE"
+	t_eq "id= свой=2 порт=443" "$(own)" "нечисловой id в настройках — как будто его нет"
+	rm -f "$DB"; mkdb_tags '8443||vmess|{}|{}|1'
+	printf "%s\n" "S_MODE='nodomain'" > "$STATE"
+	t_eq "id= свой= порт=" "$(own)" "VLESS + Reality в базе нет — своего нет"
+}
+test_foreign_xui_port_taken_stops_before_question() {  # порт своего подключения занят чужим — стоп до вопросов и изменений
+	local out
+	own_fns; answers y y y
+	mkdb_tags "2083||vless|{}|$REALITY|1" '8443||vmess|{}|{}|1'
+	! ( foreign_xui_check ) || t_fail "пошёл дальше, хотя порт 2083 занят чужим подключением"
+	out=$(cat "$WORK/out")
+	t_has "DIE " "$out" "остановка"; t_has "2083" "$out" "какой порт занят"; t_has "--port" "$out" "что делать"
+	! grep -q 'Продолжить?' "$WORK/tty.out" 2> /dev/null || t_fail "вопрос задан, хотя ставить некуда"
+	: > "$WORK/out"; PORT_ARG=8443
+	! ( foreign_xui_check ) || t_fail "пошёл дальше, хотя порт из --port занят чужим подключением"
+	t_has "8443" "$(cat "$WORK/out")" "какой порт занят (--port)"
+	: > "$WORK/out"; PORT_ARG=3000
+	foreign_xui_check
+	t_eq 1 "$FOREIGN_XUI" "свободный --port — обычный вопрос и согласие"
+	! grep -q '^DIE' "$WORK/out" || t_fail "остановился на свободном порту: $(cat "$WORK/out")"
+}
+test_port_taken_check_by_state() {  # та же проверка перед изменениями — когда база не читалась в самом начале и на повторных запусках
+	own_fns
+	mkdb_tags "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1" '3000||vmess|{}|{}|0'
+	S_INBOUND_ID=0 OWN_INBOUND_ID='' REALITY_PORT=2083
+	! ( port_taken_check ) || t_fail "своего ещё нет, порт 2083 занят чужим — должен остановиться"
+	t_has "2083" "$(cat "$WORK/out")" "какой порт"; t_has "--port" "$(cat "$WORK/out")" "что делать"
+	S_INBOUND_ID=0 OWN_INBOUND_ID='' REALITY_PORT=2084
+	( port_taken_check ) || t_fail "порт 2084 свободен: $(cat "$WORK/out")"
+	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=2083
+	( port_taken_check ) || t_fail "на порту своё подключение: $(cat "$WORK/out")"
+	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=443
+	! ( port_taken_check ) || t_fail "--port 443 на повторном запуске, а там чужое — должен остановиться"
+	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=3000
+	! ( port_taken_check ) || t_fail "выключенное чужое подключение тоже занимает порт в панели"
+	S_INBOUND_ID=7 OWN_INBOUND_ID='' REALITY_PORT=2083
+	! ( port_taken_check ) || t_fail "своё подключение удалено, на его порту другое — оно не своё"
+	S_INBOUND_ID='' OWN_INBOUND_ID=1 REALITY_PORT=2083
+	( port_taken_check ) || t_fail "настройки прежней версии — как раньше, без этой проверки: $(cat "$WORK/out")"
+}
+test_inbound_move_touches_only_own() {  # --port переносит своё подключение — и только его
+	own_fns
+	mkdb_tags "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1" "2083|203.0.113.7|vless|{}|$REALITY|1"
+	inbound_move 2 2083 3000
+	t_eq "1:443:in-443-tcp 2:3000:in-3000-tcp 3:2083:in-2083-tcp" "$(inbounds)" "перенесено своё (#2), остальные на месте"
+}
+test_state_keeps_inbound_id() {  # id своего подключения переживает запись и чтение настроек; у прежних настроек он так и остаётся пустым
+	own_fns
+	MODE=nodomain DOMAIN='' PANEL_USER=u PANEL_PASS=p WEB_PORT=54321 WEB_PATH=/w/ SUB_PATH=/s/ CLASH_PATH=/c/ JSON_PATH=/j/ EXIT_MODE=direct
+	S_INBOUND_ID=5 save_state
+	t_eq 5 "$(state_val S_INBOUND_ID)" "id записан"
+	S_INBOUND_ID='' save_state
+	t_eq "" "$(state_val S_INBOUND_ID)" "пустой остаётся пустым"
+	S_INBOUND_ID=0 save_state
+	t_eq 0 "$(state_val S_INBOUND_ID)" "«ещё не создано» — тоже"
+}
+
+test_tunnel_check_takes_own_client() {  # проверка туннеля — по ссылке клиента своего подключения, а не первого клиента панели (он чужой)
+	eval "$(awk '/^check_sub_id\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	DB=$WORK/x-ui.db
+	sql "create table clients (id integer primary key, email text, sub_id text, enable integer);
+		create table client_inbounds (client_id integer, inbound_id integer);
+		insert into clients (email, sub_id, enable) values ('чужой', 'subforeign', 1), ('свой-выключен', 'suboff', 0), ('свой', 'subown', 1), ('свой2', 'subown2', 1);
+		insert into client_inbounds values (1, 1), (2, 3), (3, 3), (4, 3);"
+	S_INBOUND_ID=3; t_eq subown "$(check_sub_id)" "первый включённый клиент своего подключения (#3)"
+	S_INBOUND_ID=''; t_eq subforeign "$(check_sub_id)" "настройки прежней версии — первый клиент панели, как раньше"
+	S_INBOUND_ID=0; t_eq subforeign "$(check_sub_id)" "своё подключение ещё не создано — как раньше"
+	S_INBOUND_ID=9; t_eq subforeign "$(check_sub_id)" "у своего подключения нет клиентов — как раньше"
+	sql "drop table client_inbounds"
+	S_INBOUND_ID=3; t_eq subforeign "$(check_sub_id)" "база без таблицы связей — как раньше"
+}
+
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
