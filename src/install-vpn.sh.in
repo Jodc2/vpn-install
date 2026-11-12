@@ -3265,7 +3265,10 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		case " $KEEP " in *" $p "*) lost="$lost $p" ;; esac
 		for pp in $SSH_PORTS; do [ "$pp/tcp" != "$p" ] || lost_ssh="$lost_ssh $pp"; done
 	done
-	[ -z "$ssh_as_is" ] || ok "SSH :$(echo $ssh_as_is | sed 's#/tcp##g; s/ /,/g') уже разрешён правилами ufw — их не менял"
+	if [ -n "$ssh_as_is" ]; then
+		p=${ssh_as_is# }; p=${p//\/tcp/}
+		ok "SSH :${p// /,} уже разрешён правилами ufw — их не менял"
+	fi
 	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || [[ " $lost " == *" $pp "* ]] || printf '%s ' "$pp"; done)
 	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
 	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"

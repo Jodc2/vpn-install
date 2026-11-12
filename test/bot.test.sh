@@ -1583,7 +1583,9 @@ test_fw_ssh_limited_by_source_is_not_reopened_to_all() {  # пункт 9а: ufw 
 		fw_step
 		! fw_called "allow 22/tcp" || t_fail "SSH открыт всем поверх правила «$rule»: $(fw_calls)"
 		case $rule in
-			*"any any"*) ! fw_called "allow 2222/tcp" || t_fail "правило на любой порт покрывает и 2222: $(fw_calls)" ;;
+			*"any any"*)
+				! fw_called "allow 2222/tcp" || t_fail "правило на любой порт покрывает и 2222: $(fw_calls)"
+				grep -q '^OK SSH :22,2222 уже разрешён' "$WORK/out" || t_fail "оба порта SSH названы оставленными: $(cat "$WORK/out")" ;;
 			*) fw_called "allow 2222/tcp" || t_fail "для порта SSH 2222 правила нет — его надо разрешить: $(fw_calls)" ;;
 		esac
 		fw_called "allow 2083/tcp" || t_fail "порт VPN не разрешён: $(fw_calls)"
