@@ -698,10 +698,45 @@ ssh_login_method() {  # как вошли в эту SSH-сессию: publickey 
 		{ grep -oE "Accepted [a-z-]+ for [^ ]+ from ${cip//./\\.} port $cport( |\$)" || true; } | tail -1 | awk '{print $2}'
 }
 
-ssh_ports() {  # TCP-порты sshd (обычно 22)
+ssh_conn_port() {  # порт сервера из SSH_CONNECTION — через него человек вошёл сейчас. sudo и «su -» её стирают:
+	# тогда она берётся из окружения родительских процессов (оболочки, из которой запущен sudo).
+	local c=${SSH_CONNECTION:-} pid=$$ n=0
+	while [ -z "$c" ] && [ "${pid:-0}" -gt 1 ] && [ "$n" -lt 32 ]; do
+		c=$({ tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^SSH_CONNECTION=//p'; } 2>/dev/null || true)
+		pid=$(awk '$1 == "PPid:" {print $2}' "/proc/$pid/status" 2>/dev/null || true)
+		n=$((n + 1))
+	done
+	c=${c%%$'\n'*}
+	echo "${c##* }"
+}
+ssh_socket_ports() {  # порты из ListenStream у ssh.socket / sshd.socket: когда sshd запускает systemd по обращению к порту,
+	# порт задан там (в том числе в drop-in), и sshd -T его не знает. Сокет, который не включён и не работает, — не в счёт.
+	local u
+	for u in ssh.socket sshd.socket; do
+		systemctl -q is-active "$u" 2>/dev/null || systemctl -q is-enabled "$u" 2>/dev/null || continue
+		{ systemctl show -p Listen --value "$u" 2>/dev/null || true; } | sed -n 's/.*:\([0-9][0-9]*\) (Stream)$/\1/p'
+	done
+}
+sshd_listen_ports() {  # порты, которые сам sshd слушает на деле (не только на localhost). Порт, проброшенный сеансом
+	# («ssh -R», X11), тоже слушает процесс sshd — но у него и родитель sshd, а у самого sshd — нет.
+	local port pid ppid
+	{ ss -Htlnp 2>/dev/null || true; } | awk 'match($0, /\("sshd",pid=[0-9]+/) && $4 !~ /^(127\.|\[::1\])/ {
+			n = split($4, a, ":"); print a[n], substr($0, RSTART + 12, RLENGTH - 12) }' |
+		while read -r port pid; do
+			ppid=$(awk '$1 == "PPid:" {print $2}' "/proc/$pid/status" 2>/dev/null || true)
+			[ "$(cat "/proc/${ppid:-0}/comm" 2>/dev/null || true)" = sshd ] || echo "$port"
+		done
+}
+ssh_ports() {  # TCP-порты SSH из всех источников, без повторов; первым — как раньше, порт из sshd -T (обычно 22).
+	# Одного sshd -T мало: порт, через который человек вошёл, может быть задан не в sshd_config, и фаервол его закрыл бы.
 	local p
-	p=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -un | tr '\n' ' ' || true)
-	[ -n "$p" ] || p=${SSH_CONNECTION:+${SSH_CONNECTION##* }}
+	p=$( {
+		sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -un || true
+		ssh_conn_port
+		ssh_socket_ports
+		sshd_listen_ports
+	} | awk '/^[0-9]+$/ && $1 >= 1 && $1 <= 65535 && !seen[$1]++' | tr '\n' ' ')
+	p=${p% }
 	echo "${p:-22}"
 }
 
@@ -3094,8 +3129,7 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 	FW_INBOUND=$(xui_inbound_ports | tr '\n' ' ')
 	KEEP=$(fw_kept_ports | tr '\n' ' ')
 	OPEN=$( {
-		for p in $SSH_PORTS; do echo "$p/tcp"; done
-		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
+		for p in $SSH_PORTS; do echo "$p/tcp"; done   # среди них и порт нынешнего входа (ssh_ports)
 		if [ "$MODE" = domain ]; then echo 80/tcp; echo 443/tcp; fi
 		if [ "$PANEL_PUBLIC" = 1 ]; then echo "$WEB_PORT/tcp"; fi
 		if [ "${SUB_TLS:-0}" = 1 ]; then echo 80/tcp; echo "$SUB_PORT/tcp"; fi   # :80 — продление сертификата на IP

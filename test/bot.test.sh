@@ -1586,6 +1586,112 @@ test_exit_fw_follows_what_ufw_says() {  # пункт 5: на старом сер
 		t_fail "скрипт выхода не снимает LANGUAGE в самом начале"
 }
 
+# Порты SSH (пункт 9в). sshd -T отвечает портами из $SSHD_T, systemctl знает сокеты из $SOCK_ON (их Listen — в файлах
+# $WORK/listen.ИМЯ), ss печатает $WORK/ss.out. ssh_fns_file — те же функции и заглушки файлом, для запуска в другой оболочке.
+SSH_FNS='ssh_ports|ssh_conn_port|ssh_socket_ports|sshd_listen_ports'
+ssh_stubs() {
+	sshd() {
+		local p
+		[ "$1" = -T ] && [ -n "$SSHD_T" ] || return 1
+		for p in $SSHD_T; do echo "port $p"; done
+		echo "addressfamily any"
+	}
+	systemctl() {
+		local u=${!#}
+		case " $* " in
+			*" is-active "* | *" is-enabled "*) [[ " $SOCK_ON " == *" $u "* ]] ;;
+			*" show "*) cat "$WORK/listen.$u" 2> /dev/null || true ;;
+			*) return 1 ;;
+		esac
+	}
+	ss() { cat "$WORK/ss.out" 2> /dev/null || true; }
+}
+ssh_fns() {
+	eval "$(awk "/^($SSH_FNS)\\(\\) \\{/,/^}/" "$ROOT/src/install-vpn.sh.in")"
+	ssh_stubs
+	SSHD_T=22 SOCK_ON=''
+	unset SSH_CONNECTION
+}
+ssh_fns_file() {  # ssh_fns_file ФАЙЛ 'команды'
+	{
+		echo 'set -euo pipefail'
+		awk "/^($SSH_FNS)\\(\\) \\{/,/^}/" "$ROOT/src/install-vpn.sh.in"
+		declare -f ssh_stubs
+		echo "ssh_stubs; WORK='$WORK' SSHD_T=22 SOCK_ON=''"
+		echo "$2"
+	} > "$1"
+}
+test_ssh_ports_from_every_source() {  # порт из sshd -T, порт нынешнего входа, порт сокета systemd и порт, который sshd слушает на деле
+	fw_env; ssh_fns
+	SSHD_T="2200 22" SOCK_ON="ssh.socket"
+	export SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222'
+	printf '%s\n' '[::]:2022 (Stream)' '0.0.0.0:2022 (Stream)' '/run/sshd.sock (Stream)' > "$WORK/listen.ssh.socket"
+	echo '[::]:9999 (Stream)' > "$WORK/listen.sshd.socket"   # сокет есть, но не включён и не работает — не в счёт
+	cat > "$WORK/ss.out" <<'EOF'
+LISTEN 0      128          0.0.0.0:2233      0.0.0.0:*    users:(("sshd",pid=999999901,fd=3))
+LISTEN 0      128             [::]:2233         [::]:*    users:(("sshd",pid=999999901,fd=4))
+LISTEN 0      4096               *:2022            *:*    users:(("systemd",pid=1,fd=119))
+LISTEN 0      128        127.0.0.1:6010      0.0.0.0:*    users:(("sshd",pid=999999902,fd=9))
+LISTEN 0      128            [::1]:6010         [::]:*    users:(("sshd",pid=999999902,fd=8))
+LISTEN 0      511          0.0.0.0:443       0.0.0.0:*    users:(("nginx",pid=999999903,fd=6))
+LISTEN 0      4096   127.0.0.53%lo:53        0.0.0.0:*    users:(("systemd-resolve",pid=999999904,fd=14))
+EOF
+	t_eq "22 2200 2222 2022 2233" "$(ssh_ports)" "все порты SSH; первым — меньший из sshd -T, как раньше"
+	SSH_PORTS=$(ssh_ports)
+	fw_step
+	t_eq "allow 22/tcp;allow 2022/tcp;allow 2083/tcp;allow 2200/tcp;allow 2222/tcp;allow 2233/tcp;" "$(grep '^allow' "$WORK/ufw.calls" | tr '\n' ';')" "фаервол разрешает их все"
+}
+test_ssh_ports_fallbacks() {
+	fw_env; ssh_fns
+	ssh_conn_port() { :; }   # тест сам может идти по SSH — своего входа «нет»
+	t_eq "22" "$(ssh_ports | xargs)" "обычный сервер: sshd -T говорит 22"
+	SSHD_T=''
+	t_eq "22" "$(ssh_ports | xargs)" "ни один источник ничего не сказал — 22"
+	SSHD_T='' SOCK_ON="ssh.socket"; echo '[::]:2022 (Stream)' > "$WORK/listen.ssh.socket"
+	t_eq "2022" "$(ssh_ports | xargs)" "sshd -T молчит, порт известен только сокету"
+}
+test_ssh_port_of_this_login_survives_sudo() {  # пункт 9в: sudo стирает SSH_CONNECTION — порт входа берётся из окружения родительских процессов
+	local out
+	ssh_fns_file "$WORK/ports.sh" 'ssh_ports'
+	# Средняя оболочка — «sudo»: у неё SSH_CONNECTION есть, а запущенному из неё скрипту она её не передаёт.
+	out=$(SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222' bash -c 'env -u SSH_CONNECTION bash "$0"; :' "$WORK/ports.sh")
+	t_eq "22 2222" "$out" "порт входа найден у родительского процесса"
+	out=$(SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222' bash -c 'env -u SSH_CONNECTION bash -c "bash \"\$0\"; :" "$0"; :' "$WORK/ports.sh")
+	t_eq "22 2222" "$out" "и через одного (sudo → оболочка → скрипт)"
+	out=$(SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222' bash -c 'SSH_CONNECTION="203.0.113.9 50001 198.51.100.1 2200" bash "$0"; :' "$WORK/ports.sh")
+	t_eq "22 2200" "$out" "своя SSH_CONNECTION главнее родительской"
+}
+test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» слушает от имени sshd сеанса — это не порт SSH; у сеанса родитель тоже sshd
+	local parent child n=0
+	ssh_fns
+	cp "$(command -v bash)" "$WORK/sshd"   # имя процесса — по имени файла: это и есть «sshd» для /proc
+	mkfifo "$WORK/hold"
+	cat > "$WORK/session.sh" <<'EOF'
+echo $$ > "$1/session.pid"
+read -r -t 20 _ <> "$1/hold" || true
+EOF
+	cat > "$WORK/listener.sh" <<'EOF'
+echo $$ > "$1/listener.pid"
+"$1/sshd" "$1/session.sh" "$1" &
+wait
+EOF
+	"$WORK/sshd" "$WORK/listener.sh" "$WORK" &
+	until [ -s "$WORK/listener.pid" ] && [ -s "$WORK/session.pid" ]; do
+		n=$((n + 1)); [ "$n" -lt 100 ] || t_fail "процессы-заглушки sshd не запустились"
+		sleep 0.05
+	done
+	parent=$(cat "$WORK/listener.pid") child=$(cat "$WORK/session.pid")
+	t_eq sshd "$(cat "/proc/$child/comm")" "имя процесса-заглушки"
+	cat > "$WORK/ss.out" <<EOF
+LISTEN 0      128          0.0.0.0:2233      0.0.0.0:*    users:(("sshd",pid=$parent,fd=3))
+LISTEN 0      128          0.0.0.0:8080      0.0.0.0:*    users:(("sshd",pid=$child,fd=9))
+LISTEN 0      128                *:8081            *:*    users:(("sshd",pid=$child,fd=10))
+EOF
+	n=$(sshd_listen_ports | tr '\n' ' ')
+	kill "$child" "$parent" 2> /dev/null || true
+	t_eq "2233 " "$n" "только порт самого sshd, без портов, проброшенных его сеансом"
+}
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.
