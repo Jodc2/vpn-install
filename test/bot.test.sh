@@ -1695,17 +1695,18 @@ pw_sh() {
 $*"
 }
 test_passwall_tmp_room_is_free_memory() {  # /tmp роутера — в памяти: df показывает потолок tmpfs, а не свободную память
-	local sh df_mb
+	# «Место по df» в тесте задано (500 МБ): настоящее на живой машине меняется между двумя замерами, и сравнение с ним
+	# изредка расходилось на мегабайт.
+	local sh df='mb_free() { echo 500; }'
 	printf 'MemTotal:  250000 kB\nMemFree:  9000 kB\nMemAvailable:    40960 kB\n' > "$WORK/low"
 	printf 'MemTotal:  250000 kB\nMemAvailable: 999999999999 kB\n' > "$WORK/high"
 	printf 'MemTotal:  250000 kB\nMemFree:  9000 kB\n' > "$WORK/old-kernel"
 	for sh in dash "busybox ash"; do
-		df_mb=$(pw_sh "$sh" 'mb_free /tmp')
-		[ "$df_mb" -gt 40 ] || t_fail "$sh: в /tmp этой машины меньше 40 МБ — тест не о том"
-		t_eq 40 "$(pw_sh "$sh" "tmp_free '$WORK/low'")" "$sh: свободной памяти меньше, чем показывает df, — считаем по памяти"
-		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/high'")" "$sh: памяти больше, чем места в /tmp, — считаем по df"
-		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/old-kernel'")" "$sh: в meminfo нет MemAvailable — как раньше, по df"
-		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/нет-такого'")" "$sh: meminfo не прочитать — как раньше, по df"
+		[ "$(pw_sh "$sh" 'mb_free /tmp')" -ge 0 ] || t_fail "$sh: mb_free не выдала число"
+		t_eq 40 "$(pw_sh "$sh" "$df; tmp_free '$WORK/low'")" "$sh: свободной памяти меньше, чем показывает df, — считаем по памяти"
+		t_eq 500 "$(pw_sh "$sh" "$df; tmp_free '$WORK/high'")" "$sh: памяти больше, чем места в /tmp, — считаем по df"
+		t_eq 500 "$(pw_sh "$sh" "$df; tmp_free '$WORK/old-kernel'")" "$sh: в meminfo нет MemAvailable — как раньше, по df"
+		t_eq 500 "$(pw_sh "$sh" "$df; tmp_free '$WORK/нет-такого'")" "$sh: meminfo не прочитать — как раньше, по df"
 	done
 }
 
