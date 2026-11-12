@@ -1594,7 +1594,7 @@ test_no_password_login_nag() {  # решение владельца 11.11: бе�
 
 # ——— Чужой 3x-ui: вопрос в самом начале, порты его подключений фаервол не закрывает ———
 xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports; die/ok/warn — строками в $WORK/out
-	eval "$(awk '/^(foreign_xui_check|foreign_on_port|service_ports|service_port_check|xui_inbound_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(foreign_xui_check|foreign_on_port|service_ports|service_port_check|xui_inbound_ports|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1728,7 +1728,7 @@ test_inbound_ports_odd_row_keeps_the_rest() {  # settings или stream_settings
 # Шаг «Фаервол ufw» целиком: ufw — заглушка (ответ на status — $UFW_SAYS, код — $UFW_STATUS_RC; команды из $UFW_FAIL
 # не проходят), всё, что скрипт у неё просит, — построчно в $WORK/ufw.calls; правила ufw — файл $UFW_RULES.
 fw_env() {
-	eval "$(awk '/^(fw_step|fw_close|listens_outside|xui_inbound_ports|ufw_active|ufw_state|ufw_allows)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(fw_step|fw_close|listens_outside|xui_inbound_ports|ufw_state|ufw_allows|ip_cert_port80)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	say() { :; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1754,7 +1754,7 @@ fw_env() {
 	port_users() { :; }
 	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env UFW_RULES=$WORK/user.rules
 	MODE=nodomain PANEL_PUBLIC=0 SUB_TLS=0 SUB_PORT=2096 WEB_PORT=54321 REALITY_PORT=2083 SSH_PORTS=22
-	OTHER_VPN='' OTHER_VPN_PORTS='' MOVED_FROM='' FAILS=0 SSH_NOW_PORT=''
+	OTHER_VPN='' OTHER_VPN_PORTS='' MOVED_FROM='' FAILS=0 SSH_NOW_PORT='' DO_UFW=1
 	UFW_SAYS="Status: inactive" UFW_STATUS_RC='' UFW_FAIL=''
 	unset SSH_CONNECTION   # тесты идут и по SSH: порты SSH шагу задаёт только $SSH_PORTS
 	: > "$WORK/out"; : > "$WORK/ufw.calls"; : > "$UFW_RULES"; rm -f "$DB"
@@ -2080,6 +2080,34 @@ test_fw_failed_enable_is_rolled_back() {  # «ufw --force enable» не удал
 	fw_step
 	! fw_called "--force disable" || t_fail "ufw был включён до запуска, а скрипт его выключил: $(fw_calls)"
 	grep -q '^BAD ufw не включился' "$WORK/out" || t_fail "о сбое не сказано: $(cat "$WORK/out")"
+}
+test_ip_cert_no_ufw_adds_no_rule() {  # --no-ufw: перед выпуском сертификата на IP скрипт всё равно добавлял «ufw allow 80/tcp» и при успехе
+	# оставлял его. Теперь с --no-ufw правил не добавляет, а если порт 80 из-за этого закрыт — говорит открыть его самому
+	fw_env; UFW_SAYS=$ACTIVE DO_UFW=0
+	ip_cert_port80
+	t_eq "" "$(fw_calls)" "--no-ufw: правил ufw скрипт не добавляет"
+	grep -q '^WARN .*порт 80 .*ufw allow 80/tcp' "$WORK/out" || t_fail "не сказано, что порт 80 закрыт и открыть его нужно самому: $(cat "$WORK/out")"
+	t_eq 0 "$OPENED80" "правило не добавлено — убирать потом нечего"
+	fw_env; UFW_SAYS=$ACTIVE DO_UFW=0
+	echo '### tuple ### allow tcp 80,443 0.0.0.0/0 any 0.0.0.0/0 in' > "$UFW_RULES"
+	ip_cert_port80
+	t_eq "" "$(fw_calls)$(cat "$WORK/out")" "--no-ufw, порт 80 уже разрешён — ни правил, ни предупреждений"
+	fw_env; DO_UFW=0
+	ip_cert_port80
+	t_eq "" "$(fw_calls)$(cat "$WORK/out")" "--no-ufw, ufw выключен — порт 80 он не закрывает, предупреждать не о чем"
+	fw_env; UFW_SAYS=$ACTIVE
+	ip_cert_port80
+	t_eq "allow 80/tcp;|1" "$(fw_calls)|$OPENED80" "без --no-ufw — как раньше: порт 80 открывается на время проверки"
+	fw_env; UFW_SAYS=$ACTIVE
+	echo '### tuple ### allow tcp 80 0.0.0.0/0 any 0.0.0.0/0 in' > "$UFW_RULES"
+	ip_cert_port80
+	t_eq "|0" "$(fw_calls)|$OPENED80" "порт 80 уже разрешён — правило не добавляется (и потом не удаляется)"
+	fw_env; UFW_STATUS_RC=1
+	ip_cert_port80
+	t_eq "|0" "$(fw_calls)|$OPENED80" "состояние ufw не понять — не трогаем, как раньше"
+	fw_env; UFW_SAYS=$ACTIVE UFW_FAIL="allow 80/tcp"
+	ip_cert_port80
+	t_eq 0 "$OPENED80" "правило не добавилось — удалять потом нечего"
 }
 # Порты соседнего VPN (WireGuard, Amnezia в Docker — detect_other_vpn): пункт 6 второй порции.
 test_fw_other_vpn_port_failure_leaves_ufw_off() {  # ufw выключен, порт соседнего VPN в нём не разрешился: включённый фаервол отрубил бы тот VPN.

@@ -698,9 +698,6 @@ ufw_state() {  # → active | inactive | unknown. «Выключен» — то�
 		*) echo unknown ;;
 	esac
 }
-ufw_active() {  # ufw включён?
-	[ "$(ufw_state)" = active ]
-}
 ufw_allows() {  # ufw_allows ПОРТ [tcp|udp] — в правилах ufw уже есть разрешение (allow или limit) входящих на этот порт по
 	# этому протоколу (не назван — TCP), пусть и только с одного адреса. Правила — из файлов ufw: «ufw status» у правила по имени приложения (OpenSSH) порт
 	# не называет, а в файле он есть всегда. Строка правила (ufw 0.36, проверено на настоящем):
@@ -2294,9 +2291,20 @@ acme_cron() {  # строка cron acme.sh: acme_cron 1 — раз в сутки
 	rm -f /root/.crontab.new
 }
 
+ip_cert_port80() {  # перед выпуском сертификата на IP: Let's Encrypt приходит на порт 80 — во включённом ufw он должен быть разрешён.
+	# → OPENED80=1, если правило добавил скрипт (сертификат не выдадут — он же его и уберёт)
+	OPENED80=0
+	[ "$(ufw_state)" = active ] || return 0
+	! ufw_allows 80 tcp || return 0   # разрешён — пусть и не отдельным правилом «80/tcp» (80,443/tcp, профиль приложения)
+	if [ "$DO_UFW" != 1 ]; then   # --no-ufw: фаервол скрипт не трогает — и здесь тоже. Сказать, чтобы открыли сами
+		warn "ufw включён, а порт 80 в нём не разрешён: по нему Let's Encrypt проверяет сервер, без него сертификат на IP не выдадут и не продлят. Фаервол скрипт не трогает (--no-ufw) — откройте порт сами: ufw allow 80/tcp"
+		return 0
+	fi
+	if ufw allow 80/tcp >/dev/null 2>&1; then OPENED80=1; fi
+}
 issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCERT_DIR; ошибка → IPCERT_ERR
 	IPCERT_ERR=
-	local rc=0 ca=letsencrypt log=$WORK/acme-ip.log opened80=0 have
+	local rc=0 ca=letsencrypt log=$WORK/acme-ip.log have
 	[ "$ACME_STAGING" = 1 ] && ca=letsencrypt_test
 	"${APT[@]}" install socat >/dev/null 2>&1 || { IPCERT_ERR="не установился socat (им acme.sh отвечает Let's Encrypt на :80)"; return 1; }
 	ensure_acme || { IPCERT_ERR="не скачался или не установился acme.sh $ACME_TAG"; return 1; }
@@ -2316,9 +2324,7 @@ issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCER
 		fi
 	fi
 	[ -z "$(port_users 80)" ] || { IPCERT_ERR="порт 80 занят ($(port_users 80)) — Let's Encrypt не сможет проверить сервер"; return 1; }
-	if ufw_active && ! grep -qE '^80/tcp +ALLOW' <<<"$(LANGUAGE=C LC_ALL=C ufw status 2>/dev/null || true)"; then
-		ufw allow 80/tcp >/dev/null 2>&1 && opened80=1
-	fi
+	ip_cert_port80
 	# Let's Encrypt проверяет сервер по http://IP/ — на время проверки acme.sh сам слушает :80 (socat).
 	# Сертификат на IP бывает только коротким (профиль shortlived, ~160 ч): продление через 2–3 дня.
 	"$ACME" --issue -d "$PUBLIC_IP" --standalone --httpport 80 --server "$ca" --cert-profile shortlived --days 3 \
@@ -2328,7 +2334,7 @@ issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCER
 		2) ok "сертификат на IP $PUBLIC_IP уже есть, продлевать рано" ;;
 		*)
 			IPCERT_ERR=$(grep -vE '^\s*$' "$log" | tail -3 | sed -E 's/^\[[^]]*\] //' | tr '\n' ' ' | cut -c1-320)
-			[ "$opened80" = 0 ] || ufw delete allow 80/tcp >/dev/null 2>&1 || true
+			[ "$OPENED80" = 0 ] || ufw delete allow 80/tcp >/dev/null 2>&1 || true
 			return 1
 			;;
 	esac
