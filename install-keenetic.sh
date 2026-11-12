@@ -1,19 +1,25 @@
 #!/bin/sh
 # install-keenetic.sh — VPN на роутер Keenetic / Netcraze с родной прошивкой (KeeneticOS 4 и новее) одной командой.
-# Ставит XKeen с ядром Xray и настраивает его по ссылке на подписку 3x-ui (VLESS + Reality, транспорт XHTTP или TCP):
-# после этого весь дом выходит в интернет через VPN. Подписка перечитывается сама раз в сутки.
+# Ставит XKeen с ядром Xray и настраивает его по ссылке на подписку 3x-ui (VLESS + Reality, транспорт XHTTP или TCP).
+# По умолчанию через VPN идёт только заблокированное в России, остальное — напрямую; режим меняется одной командой.
+# Подписка и списки сайтов перечитываются сами.
 #
 # До запуска на роутере должна стоять среда Entware (лучше на флешке) — см. README, раздел «Роутер Keenetic».
 # Запуск — в SSH-консоли Entware (ssh root@192.168.1.1 -p 222):
 #   opkg update && opkg install curl && curl -fsSL -o /tmp/vpn-keenetic.sh https://raw.githubusercontent.com/Jodc2/vpn-install/main/install-keenetic.sh && sh /tmp/vpn-keenetic.sh
 #
 #   sh vpn-keenetic.sh [ССЫЛКА]   поставить или перенастроить; ссылку (подписка https://… или vless://…) спросит, если не дана
-#   vpn-keenetic --update         перечитать подписку и применить, если она изменилась (так запускает планировщик)
+#   vpn-keenetic --mode blocked   через VPN — только заблокированное в России (список Re:filter); так по умолчанию
+#   vpn-keenetic --mode all       через VPN — всё
+#   vpn-keenetic --mode sites youtube,instagram,discord   через VPN — только названные сервисы (имена — из списка v2fly)
+#   vpn-keenetic --update         перечитать подписку, списки и свои файлы; применить, если что-то изменилось
 #   vpn-keenetic --status         что сейчас настроено и работает ли туннель
 #   vpn-keenetic --off | --on     выключить VPN (интернет идёт напрямую) / включить обратно
 #   vpn-keenetic --remove         убрать настройки этого скрипта (XKeen остаётся: его снимает «xkeen -remove»)
 #
+# Свои сайты — в /opt/etc/vpn-keenetic/vpn.txt (всегда через VPN) и direct.txt (всегда напрямую), потом --update.
 # Повторный запуск безопасен. Сам скрипт ничего не шлёт никуда, кроме вашего сервера и проверки адреса выхода.
+
 # shellcheck disable=SC3043   # local есть и в busybox ash (оболочка Entware), и в dash
 set -eu
 
@@ -23,6 +29,8 @@ XRAY_VER=${VPNK_XRAY_VER:-26.6.1}      # как на сервере из install
 P=${VPNK_PREFIX:-}                      # для проверки скрипта: корень поддельной системы
 OPT=$P/opt
 CONF_DIR=$OPT/etc/xray/configs
+DAT_DIR=$OPT/etc/xray/dat               # списки сайтов; имена файлов — как у XKeen
+GEO_DAYS=${VPNK_GEO_DAYS:-7}            # списки старше этого перечитываются
 STATE_DIR=$OPT/etc/vpn-keenetic
 XKEEN_JSON=$OPT/etc/xkeen/xkeen.json
 SELF=$OPT/sbin/vpn-keenetic
@@ -155,20 +163,56 @@ vpnk_links() {
 vpnk_outbounds() {  # vpnk_outbounds РАЗОБРАННАЯ_ССЫЛКА(JSON)
 	printf '%s' "$1" | jq '{outbounds: [.outbound, {tag: "direct", protocol: "freedom"}, {tag: "block", protocol: "blackhole"}]}'
 }
-vpnk_routing() {  # vpnk_routing РАЗОБРАННАЯ_ССЫЛКА(JSON) — всё через VPN, кроме домашних адресов и самого сервера
-	printf '%s' "$1" | jq --arg tag "$TAG" '
+vpnk_userlist() {  # vpnk_userlist ФАЙЛ → JSON {domain, ip}: свои сайты (с поддоменами) и подсети, по одному в строке
+	[ -f "$1" ] || { echo '{"domain":[],"ip":[]}'; return 0; }
+	sed 's/#.*//' "$1" | tr -d '\r' | LC_ALL=C awk '
+	{
+		line = $0
+		gsub(/^[ \t]+|[ \t]+$/, "", line)
+		if (line == "") next
+		sub(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, "", line)
+		if (line ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/ || (index(line, ":") > 0 && line ~ /^[0-9A-Fa-f:.]+(\/[0-9]+)?$/)) { print "i " line; next }
+		sub(/[\/?].*$/, "", line)
+		sub(/:[0-9]+$/, "", line)
+		sub(/^\*\./, "", line)
+		sub(/^\./, "", line)
+		line = tolower(line)
+		if (line ~ /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/ && index(line, ".") > 0 && index(line, "..") == 0) print "d " line
+	}' | jq -Rnc '[inputs] | {domain: map(select(startswith("d ")) | "domain:" + .[2:]), ip: map(select(startswith("i ")) | .[2:])}'
+}
+vpnk_routing() {  # vpnk_routing РАЗОБРАННАЯ_ССЫЛКА(JSON) РЕЖИМ [СЕРВИСЫ] — что идёт через VPN (режимы — в шапке); свои списки главнее режима
+	printf '%s' "$1" | jq --arg tag "$TAG" --arg mode "${2:-blocked}" --arg sites "${3:-}" \
+		--argjson vpn "$(vpnk_userlist "$STATE_DIR/vpn.txt")" --argjson direct "$(vpnk_userlist "$STATE_DIR/direct.txt")" '
 	def isip: (explode | any(.[]; . == 58)) or (length > 0 and (explode | all(.[]; . == 46 or (. >= 48 and . <= 57))));
+	# Через VPN: QUIC и IPv6 обрываются сразу (сервер в IPv6 не ходит) — программа тут же переходит на TCP и IPv4.
+	def through($d): if ($d | length) == 0 then [] else [
+		{network: "udp", port: "443", domain: $d, outboundTag: "block"},
+		{domain: $d, ip: ["::/0"], outboundTag: "block"},
+		{domain: $d, outboundTag: $tag}] end;
+	def through_ip($i): if ($i | length) == 0 then [] else [
+		{network: "udp", port: "443", ip: $i, outboundTag: "block"},
+		{ip: $i, outboundTag: $tag}] end;
 	.host as $h
-	| {routing: {domainStrategy: "AsIs", rules: [
-		{inboundTag: ["vpnk-selftest"], outboundTag: $tag},
-		{inboundTag: ["force-proxy-redirect", "force-proxy-tproxy"], outboundTag: $tag},
-		{ip: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
+	| {routing: {domainStrategy: "AsIs", rules: (
+		[{inboundTag: ["vpnk-selftest"], outboundTag: $tag},
+		 {inboundTag: ["force-proxy-redirect", "force-proxy-tproxy"], outboundTag: $tag},
+		 {ip: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
 			"224.0.0.0/3", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"], outboundTag: "direct"},
-		(if ($h | isip) then {ip: [$h], outboundTag: "direct"} else {domain: ["full:" + $h], outboundTag: "direct"} end),
-		{network: "udp", port: "443", outboundTag: "block"},
-		{ip: ["::/0"], outboundTag: "block"},
-		{inboundTag: ["redirect", "tproxy"], outboundTag: $tag}
-	]}}'
+		 (if ($h | isip) then {ip: [$h], outboundTag: "direct"} else {domain: ["full:" + $h], outboundTag: "direct"} end)]
+		+ (if ($direct.domain | length) > 0 then [{domain: $direct.domain, outboundTag: "direct"}] else [] end)
+		+ (if ($direct.ip | length) > 0 then [{ip: $direct.ip, outboundTag: "direct"}] else [] end)
+		+ through($vpn.domain) + through_ip($vpn.ip)
+		+ (if $mode == "all" then
+			[{network: "udp", port: "443", outboundTag: "block"}, {ip: ["::/0"], outboundTag: "block"},
+			 {inboundTag: ["redirect", "tproxy"], outboundTag: $tag}]
+		   elif $mode == "sites" then
+			through($sites | split(",") | map(select(length > 0) | "ext:geosite_v2fly.dat:" + .))
+			+ [{inboundTag: ["redirect", "tproxy"], outboundTag: "direct"}]
+		   else
+			through(["ext:geosite_refilter.dat:refilter"]) + through_ip(["ext:geoip_refilter.dat:refilter"])
+			+ [{inboundTag: ["redirect", "tproxy"], outboundTag: "direct"}]
+		   end)
+	)}}'
 }
 vpnk_selftest_inbound() {
 	jq -n --argjson port "$SOCKS_PORT" '{inbounds: [{tag: "vpnk-selftest", listen: "127.0.0.1", port: $port, protocol: "socks", settings: {udp: false}}]}'
@@ -321,6 +365,92 @@ link_pick() {  # → PARSED (JSON разобранной ссылки) из LINK
 	PARSED=$p INDEX=$want
 }
 
+# ——— Режим: что идёт через VPN ———
+mode_load() {  # → ROUTE (blocked | all | sites) и SITES: из окружения, прошлого запуска или умолчания
+	ROUTE=${VPNK_MODE:-}
+	[ -n "$ROUTE" ] || { [ ! -s "$STATE_DIR/mode" ] || ROUTE=$(cat "$STATE_DIR/mode"); }
+	ROUTE=${ROUTE:-blocked}
+	SITES=${VPNK_SITES:-}
+	[ -n "$SITES" ] || { [ ! -s "$STATE_DIR/sites" ] || SITES=$(cat "$STATE_DIR/sites"); }
+	case $ROUTE in
+		blocked | all) ;;
+		sites)
+			SITES=$(printf '%s' "$SITES" | tr 'A-Z' 'a-z' | tr -d ' \t')
+			case $SITES in
+				'') die "для режима sites назовите сервисы: vpn-keenetic --mode sites youtube,instagram,discord" ;;
+				*[!a-z0-9,-]*) die "в списке сервисов — только латинские буквы, цифры, дефис и запятые (например: youtube,instagram,discord)" ;;
+			esac
+			;;
+		*) die "режима «$ROUTE» нет — есть blocked, all или sites" ;;
+	esac
+}
+mode_label() {
+	case $ROUTE in
+		all) echo "всё через VPN" ;;
+		sites) echo "только выбранные сервисы ($SITES), остальное напрямую" ;;
+		*) echo "только заблокированное в России, остальное напрямую" ;;
+	esac
+}
+
+# Списки сайтов: файлы выпусков GitHub, сверяются с контрольной суммой, которую публикует сам GitHub.
+geo_list() {  # какие списки нужны режиму: «файл|репозиторий|имя в выпуске»
+	case $1 in
+		blocked) printf '%s\n' "geosite_refilter.dat|1andrevich/Re-filter-lists|geosite.dat" "geoip_refilter.dat|1andrevich/Re-filter-lists|geoip.dat" ;;
+		sites) printf '%s\n' "geosite_v2fly.dat|v2fly/domain-list-community|dlc.dat" ;;
+	esac
+}
+geo_fetch() {  # geo_fetch ФАЙЛ РЕПОЗИТОРИЙ ИМЯ → $WORK/geo/ФАЙЛ; 1 и GEO_ERR — не скачался или не тот
+	local url="https://github.com/$2/releases/latest/download/$3" out="$WORK/geo/$1" want got
+	GEO_ERR="не скачался"
+	mkdir -p "$WORK/geo"
+	want=$(curl -fsSL --connect-timeout 10 -m 20 "https://api.github.com/repos/$2/releases/latest" 2> /dev/null |
+		jq -r --arg n "$3" '.assets[]? | select(.name == $n) | .digest // empty' 2> /dev/null | head -1) || want=
+	want=${want#sha256:}
+	if ! { curl -fsSL --connect-timeout 10 -m 120 -o "$out" "$url" 2> /dev/null && [ -s "$out" ]; }; then
+		# GitHub файл не отдал. Зеркалу верим, только когда есть с чем сверить.
+		[ -n "$want" ] || return 1
+		{ curl -fsSL --connect-timeout 10 -m 120 -o "$out" "https://gh-proxy.com/$url" 2> /dev/null && [ -s "$out" ]; } ||
+			{ curl -fsSL --connect-timeout 10 -m 120 -o "$out" "https://ghfast.top/$url" 2> /dev/null && [ -s "$out" ]; } || return 1
+	fi
+	if [ -n "$want" ]; then
+		got=$(sha256_of "$out")
+		[ "$got" = "$want" ] || { GEO_ERR="не совпал с опубликованной контрольной суммой"; return 1; }
+	else
+		GEO_UNVERIFIED=1   # сумму узнать не вышло; файл — напрямую с GitHub, не с зеркала
+	fi
+	! head -c 64 "$out" | grep -qi '<html\|<!doctype' || { GEO_ERR="вместо списка пришла веб-страница"; return 1; }
+	GEO_ERR=''
+}
+geo_ensure() {  # списки для режима ROUTE: скачать, если их нет или они устарели. → GEO_CHANGED; 1 и ERR — нужного списка нет вовсе
+	local f repo asset
+	GEO_CHANGED=0 GEO_UNVERIFIED=0 ERR=''
+	geo_list "$ROUTE" > "$WORK/geo.need"
+	[ -s "$WORK/geo.need" ] || return 0
+	mkdir -p "$DAT_DIR"
+	while IFS='|' read -r f repo asset; do
+		[ -n "$f" ] || continue
+		if [ -s "$DAT_DIR/$f" ] && [ -z "$(find "$DAT_DIR/$f" -mtime "+$GEO_DAYS" 2> /dev/null)" ]; then continue; fi
+		if geo_fetch "$f" "$repo" "$asset"; then
+			if cmp -s "$WORK/geo/$f" "$DAT_DIR/$f" 2> /dev/null; then touch "$DAT_DIR/$f"; continue; fi
+			# прежний файл — в сторону: не заработает новый — вернём (geo_rollback)
+			if [ -f "$DAT_DIR/$f" ]; then cp -p "$DAT_DIR/$f" "$DAT_DIR/$f.vpnk-prev"; else : > "$DAT_DIR/$f.vpnk-absent"; fi
+			cp "$WORK/geo/$f" "$DAT_DIR/$f.vpnk-new" && mv -f "$DAT_DIR/$f.vpnk-new" "$DAT_DIR/$f"
+			GEO_CHANGED=1
+		elif [ -s "$DAT_DIR/$f" ]; then
+			note "список $f не обновился ($GEO_ERR) — работаю на прежнем"
+		else
+			ERR="списки сайтов не скачались ($f $GEO_ERR). Проверьте интернет на роутере и запустите ещё раз; без списков работает режим «всё через VPN»: VPNK_MODE=all sh $0"
+			return 1
+		fi
+	done < "$WORK/geo.need"
+}
+geo_rollback() {  # вернуть списки, какими они были до geo_ensure
+	local f
+	for f in "$DAT_DIR"/*.vpnk-prev; do [ ! -f "$f" ] || mv -f "$f" "${f%.vpnk-prev}"; done
+	for f in "$DAT_DIR"/*.vpnk-absent; do [ ! -f "$f" ] || rm -f "$f" "${f%.vpnk-absent}"; done
+}
+geo_commit() { rm -f "$DAT_DIR"/*.vpnk-prev "$DAT_DIR"/*.vpnk-absent; }
+
 # ——— XKeen ———
 fetch_release() {  # fetch_release URL ФАЙЛ — с GitHub, а если он не отвечает, через зеркала; целость проверяет вызывающий
 	local u
@@ -389,7 +519,7 @@ configs_write() {  # новые файлы из PARSED → CHANGED=1, если �
 	mkdir -p "$WORK/new" "$STATE_DIR"
 	chmod 700 "$STATE_DIR"
 	vpnk_outbounds "$PARSED" > "$WORK/new/04_outbounds.json"
-	vpnk_routing "$PARSED" > "$WORK/new/05_routing.json"
+	vpnk_routing "$PARSED" "$ROUTE" "$SITES" > "$WORK/new/05_routing.json"
 	vpnk_selftest_inbound > "$WORK/new/09_vpnk_selftest.json"
 	for f in $FILES; do
 		[ -s "$WORK/new/$f" ] || die "не собрался файл настроек $f"
@@ -404,6 +534,10 @@ configs_write() {  # новые файлы из PARSED → CHANGED=1, если �
 	done
 }
 configs_restore() { configs_back "$STATE_DIR/prev"; }   # вернуть файлы, которые были до configs_write
+rollback() {  # настройки и списки — как до этого запуска; CHANGED/GEO_CHANGED говорят, что успели тронуть
+	[ "${CHANGED:-0}" != 1 ] || configs_restore
+	geo_rollback
+}
 
 tunnel_ip() {  # адрес, под которым интернет видит роутер через VPN; пусто — туннель не работает
 	local i out
@@ -418,8 +552,8 @@ tunnel_ip() {  # адрес, под которым интернет видит �
 apply() {  # проверить настройки, запустить и убедиться, что туннель работает; иначе вернуть как было. → VPN_IP
 	local out
 	VPN_IP=
-	if ! out=$(XRAY_LOCATION_CONFDIR="$CONF_DIR" XRAY_LOCATION_ASSET="$OPT/etc/xray/dat" "$OPT/sbin/xray" -format=json -test 2>&1 < /dev/null); then
-		configs_restore
+	if ! out=$(XRAY_LOCATION_CONFDIR="$CONF_DIR" XRAY_LOCATION_ASSET="$DAT_DIR" "$OPT/sbin/xray" -format=json -test 2>&1 < /dev/null); then
+		rollback
 		die "Xray не принял настройки, вернул прежние. Его ответ: $(printf '%s' "$out" | tail -3 | tr '\n' ' ' | cut -c1-300)"
 	fi
 	"$OPT/sbin/xkeen" -restart < /dev/null > "$WORK/xkeen.out" 2>&1 || true
@@ -450,7 +584,12 @@ cron_set() {  # раз в сутки перечитывать подписку (
 state_save() {
 	mkdir -p "$STATE_DIR"
 	chmod 700 "$STATE_DIR"
-	(umask 077 && printf '%s\n' "$SOURCE" > "$STATE_DIR/source" && printf '%s\n' "$INDEX" > "$STATE_DIR/index" && date '+%F %R' > "$STATE_DIR/updated")
+	(umask 077 && printf '%s\n' "$SOURCE" > "$STATE_DIR/source" && printf '%s\n' "$INDEX" > "$STATE_DIR/index" && date '+%F %R' > "$STATE_DIR/updated" &&
+		printf '%s\n' "$ROUTE" > "$STATE_DIR/mode" && printf '%s\n' "$SITES" > "$STATE_DIR/sites")
+	[ -f "$STATE_DIR/vpn.txt" ] || printf '%s\n' "# Сайты, которые всегда идут через VPN — по одному в строке: example.com (вместе с поддоменами) или подсеть 203.0.113.0/24." \
+		"# После правки: vpn-keenetic --update" > "$STATE_DIR/vpn.txt"
+	[ -f "$STATE_DIR/direct.txt" ] || printf '%s\n' "# Сайты, которые всегда идут напрямую, мимо VPN — по одному в строке: example.com или подсеть 203.0.113.0/24." \
+		"# После правки: vpn-keenetic --update" > "$STATE_DIR/direct.txt"
 }
 
 do_install() {
@@ -467,12 +606,21 @@ do_install() {
 	source_get "${1:-}"
 	links_fetch || die "$ERR"
 	link_pick || die "$ERR"
+	mode_load
 	host=$(printf '%s' "$PARSED" | jq -r '.host + ":" + (.port | tostring)')
 	ok "сервер $host ($(printf '%s' "$PARSED" | jq -r '.outbound.streamSettings.network | ascii_upcase') + Reality)$(printf '%s' "$PARSED" | jq -r 'if (.name | length) > 0 then ", клиент «" + .name + "»" else "" end')"
 	xkeen_install
 	say "Настройки и запуск"
+	geo_ensure || die "$ERR"
+	if [ "$ROUTE" != all ]; then
+		if [ "$GEO_CHANGED" = 0 ]; then ok "списки сайтов на месте"
+		elif [ "$GEO_UNVERIFIED" = 0 ]; then ok "списки сайтов скачаны и сверены с контрольными суммами GitHub"
+		else warn "списки сайтов скачаны с GitHub, но сверить их с контрольной суммой не вышло (GitHub API не ответил)"
+		fi
+	fi
 	configs_write
 	if apply; then
+		geo_commit
 		state_save
 		if [ -f "$0" ] && [ "$(readlink -f "$0" 2> /dev/null || echo "$0")" != "$SELF" ]; then cp "$0" "$SELF.new" && chmod 755 "$SELF.new" && mv -f "$SELF.new" "$SELF"; fi
 		direct=$(curl -s --connect-timeout 5 -m 12 "$TRACE_URL" 2> /dev/null | sed -n 's/^ip=//p' | head -1) || direct=
@@ -481,46 +629,88 @@ do_install() {
 		note "VPN настроен: сервер $host, выход $VPN_IP"
 		cat <<EOF
 
-Готово: весь дом выходит в интернет через VPN (проверка с любого устройства: https://2ip.ru — должен быть адрес $VPN_IP).
+Готово. Режим: $(mode_label).
+Выход через VPN — с адреса $VPN_IP: его увидят сайты, которые идут через VPN.
 
+  Сменить режим:            vpn-keenetic --mode all        всё через VPN
+                            vpn-keenetic --mode blocked    только заблокированное в России (список Re:filter)
+                            vpn-keenetic --mode sites youtube,instagram,discord    только названные сервисы
+  Свои сайты:               $STATE_DIR/vpn.txt — всегда через VPN, direct.txt — всегда напрямую; потом: vpn-keenetic --update
   Выключить VPN:            vpn-keenetic --off     (интернет идёт напрямую; включить — vpn-keenetic --on)
   Что сейчас:               vpn-keenetic --status
-  Через VPN — не все:       в веб-интерфейсе роутера создайте политику доступа в интернет с именем xkeen и перенесите
-                            в неё нужные устройства, затем: xkeen -restart. Без такой политики через VPN идут все.
+  Не все устройства:        в веб-интерфейсе роутера создайте политику доступа в интернет с именем xkeen и перенесите
+                            в неё нужные устройства, затем: xkeen -restart. Без такой политики правила действуют для всех.
   Желательно:               задать в роутере шифрованный DNS (DNS-over-TLS) — без него часть заблокированных сайтов
                             может не открываться и через VPN: README, раздел «Роутер Keenetic», шаг 2.
 EOF
 	else
 		# Туннель не поднялся: дом не должен остаться без интернета.
 		"$OPT/sbin/xkeen" -stop < /dev/null > /dev/null 2>&1 || true
-		configs_restore
+		rollback
 		die "туннель до сервера $host не заработал — VPN выключен, интернет идёт напрямую, прежние настройки возвращены.
 Что проверить: ссылка свежая и клиент не выключен в боте; сервер работает (на нём: vpn-check); в роутере задан шифрованный DNS.
 Ответ XKeen: $(tail -4 "$WORK/xkeen.out" 2> /dev/null | sed "s/$(printf '\033').[0-9;]*m//g" | tr '\n' ' ' | cut -c1-300)"
 	fi
 }
 
-do_update() {  # для планировщика: тихо; меняет что-то, только если подписка изменилась и новый туннель работает
+reapply() {  # после сбоя новых настроек: прежние возвращены — поднять VPN на них
+	rollback
+	"$OPT/sbin/xkeen" -restart < /dev/null > /dev/null 2>&1 || true
+}
+
+do_update() {  # для планировщика: тихо; меняет что-то, только если есть что менять и новый туннель работает
 	MODE=update
 	[ -s "$STATE_DIR/source" ] && [ -x "$OPT/sbin/xkeen" ] || die "VPN этим скриптом ещё не настраивался"
 	SOURCE=$(cat "$STATE_DIR/source")
+	mode_load
 	links_fetch || { note "подписка не прочиталась: $ERR"; die "$ERR"; }
 	link_pick || { note "подписка не подошла: $ERR"; die "$ERR"; }
+	geo_ensure || { note "$ERR"; die "$ERR"; }
 	configs_write
-	if [ "$CHANGED" = 0 ]; then
+	if [ "$CHANGED" = 0 ] && [ "$GEO_CHANGED" = 0 ]; then
 		date '+%F %R' > "$STATE_DIR/updated"
-		echo "подписка не изменилась"
+		echo "подписка и списки сайтов не изменились"
 		return 0
 	fi
 	if apply; then
+		geo_commit
 		state_save
-		note "подписка изменилась — настройки обновлены, выход $VPN_IP"
-		echo "подписка изменилась — настройки обновлены, туннель работает (выход $VPN_IP)"
+		note "настройки обновлены (подписка, списки сайтов или свои списки), выход $VPN_IP"
+		echo "настройки обновлены, туннель работает (выход $VPN_IP)"
 	else
-		configs_restore
-		"$OPT/sbin/xkeen" -restart < /dev/null > /dev/null 2>&1 || true
-		note "новые настройки из подписки не заработали — возвращены прежние"
-		die "новые настройки из подписки не заработали — вернул прежние"
+		reapply
+		note "новые настройки не заработали — возвращены прежние"
+		die "новые настройки не заработали — вернул прежние"
+	fi
+}
+
+do_mode() {  # vpn-keenetic --mode РЕЖИМ [СЕРВИСЫ]: сменить, что идёт через VPN; не заработало — остаться как было
+	MODE=update
+	[ -s "$STATE_DIR/source" ] && [ -x "$OPT/sbin/xkeen" ] && [ -f "$CONF_DIR/04_outbounds.json" ] || die "VPN этим скриптом ещё не настраивался"
+	[ -n "${1:-}" ] || die "какой режим? vpn-keenetic --mode blocked | all | sites youtube,instagram"
+	VPNK_MODE=$1
+	[ -z "${2:-}" ] || VPNK_SITES=$2
+	mode_load
+	SOURCE=$(cat "$STATE_DIR/source")
+	INDEX=$(cat "$STATE_DIR/index" 2> /dev/null || echo 1)
+	# Сервер — тот же, что настроен: подписку ради смены режима не перечитываем.
+	PARSED=$(jq -c '{name: "", host: .outbounds[0].settings.vnext[0].address, port: .outbounds[0].settings.vnext[0].port, outbound: .outbounds[0]}' "$CONF_DIR/04_outbounds.json") ||
+		die "не читаются нынешние настройки — запустите установку заново"
+	geo_ensure || die "$ERR"
+	configs_write
+	if [ "$CHANGED" = 0 ] && [ "$GEO_CHANGED" = 0 ]; then
+		state_save
+		echo "Режим уже такой: $(mode_label)"
+		return 0
+	fi
+	if apply; then
+		geo_commit
+		state_save
+		note "режим: $(mode_label)"
+		echo "Готово. Режим: $(mode_label). Туннель работает (выход $VPN_IP)"
+	else
+		reapply
+		die "в новом режиме туннель не заработал — вернул прежний"
 	fi
 }
 
@@ -530,6 +720,8 @@ do_status() {
 	if [ -f "$CONF_DIR/04_outbounds.json" ]; then
 		echo "Сервер: $(jq -r '.outbounds[0].settings.vnext[0] | .address + ":" + (.port | tostring)' "$CONF_DIR/04_outbounds.json" 2> /dev/null || echo '?')"
 	fi
+	mode_load
+	echo "Режим: $(mode_label)"
 	echo "Подписка проверялась: $(cat "$STATE_DIR/updated" 2> /dev/null || echo 'ни разу')"
 	VPNK_WAIT=1
 	ip=$(tunnel_ip)
@@ -541,6 +733,7 @@ do_remove() {
 	[ -d "$STATE_DIR" ] || die "настроек этого скрипта на роутере нет"
 	"$OPT/sbin/xkeen" -stop < /dev/null > /dev/null 2>&1 || true
 	if [ -d "$STATE_DIR/original" ]; then configs_back "$STATE_DIR/original"; else for f in $FILES; do rm -f "$CONF_DIR/$f"; done; fi
+	for f in geosite_refilter.dat geoip_refilter.dat geosite_v2fly.dat; do rm -f "$DAT_DIR/$f" "$DAT_DIR/$f.vpnk-prev" "$DAT_DIR/$f.vpnk-absent"; done
 	if [ -f "$CRON_FILE" ]; then grep -v 'vpn-keenetic --update' "$CRON_FILE" > "$WORK/cron" || true; cp "$WORK/cron" "$CRON_FILE"; fi
 	rm -rf "$STATE_DIR"
 	rm -f "$SELF"
@@ -553,11 +746,12 @@ main() {
 	trap 'rm -rf "$WORK"' EXIT
 	case ${1:-} in
 		--update) do_update ;;
+		--mode) do_mode "${2:-}" "${3:-}" ;;
 		--status) do_status ;;
 		--off) "$OPT/sbin/xkeen" -stop < /dev/null && echo "VPN выключен: интернет идёт напрямую" ;;
 		--on) "$OPT/sbin/xkeen" -start < /dev/null && echo "VPN включён" ;;
 		--remove) do_remove ;;
-		-h | --help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+		-h | --help) sed -n '2,/^$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' ;;
 		--*) die "неизвестный параметр $1 (справка: --help)" ;;
 		*) do_install "${1:-}" ;;
 	esac

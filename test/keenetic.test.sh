@@ -165,17 +165,17 @@ EOF
 	printf '// пример\n{"routing": {"rules": [{"inboundTag": ["redirect", "tproxy"], "outboundTag": "direct"}]}}\n' > "$1/05_routing.json"
 	echo '{"policy": {"levels": {"0": {"uplinkOnly": 0, "downlinkOnly": 0}}}}' > "$1/06_policy.json"
 }
-test_routing_everything_through_vpn_except_home_and_server() {
+test_routing_everything_through_vpn_except_home_and_server() {  # режим all
 	lib
 	local r
-	r=$(vpnk_routing "$(vpnk_parse "$LINK")")
+	r=$(vpnk_routing "$(vpnk_parse "$LINK")" all)
 	t_eq '["full:vpn.example.com"]' "$(printf '%s' "$r" | jq -c '[.routing.rules[] | select(.outboundTag == "direct" and has("domain"))][0].domain')" "сам сервер — напрямую"
 	t_eq "vless-reality" "$(printf '%s' "$r" | jq -r '.routing.rules[-1].outboundTag')" "остальное — через VPN"
 	t_eq '["redirect","tproxy"]' "$(printf '%s' "$r" | jq -c '.routing.rules[-1].inboundTag')" "входы XKeen"
 	printf '%s' "$r" | jq -e '[.routing.rules[] | select(.outboundTag == "direct" and has("ip"))][0].ip | index("192.168.0.0/16") != null' > /dev/null || t_fail "домашняя сеть не напрямую"
-	r=$(vpnk_routing "$(vpnk_parse "vless://$U@203.0.113.5:2083?security=reality&pbk=$PBK")")
+	r=$(vpnk_routing "$(vpnk_parse "vless://$U@203.0.113.5:2083?security=reality&pbk=$PBK")" all)
 	t_eq '["203.0.113.5"]' "$(printf '%s' "$r" | jq -c '[.routing.rules[] | select(.outboundTag == "direct" and has("ip"))][1].ip')" "сервер по IP — напрямую"
-	r=$(vpnk_routing "$(vpnk_parse "vless://$U@[2001:db8::1]:2083?security=reality&pbk=$PBK")")
+	r=$(vpnk_routing "$(vpnk_parse "vless://$U@[2001:db8::1]:2083?security=reality&pbk=$PBK")" all)
 	t_eq '["2001:db8::1"]' "$(printf '%s' "$r" | jq -c '[.routing.rules[] | select(.outboundTag == "direct" and has("ip"))][1].ip')" "сервер по IPv6 — напрямую"
 }
 test_configs_accepted_by_real_xray() {  # то, что скрипт положит рядом с шаблонами XKeen, Xray принимает целиком
@@ -188,7 +188,7 @@ test_configs_accepted_by_real_xray() {  # то, что скрипт положи
 		rm -rf "$d"; tpl "$d"
 		p=$(vpnk_parse "$link")
 		vpnk_outbounds "$p" > "$d/04_outbounds.json"
-		vpnk_routing "$p" > "$d/05_routing.json"
+		vpnk_routing "$p" all > "$d/05_routing.json"
 		vpnk_selftest_inbound > "$d/09_vpnk_selftest.json"
 		XRAY_LOCATION_CONFDIR=$d "$VPNK_TEST_XRAY" -format=json -test > "$WORK/xray.out" 2>&1 || t_fail "Xray не принял настройки для ссылки $n: $(tail -3 "$WORK/xray.out")"
 	done <<EOF
@@ -197,6 +197,47 @@ vless://$U@203.0.113.5:2083?type=xhttp&security=reality&pbk=$PBK&sni=www.example
 vless://$U@[2001:db8::1]:443?type=tcp&security=reality&pbk=$PBK&sni=example.org&sid=0a&flow=xtls-rprx-vision
 EOF
 	[ "$n" = 3 ] || t_fail "проверено $n ссылок"
+}
+
+# Списки сайтов в настоящем формате Xray (protobuf GeoSiteList / GeoIPList) — маленькие, для тестов.
+mkdat() {  # mkdat ФАЙЛ site|ip "КАТЕГОРИЯ=значение,значение" …
+	python3 -I - "$@" <<'EOF'
+import ipaddress, sys
+def vi(n):
+    out = b""
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out += bytes([b | (0x80 if n else 0)])
+        if not n:
+            return out
+def ld(field, data):
+    return vi(field << 3 | 2) + vi(len(data)) + data
+out = b""
+for spec in sys.argv[3:]:
+    cat, vals = spec.split("=", 1)
+    body = ld(1, cat.upper().encode())
+    for v in filter(None, vals.split(",")):
+        if sys.argv[2] == "site":
+            body += ld(2, vi(1 << 3 | 0) + vi(2) + ld(2, v.encode()))
+        else:
+            net = ipaddress.ip_network(v)
+            body += ld(2, ld(1, net.network_address.packed) + vi(2 << 3 | 0) + vi(net.prefixlen))
+    out += ld(1, body)
+open(sys.argv[1], "wb").write(out)
+EOF
+}
+geo_world() {  # что «лежит на GitHub»: списки и их контрольные суммы в API
+	mkdir -p "$FAKE/geo"
+	mkdat "$FAKE/geo/refilter_site.dat" site "refilter=blocked.example.org,rutracker.example"
+	mkdat "$FAKE/geo/refilter_ip.dat" ip "refilter=198.51.100.0/24,2001:db8:bad::/48"
+	mkdat "$FAKE/geo/v2fly_site.dat" site "youtube=youtube.example,ytimg.example" "instagram=instagram.example" "discord=discord.example"
+	geo_api
+}
+geo_api() {  # ответы API GitHub с контрольными суммами нынешних файлов
+	printf '{"assets": [{"name": "geosite.dat", "digest": "sha256:%s"}, {"name": "geoip.dat", "digest": "sha256:%s"}]}\n' \
+		"$(sha256sum "$FAKE/geo/refilter_site.dat" | cut -d' ' -f1)" "$(sha256sum "$FAKE/geo/refilter_ip.dat" | cut -d' ' -f1)" > "$FAKE/geo/api.refilter.json"
+	printf '{"assets": [{"name": "dlc.dat", "digest": "sha256:%s"}]}\n' "$(sha256sum "$FAKE/geo/v2fly_site.dat" | cut -d' ' -f1)" > "$FAKE/geo/api.v2fly.json"
 }
 
 # ——— Поддельный роутер ———
@@ -210,6 +251,7 @@ router() {  # Entware в $WORK/opt, заглушки в $WORK/bin, их журн
 	echo '{"release": "4.03.C.6.3-9", "title": "4.3.6.3", "model": "Giga (KN-1011)", "hw_id": "KN-1011", "region": "EA"}' > "$FAKE/version.json"
 	tpl "$FAKE/tpl"
 	: > "$FAKE/tunnel.ok"
+	geo_world
 	printf '%s\n' "$LINK" | base64 | tr -d '\n' > "$FAKE/sub.body"
 	cat > "$WORK/bin/opkg" <<'EOF'
 #!/bin/sh
@@ -240,6 +282,13 @@ case $url in
 		[ "$code" = 200 ] || exit 22
 		cat "$FAKE/version.json" ;;
 	*xkeen.tar.gz) [ -f "$FAKE/xkeen.tar.gz" ] || exit 22; cat "$FAKE/xkeen.tar.gz" > "$out" ;;
+	https://api.github.com/repos/1andrevich/Re-filter-lists/releases/latest) [ -f "$FAKE/geo/api.refilter.json" ] || exit 22; cat "$FAKE/geo/api.refilter.json" ;;
+	https://api.github.com/repos/v2fly/domain-list-community/releases/latest) [ -f "$FAKE/geo/api.v2fly.json" ] || exit 22; cat "$FAKE/geo/api.v2fly.json" ;;
+	https://github.com/1andrevich/Re-filter-lists/releases/latest/download/geosite.dat) [ ! -f "$FAKE/github.down" ] && [ -f "$FAKE/geo/refilter_site.dat" ] || exit 22; cat "$FAKE/geo/refilter_site.dat" > "$out" ;;
+	https://github.com/1andrevich/Re-filter-lists/releases/latest/download/geoip.dat) [ ! -f "$FAKE/github.down" ] && [ -f "$FAKE/geo/refilter_ip.dat" ] || exit 22; cat "$FAKE/geo/refilter_ip.dat" > "$out" ;;
+	https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat) [ ! -f "$FAKE/github.down" ] && [ -f "$FAKE/geo/v2fly_site.dat" ] || exit 22; cat "$FAKE/geo/v2fly_site.dat" > "$out" ;;
+	https://gh-proxy.com/https://github.com/*/geosite.dat | https://gh-proxy.com/https://github.com/*/geoip.dat | https://gh-proxy.com/https://github.com/*/dlc.dat)
+		[ -f "$FAKE/mirror.file" ] || exit 22; cat "$FAKE/mirror.file" > "$out" ;;
 	*cdn-cgi/trace*)
 		if [ -n "$proxy" ]; then
 			[ -f "$FAKE/tunnel.ok" ] || exit 7
@@ -449,7 +498,7 @@ test_update_unchanged_touches_nothing() {
 	: > "$FAKE/calls"
 	run --update
 	t_eq 0 "$RC" "обновление: $OUT"
-	t_has "не изменилась" "$OUT" "итог"
+	t_has "не изменились" "$OUT" "итог"
 	t_eq 0 "$(calls '^xkeen ')" "XKeen не перезапускали"
 }
 test_update_changed_subscription_applies() {  # сервер сменил порт — роутер подхватил сам
@@ -515,6 +564,246 @@ test_help_and_unknown_option() {
 	run --wat
 	[ "$RC" != 0 ] || t_fail "неизвестный параметр принят"
 	t_eq 0 "$(calls '^xkeen ')" "ничего не делали"
+}
+# ——— Режимы: что идёт через VPN ———
+rules() { printf '%s' "$1" | jq -c "$2"; }
+test_routing_blocked_only_listed_through_vpn() {  # режим по умолчанию: через VPN — только заблокированное в России
+	lib
+	local r
+	r=$(vpnk_routing "$(vpnk_parse "$LINK")" blocked)
+	t_eq '{"inboundTag":["redirect","tproxy"],"outboundTag":"direct"}' "$(rules "$r" '.routing.rules[-1]')" "остальное — напрямую"
+	t_eq '["ext:geosite_refilter.dat:refilter"]' "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "vless-reality" and has("domain"))][0].domain')" "сайты из списка — через VPN"
+	t_eq '["ext:geoip_refilter.dat:refilter"]' "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "vless-reality" and has("ip"))][0].ip')" "адреса из списка — через VPN"
+	t_eq 0 "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "block" and (has("domain") or has("ip")) | not) | select(.outboundTag == "block")] | length')" "напрямую идущее не режется"
+	t_eq '["vpnk-selftest"]' "$(rules "$r" '.routing.rules[0].inboundTag')" "самопроверка — всегда через VPN"
+	rules "$r" '[.routing.rules[] | select(.outboundTag == "direct" and has("ip"))][0].ip | index("192.168.0.0/16") != null' | grep -q true || t_fail "домашняя сеть не напрямую"
+}
+test_routing_sites_only_chosen_services() {  # режим sites: через VPN — только выбранные сервисы
+	lib
+	local r
+	r=$(vpnk_routing "$(vpnk_parse "$LINK")" sites "youtube,instagram")
+	t_eq '["ext:geosite_v2fly.dat:youtube","ext:geosite_v2fly.dat:instagram"]' "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "vless-reality" and has("domain"))][0].domain')" "выбранные сервисы"
+	t_eq '"direct"' "$(rules "$r" '.routing.rules[-1].outboundTag')" "остальное — напрямую"
+	t_eq 0 "$(rules "$r" '[.routing.rules[] | select((.ip // []) | index("ext:geoip_refilter.dat:refilter"))] | length')" "список заблокированного не используется"
+}
+test_routing_quic_and_ipv6_fall_back_to_tcp_ipv4() {  # для идущего через VPN: QUIC и IPv6 обрываются сразу — браузер уходит на TCP/IPv4
+	lib
+	local r d='["ext:geosite_refilter.dat:refilter"]'
+	r=$(vpnk_routing "$(vpnk_parse "$LINK")" blocked)
+	t_eq "{\"network\":\"udp\",\"port\":\"443\",\"domain\":$d,\"outboundTag\":\"block\"}" "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "block" and has("domain") and has("network"))][0]')" "QUIC к сайтам из списка"
+	t_eq "{\"domain\":$d,\"ip\":[\"::/0\"],\"outboundTag\":\"block\"}" "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "block" and has("domain") and has("ip"))][0]')" "IPv6 к сайтам из списка"
+	# порядок: сначала обрыв QUIC и IPv6, потом «через VPN» — иначе до обрыва дело не дойдёт
+	t_eq '["block","block","vless-reality"]' "$(rules "$r" '[.routing.rules[] | select(has("domain") and (.domain[0] | startswith("ext:"))) | .outboundTag]')" "порядок правил для списка"
+}
+test_user_lists_parsed() {  # свои списки: домены и адреса, по строке; лишнее — отбрасывается, а не ломает настройки
+	lib
+	mkdir -p "$STATE_DIR"
+	cat > "$STATE_DIR/vpn.txt" <<'EOF'
+# мои сайты через VPN
+Example.ORG
+https://sub.example.net/path?x=1
+*.wild.example.com
+  spaced.example.org   # с комментарием
+203.0.113.0/24
+2001:db8::/32
+не домен
+bad_domain.example
+"quoted.example"
+$(touch /tmp/x)
+EOF
+	t_eq '{"domain":["domain:example.org","domain:sub.example.net","domain:wild.example.com","domain:spaced.example.org"],"ip":["203.0.113.0/24","2001:db8::/32"]}' \
+		"$(vpnk_userlist "$STATE_DIR/vpn.txt")" "разбор списка"
+	t_eq '{"domain":[],"ip":[]}' "$(vpnk_userlist "$STATE_DIR/нет-такого.txt")" "нет файла — пусто"
+}
+test_routing_user_lists_win_over_mode() {  # свои списки главнее режима: direct.txt — напрямую, vpn.txt — через VPN
+	lib
+	mkdir -p "$STATE_DIR"
+	printf 'bank.example\n192.0.2.0/24\n' > "$STATE_DIR/direct.txt"
+	printf 'my.example\n' > "$STATE_DIR/vpn.txt"
+	local r
+	r=$(vpnk_routing "$(vpnk_parse "$LINK")" blocked)
+	t_eq '["domain:bank.example"]' "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "direct" and has("domain") and (.domain[0] | startswith("domain:")))][0].domain')" "свой список «напрямую»"
+	t_eq '["domain:my.example"]' "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "vless-reality" and has("domain"))][0].domain')" "свой список «через VPN» — раньше общего"
+	[ "$(rules "$r" '[.routing.rules[] | select(has("domain")) | .domain[0]] | index("domain:bank.example") < index("domain:my.example")')" = true ] || t_fail "«напрямую» должно стоять раньше «через VPN»"
+	r=$(vpnk_routing "$(vpnk_parse "$LINK")" all)
+	t_eq '["domain:bank.example"]' "$(rules "$r" '[.routing.rules[] | select(.outboundTag == "direct" and has("domain") and (.domain[0] | startswith("domain:")))][0].domain')" "и в режиме «всё через VPN»"
+}
+test_modes_accepted_by_real_xray() {  # правила всех режимов со списками настоящего формата принимает настоящий Xray
+	[ -n "${VPNK_TEST_XRAY:-}" ] || { echo "    (пропуск: нет VPNK_TEST_XRAY)"; return 0; }
+	lib
+	FAKE=$WORK/fake; geo_world
+	local d=$WORK/conf a=$WORK/dat p m
+	mkdir -p "$a" "$STATE_DIR"
+	cp "$FAKE/geo/refilter_site.dat" "$a/geosite_refilter.dat"; cp "$FAKE/geo/refilter_ip.dat" "$a/geoip_refilter.dat"; cp "$FAKE/geo/v2fly_site.dat" "$a/geosite_v2fly.dat"
+	printf 'my.example\n203.0.113.0/24\n' > "$STATE_DIR/vpn.txt"; printf 'bank.example\n' > "$STATE_DIR/direct.txt"
+	p=$(vpnk_parse "$LINK")
+	for m in "blocked" "all" "sites youtube,instagram,discord"; do
+		rm -rf "$d"; tpl "$d"
+		vpnk_outbounds "$p" > "$d/04_outbounds.json"
+		# shellcheck disable=SC2086
+		vpnk_routing "$p" $m > "$d/05_routing.json"
+		vpnk_selftest_inbound > "$d/09_vpnk_selftest.json"
+		XRAY_LOCATION_CONFDIR=$d XRAY_LOCATION_ASSET=$a "$VPNK_TEST_XRAY" -format=json -test > "$WORK/xray.out" 2>&1 || t_fail "режим «$m»: Xray не принял: $(tail -3 "$WORK/xray.out")"
+	done
+	vpnk_routing "$p" sites "nosuchservice" > "$d/05_routing.json"
+	! XRAY_LOCATION_CONFDIR=$d XRAY_LOCATION_ASSET=$a "$VPNK_TEST_XRAY" -format=json -test > /dev/null 2>&1 || t_fail "несуществующий сервис принят"
+}
+dat() { ls "$WORK/opt/etc/xray/dat" 2> /dev/null | tr '\n' ' '; }
+age() { python3 -I -c 'import os, sys, time; t = time.time() - 9 * 86400; [os.utime(f, (t, t)) for f in sys.argv[1:]]' "$@"; }   # файлам — 9 дней
+test_install_default_mode_is_blocked() {  # решение владельца: по умолчанию через VPN — только заблокированное в России
+	router
+	run "$SUB"
+	t_eq 0 "$RC" "установка: $OUT"
+	t_eq "blocked" "$(cat "$WORK/opt/etc/vpn-keenetic/mode")" "режим запомнен"
+	t_eq "geoip_refilter.dat geosite_refilter.dat " "$(dat)" "скачаны только нужные списки"
+	t_eq '"direct"' "$(conf 05_routing.json '.routing.rules[-1].outboundTag | tojson')" "остальное — напрямую"
+	t_has "только заблокированное" "$OUT" "режим назван"
+	t_has "vpn-keenetic --mode" "$OUT" "как переключить"
+	[ -f "$WORK/opt/etc/vpn-keenetic/vpn.txt" ] && [ -f "$WORK/opt/etc/vpn-keenetic/direct.txt" ] || t_fail "нет файлов для своих списков"
+}
+test_install_mode_from_environment() {
+	router
+	VPNK_MODE=all; export VPNK_MODE
+	run "$SUB"
+	t_eq 0 "$RC" "установка: $OUT"
+	t_eq "all" "$(cat "$WORK/opt/etc/vpn-keenetic/mode")" "режим"
+	t_eq "" "$(dat)" "списки не нужны — не качаем"
+	t_eq '"vless-reality"' "$(conf 05_routing.json '.routing.rules[-1].outboundTag | tojson')" "всё через VPN"
+}
+test_mode_switch() {  # vpn-keenetic --mode …: переключить, проверить туннель, запомнить
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	: > "$FAKE/calls"
+	run --mode sites youtube,discord
+	t_eq 0 "$RC" "переключение: $OUT"
+	t_eq "sites youtube,discord" "$(cat "$WORK/opt/etc/vpn-keenetic/mode") $(cat "$WORK/opt/etc/vpn-keenetic/sites")" "запомнено"
+	t_eq '["ext:geosite_v2fly.dat:youtube","ext:geosite_v2fly.dat:discord"]' "$(conf 05_routing.json '[.routing.rules[] | select(.outboundTag == "vless-reality" and has("domain"))][0].domain | tojson')" "правила"
+	[ -f "$WORK/opt/etc/xray/dat/geosite_v2fly.dat" ] || t_fail "список сервисов не скачан"
+	t_eq 1 "$(calls '^xkeen -restart$')" "перезапуск"
+	run --mode all
+	t_eq 0 "$RC" "переключение на всё: $OUT"
+	t_eq '"vless-reality"' "$(conf 05_routing.json '.routing.rules[-1].outboundTag | tojson')" "всё через VPN"
+	run --status
+	t_has "всё через VPN" "$OUT" "режим виден в --status"
+	run --mode blocked
+	run --status
+	t_has "только заблокированное" "$OUT" "и обратно"
+}
+test_mode_switch_rejects_nonsense() {
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	: > "$FAKE/calls"
+	run --mode everything
+	[ "$RC" != 0 ] || t_fail "принят несуществующий режим"
+	t_has "blocked, all или sites" "$OUT" "подсказка"
+	run --mode sites 'You Tube;rm -rf'
+	[ "$RC" != 0 ] || t_fail "принят мусор вместо списка сервисов"
+	run --mode sites
+	[ "$RC" != 0 ] || t_fail "режим sites без сервисов и без прежнего выбора"
+	t_eq 0 "$(calls '^xkeen ')" "ничего не трогали"
+	t_eq "blocked" "$(cat "$WORK/opt/etc/vpn-keenetic/mode")" "режим прежний"
+}
+test_mode_switch_unknown_service_keeps_working_setup() {  # сервиса нет в списке — Xray не примет; остаёмся как были
+	[ -n "${VPNK_TEST_XRAY:-}" ] || { echo "    (пропуск: нет VPNK_TEST_XRAY)"; return 0; }
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	run --mode sites nosuchservice
+	[ "$RC" != 0 ] || t_fail "принят сервис, которого нет в списке"
+	t_has "Xray не принял" "$OUT" "причина"
+	t_eq "blocked" "$(cat "$WORK/opt/etc/vpn-keenetic/mode")" "режим прежний"
+	t_eq '["ext:geosite_refilter.dat:refilter"]' "$(conf 05_routing.json '[.routing.rules[] | select(.outboundTag == "vless-reality" and has("domain"))][0].domain | tojson')" "правила прежние"
+}
+test_mode_switch_dead_tunnel_keeps_previous_mode() {  # в новом режиме туннель не поднялся — остаёмся в прежнем
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	rm -f "$FAKE/tunnel.ok"
+	: > "$FAKE/calls"
+	run --mode all
+	[ "$RC" != 0 ] || t_fail "сообщила об успехе без туннеля"
+	t_has "вернул прежний" "$OUT" "сказано человеку"
+	t_eq "blocked" "$(cat "$WORK/opt/etc/vpn-keenetic/mode")" "режим прежний"
+	t_eq '"direct"' "$(conf 05_routing.json '.routing.rules[-1].outboundTag | tojson')" "правила прежние"
+	t_eq 2 "$(calls '^xkeen -restart$')" "перезапуск с новыми правилами и снова — с прежними"
+}
+test_lists_checked_against_github_checksum() {  # список не тот, что опубликован, — не берём
+	router
+	echo '{"assets": [{"name": "geosite.dat", "digest": "sha256:0000"}, {"name": "geoip.dat", "digest": "sha256:0000"}]}' > "$FAKE/geo/api.refilter.json"
+	run "$SUB"
+	[ "$RC" != 0 ] || t_fail "принят список с чужой контрольной суммой"
+	t_has "не совпал" "$OUT" "причина"
+	t_eq "" "$(dat)" "чужой список не положен"
+	t_eq 0 "$(calls '^xkeen -restart$')" "VPN не запускали"
+}
+test_lists_from_mirror_only_with_checksum() {  # GitHub не отдал файл: зеркалу верим, только если сумма сходится с опубликованной
+	router
+	: > "$FAKE/github.down"
+	cp "$FAKE/geo/refilter_site.dat" "$FAKE/mirror.file"
+	run "$SUB"
+	[ "$RC" != 0 ] || t_fail "зеркало отдало один файл на оба списка — и это принято"
+	rm -f "$FAKE/geo/api.refilter.json"
+	run "$SUB"
+	[ "$RC" != 0 ] || t_fail "файл с зеркала принят без проверки суммы"
+	t_has "списки сайтов не скачались" "$OUT" "причина"
+	t_has "VPNK_MODE=all" "$OUT" "что можно сделать"
+}
+test_lists_without_published_checksum_say_so() {  # API GitHub не ответил: с самого GitHub берём, но не говорим «сверено»
+	router
+	rm -f "$FAKE/geo/api.refilter.json"
+	run "$SUB"
+	t_eq 0 "$RC" "установка: $OUT"
+	t_has "сверить их с контрольной суммой не вышло" "$OUT" "честно сказано"
+	t_hasnt "сверены с контрольными суммами" "$OUT" "и не сказано лишнего"
+	geo_api
+	run --remove; run "$SUB"
+	t_has "сверены с контрольными суммами" "$OUT" "когда сверено — так и сказано"
+}
+test_update_refreshes_old_lists() {  # списки старше недели перечитываются; не скачались — работаем на прежних
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	mkdat "$FAKE/geo/refilter_site.dat" site "refilter=blocked.example.org,rutracker.example,new-blocked.example"
+	geo_api
+	: > "$FAKE/calls"
+	run --update
+	t_has "не изменились" "$OUT" "свежие списки не трогаем"
+	t_eq 0 "$(calls 'geosite.dat')" "и не качаем"
+	age "$WORK/opt/etc/xray/dat/geosite_refilter.dat" "$WORK/opt/etc/xray/dat/geoip_refilter.dat"
+	run --update
+	t_eq 0 "$RC" "обновление: $OUT"
+	cmp -s "$FAKE/geo/refilter_site.dat" "$WORK/opt/etc/xray/dat/geosite_refilter.dat" || t_fail "список не обновлён"
+	t_eq 1 "$(calls '^xkeen -restart$')" "перезапуск, чтобы Xray перечитал список"
+	age "$WORK/opt/etc/xray/dat/geosite_refilter.dat"
+	: > "$FAKE/github.down"; : > "$FAKE/calls"
+	run --update
+	t_eq 0 "$RC" "GitHub недоступен — не ошибка: $OUT"
+	t_eq 0 "$(calls '^xkeen ')" "работаем на прежних списках"
+}
+test_update_broken_list_is_rolled_back() {  # новый список не читается Xray — возвращаем прежний
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	cp "$WORK/opt/etc/xray/dat/geosite_refilter.dat" "$WORK/good.dat"
+	head -c 300 /dev/urandom > "$FAKE/geo/refilter_site.dat"; geo_api
+	age "$WORK/opt/etc/xray/dat/geosite_refilter.dat"
+	: > "$FAKE/xray.test.fail"
+	run --update
+	[ "$RC" != 0 ] || t_fail "битый список принят"
+	cmp -s "$WORK/good.dat" "$WORK/opt/etc/xray/dat/geosite_refilter.dat" || t_fail "прежний список не возвращён"
+}
+test_edited_user_lists_apply_on_update() {  # поправил свой список → vpn-keenetic --update применяет
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	printf 'my.example\n' >> "$WORK/opt/etc/vpn-keenetic/vpn.txt"
+	: > "$FAKE/calls"
+	run --update
+	t_eq 0 "$RC" "обновление: $OUT"
+	t_eq '["domain:my.example"]' "$(conf 05_routing.json '[.routing.rules[] | select(.outboundTag == "vless-reality" and has("domain"))][0].domain | tojson')" "свой сайт — через VPN"
+	t_eq 1 "$(calls '^xkeen -restart$')" "применено"
+}
+test_remove_takes_lists_away() {
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	run --remove
+	t_eq 0 "$RC" "удаление: $OUT"
+	t_eq "" "$(dat)" "списки сайтов убраны"
 }
 test_script_is_posix_and_self_contained() {  # роутеру: без bash, без регулярных выражений jq, без скрытого ввода
 	! grep -nE '\[\[|<<<|\$\{[A-Za-z_]+//|function |=~|read +-[a-z]*s' "$SCRIPT" || t_fail "в скрипте конструкции не из POSIX sh"
