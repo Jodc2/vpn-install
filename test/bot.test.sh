@@ -770,6 +770,7 @@ test_deploy_grant_request_for_bot() {
 	t_eq "inherit|" "$(mb ADMIN_ID)" "ADMIN_ID не перезаписан"
 	! grep -q 'values/admins$' "$WORK/cf.calls" || t_fail "трогал сам список админов бота"
 	t_has "добавлен к админам бота" "$BOT_REPORT" "отчёт"
+	[ ! -e "$BOT_DIR/grant.json" ] || t_fail "заявка с id админа осталась на диске"
 }
 test_deploy_grant_merges_pending_request() {  # прошлая заявка ещё не влита (бот не получал обновлений) — дописываем
 	grant_env

@@ -735,7 +735,7 @@ bot_alive() { [ "$(curl -sS --max-time 15 "$1/healthz" 2> /dev/null)" = ok ]; } 
 bot_wipe() {  # стереть секреты из $BOT_DIR (они уже в воркере или больше не нужны)
 	local f
 	for f in id id.pub panel.token tg.token cf.token cf.hdr metadata.json webhook.secret selftest.secret selftest.hdr \
-		admin.id hook.json req.json exit.fpr fpr.json backup.meta bindings.list settings.json; do
+		admin.id hook.json req.json exit.fpr fpr.json backup.meta bindings.list settings.json grant.json; do
 		rm -f "${BOT_DIR:?}/$f"
 	done
 }
