@@ -942,6 +942,9 @@ w = base.get("webhook") or {}
 line(w.get("ok"), "вебхук Телеграма ✓" + (" (последняя ошибка доставки: %s)" % w["error"] if w.get("error") else ""), "вебхук Телеграма не стоит: %s" % w.get("error"))
 adm = base.get("admin") or {}
 line(adm.get("ok"), "админ бота назначен ✓", "у бота нет админа")
+cron = base.get("cron")
+if cron and cron != sys.argv[7]:
+    out.append("⚠ расписание воркера (%s) не то, на которое рассчитан бот (%s): суточный бэкап может не сниматься — возьмите свежий install-vpn.sh" % (sys.argv[7], cron))
 want, fresh = sys.argv[5], sys.argv[6] == "1"
 ids = [str(i) for i in adm.get("ids") or []]
 if want and ids:
@@ -960,7 +963,7 @@ else:
     out.append("⚠ выход по SSH не прошёл (%s) — при переезде порт новому входу открывать руками" % ex.get("error"))
 print("\n".join(out))
 print("RESULT " + ("; ".join(bad) if bad else "ok"))' "$(bot_http '/selftest?part=base')" "$(bot_http '/selftest?part=entry')" "$(bot_http '/selftest?part=exit')" "${EXIT_MODE:-}" \
-		"${BOT_GRANT_ID:-${BOT_ADMIN_ID:-}}" "$([ "${BOT_EXISTING:-none}" = none ] && echo 1 || echo 0)")
+		"${BOT_GRANT_ID:-${BOT_ADMIN_ID:-}}" "$([ "${BOT_EXISTING:-none}" = none ] && echo 1 || echo 0)" "$BOT_CRON")
 	BOT_REPORT+=$(grep -v '^RESULT ' <<< "$res")
 	res=$(sed -n 's/^RESULT //p' <<< "$res")
 	[ "$res" = ok ] || { BOT_ERR=$res; return 1; }

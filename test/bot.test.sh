@@ -1176,6 +1176,20 @@ test_summary_says_bot_not_updated() {  # бот есть, а обновить е
 	t_eq "" "$(bot_summary)" "бота не просили — ни строки"
 	grep -q '^	bot_summary$' "$ROOT/src/install-vpn.sh.in" || t_fail "итог установщика не зовёт bot_summary"
 }
+test_deploy_report_cron_mismatch() {  # расписание, которое ставит установщик, и то, на которое рассчитан бот, разошлись — суточный бэкап не снимался бы
+	deploy_env
+	echo '{"panel":{"ok":true,"clients":3},"dns":{"ok":true,"ip":"1.2.3.4"},"webhook":{"ok":true},"admin":{"ok":true},"cron":"0 */4 * * *"}' > "$WORK/st.base"
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_has "⚠ расписание" "$BOT_REPORT" "сказано"
+	echo '{"panel":{"ok":true,"clients":3},"dns":{"ok":true,"ip":"1.2.3.4"},"webhook":{"ok":true},"admin":{"ok":true},"cron":"0 */3 * * *"}' > "$WORK/st.base"
+	BOT_KEY_NEW=0; settings '[{"type":"secret_text","name":"BOT_TOKEN"},{"type":"secret_text","name":"WEBHOOK_SECRET"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"secret_text","name":"PANEL_TOKEN"},{"type":"secret_text","name":"ENTRY_SSH_KEY"}]'
+	BOT_CF_TOKEN=c bot_init_secrets; BOT_ADMIN_ID=
+	bot_deploy || t_fail "не развернул повторно: $BOT_ERR"
+	case $BOT_REPORT in *"⚠ расписание"*) t_fail "совпавшее расписание названо расхождением" ;; esac
+}
+test_cron_matches_worker() {  # вшитая сборка бота рассчитана на то же расписание, что ставит установщик
+	grep -qF "\"$BOT_CRON\"" "$ROOT/src/bot/worker.js" || t_fail "в сборке бота нет расписания «$BOT_CRON» — src/bot/worker.js устарел или расписания разошлись"
+}
 test_no_hidden_input_in_any_form() {  # решение владельца 11.11: скрытого ввода нет ни в каком написании
 	local f bad
 	hidden() { grep -nE '(^|[^[:alnum:]_])read[[:space:]]([^|;&]*[[:space:]])?-[a-zA-Z]*s[a-zA-Z]*([[:space:]]|$)|stty[[:space:]]([^|;&]*[[:space:]])?-echo' "$@"; }
