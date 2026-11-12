@@ -1960,6 +1960,66 @@ test_db_copy_failure_stops_install() {  # копии нет или она не �
 	t_has "OK копия прежней базы" "$(cat "$WORK/out")" "сказано, где копия"
 }
 
+# Первый вопрос про чужой 3x-ui (пункт 8): объяснение — там же, где вопрос.
+test_foreign_question_explained_where_asked() {  # вывод перенаправлен (> файл): объяснение уходит и в терминал, к вопросу
+	xui_fns; answers y
+	mkdb '443||vless|{}|{}|1'
+	foreign_xui_check > "$WORK/stdout.txt"
+	grep -q 'подключения и клиенты останутся' "$WORK/tty.out" || t_fail "в терминале один вопрос, без объяснения: $(cat "$WORK/tty.out")"
+	[ "$(grep -n 'подключения и клиенты останутся' "$WORK/tty.out" | cut -d: -f1)" -le "$(grep -n 'Продолжить?' "$WORK/tty.out" | cut -d: -f1)" ] ||
+		t_fail "объяснение после вопроса"
+	t_has "подключения и клиенты останутся" "$(cat "$WORK/out")" "в выводе скрипта (журнале) объяснение осталось"
+}
+# pty_run 'команда' → всё, что увидел человек в терминале (на вопрос «[y/N]: » отвечает «n»).
+pty_run() {
+	python3 -I - "$1" <<'EOF'
+import os, pty, select, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("bash", ["bash", "-c", sys.argv[1]])
+out, answered, end = b"", False, time.time() + 30
+while time.time() < end:
+    r, _, _ = select.select([fd], [], [], 0.3)
+    if fd in r:
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        out += data
+        if not answered and b"[y/N]: " in out:
+            time.sleep(0.5)   # перед вопросом скрипт выбрасывает набранное заранее — ответить после паузы
+            os.write(fd, b"n\n")
+            answered = True
+    elif os.waitpid(pid, os.WNOHANG)[0]:
+        break
+sys.stdout.write(out.decode("utf-8", "replace"))
+EOF
+}
+test_foreign_question_on_real_terminal() {  # настоящий терминал: объяснение — один раз и на экране, и (если вывод в файл) в файле
+	local seen
+	cat > "$WORK/ask.sh" <<EOF
+set -euo pipefail
+WORK=$WORK
+. "$ROOT/src/bot.sh"
+eval "\$(awk '/^(foreign_xui_check|foreign_on_port)\\(\\) \\{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+warn() { printf '  ВНИМ. %s\\n' "\$*"; }
+die() { printf 'Остановлено: %s\\n' "\$*" >&2; exit 1; }
+DB=\$WORK/x-ui.db STATE=\$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
+foreign_xui_check
+EOF
+	DB=$WORK/x-ui.db; mkdb '443||vless|{}|{}|1'
+	seen=$(pty_run "bash '$WORK/ask.sh'")
+	t_eq 1 "$(grep -c 'подключения и клиенты останутся' <<< "$seen")" "вывод на экран: объяснение на экране один раз, не дважды"
+	t_has "Продолжить? [y/N]: " "$seen" "вопрос задан"
+	t_has "ничего не менял" "$seen" "ответ «n» остановил"
+	seen=$(pty_run "bash '$WORK/ask.sh' > '$WORK/log.txt'")
+	t_eq 1 "$(grep -c 'подключения и клиенты останутся' <<< "$seen")" "вывод в файл: объяснение всё равно на экране, рядом с вопросом"
+	t_has "Продолжить? [y/N]: " "$seen" "вопрос задан"
+	t_eq 1 "$(grep -c 'подключения и клиенты останутся' "$WORK/log.txt")" "и в файле (журнале) — тоже, один раз"
+}
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.
