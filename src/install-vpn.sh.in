@@ -3082,10 +3082,17 @@ fw_kept_ports() {  # ufw выключен (сам так ответил) — п�
 	[ "$(ufw_state)" = inactive ] || return 0   # включён — его правила остаются как есть; не понять — лишнего не открываем
 	xui_inbound_ports
 }
+fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в ufw; 1 — не тронуто: на этом порту работает подключение панели
+	case " $FW_INBOUND " in *" ${1%/*}/"*) return 1 ;; esac
+	ufw delete allow "$1" >/dev/null 2>&1 || true
+}
 fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить
-	local KEEP OPEN KEPT CLOSING p pp state
+	local KEEP OPEN KEPT CLOSING p pp state lost=""
 	state=$(ufw_state)
-	KEEP=$(fw_kept_ports)
+	# Порты включённых подключений панели, слушающих не только localhost. Скрипт их не закрывает никогда, был ufw включён
+	# или нет: ни удалением разрешения (fw_close), ни включением ufw, в котором для них нет разрешения.
+	FW_INBOUND=$(xui_inbound_ports | tr '\n' ' ')
+	KEEP=$(fw_kept_ports | tr '\n' ' ')
 	OPEN=$( {
 		for p in $SSH_PORTS; do echo "$p/tcp"; done
 		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
@@ -3095,8 +3102,12 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		echo "$REALITY_PORT/tcp"
 		for pp in $OTHER_VPN_PORTS $KEEP; do echo "$pp"; done
 	} | sort -u | sort -t/ -k1,1n -k2,2)
-	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
-	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || printf '%s ' "$pp"; done)
+	for p in $OPEN; do
+		ufw allow "$p" >/dev/null && continue
+		bad "ufw allow $p не прошёл"
+		case " $KEEP " in *" $p "*) lost="$lost $p" ;; esac
+	done
+	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || [[ " $lost " == *" $pp "* ]] || printf '%s ' "$pp"; done)
 	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
 	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
 	if [ "$state" = unknown ]; then
@@ -3104,16 +3115,19 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		bad "состояние ufw понять не удалось («ufw status» не ответил ни «active», ни «inactive») — нужные порты в нём разрешил, но включать его и убирать лишние правила не стал. Проверьте: ufw status"
 		return 0
 	fi
-	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ]; then
-		ufw delete allow "$MOVED_FROM/tcp" >/dev/null 2>&1 || true
+	if [ "$state" = inactive ] && [ -n "$lost" ]; then
+		bad "ufw не включал: не удалось разрешить в нём$lost, а включённый фаервол закрыл бы подключения панели на этих портах. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
+		return 0
+	fi
+	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ] && fw_close "$MOVED_FROM/tcp"; then
 		ok "старый порт подключения $MOVED_FROM закрыт в ufw"
 	fi
 	# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
 	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
-		for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || ufw delete allow "$p" >/dev/null 2>&1 || true; done
+		for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || fw_close "$p" || true; done
 	fi
 	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
-	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
+	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then fw_close "$WEB_PORT/tcp" || true; fi
 	if [ "$state" = inactive ]; then
 		# Что ещё слушает снаружи, фаервол закроет — назвать, чтобы чужая служба не пропала молча.
 		CLOSING=$(ss -Htuln 2>/dev/null | awk '{print $1, $5}' | while read -r proto addr; do

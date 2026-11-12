@@ -1474,6 +1474,19 @@ ufw_speaks_russian() {  # настоящий ufw (Python, gettext) берёт я
 fw_calls() { tr '\n' ';' < "$WORK/ufw.calls"; }
 ACTIVE=$'Status: active\n\nTo                         Action      From\n--                         ------      ----\n22/tcp                     ALLOW       Anywhere'
 
+test_fw_never_closes_port_of_enabled_inbound() {  # пункт 3: ufw уже включён — правила портов, на которых работают подключения панели, не удаляются
+	local p
+	fw_env; UFW_SAYS=$ACTIVE MOVED_FROM=443
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' \
+		'80||vless|{}|{"network":"ws"}|1' '2096|0.0.0.0|vmess|{}|{}|1' '54321||trojan|{}|{}|1' '443|203.0.113.7|vless|{}|{}|1'
+	fw_step
+	for p in 80 2096 54321 443; do
+		! grep -q "^delete allow $p/" "$WORK/ufw.calls" || t_fail "закрыт порт $p, на котором работает подключение панели: $(fw_calls)"
+		! fw_called "allow $p/tcp" || t_fail "ufw уже включён, а скрипт сам открыл порт чужого подключения $p: $(fw_calls)"
+	done
+	! grep -q 'старый порт подключения 443 закрыт' "$WORK/out" || t_fail "сказано, что порт 443 закрыт: $(cat "$WORK/out")"
+	fw_called "allow 2083/tcp" || t_fail "свой порт не открыт: $(fw_calls)"
+}
 test_fw_closes_ports_nobody_uses() {  # обратная сторона: порт без включённого подключения, слушающего снаружи, закрывается как раньше
 	fw_env; UFW_SAYS=$ACTIVE MOVED_FROM=443
 	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' \
@@ -1518,6 +1531,14 @@ test_fw_unknown_state_opens_no_extra_and_closes_nothing() {  # пункт 5: с�
 		grep -q '^BAD .*понять не удалось' "$WORK/out" || t_fail "не сказано, что состояние ufw непонятно: $(cat "$WORK/out")"
 		! grep -q 'включён, открыто' "$WORK/out" || t_fail "сказано «включён»: $(cat "$WORK/out")"
 	done
+}
+test_fw_inbound_allow_failure_leaves_ufw_off() {  # пункт 3 («ни иначе»): порт чужого подключения не разрешился — включение ufw его закрыло бы
+	fw_env; UFW_FAIL="allow 8443/tcp"
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	fw_step
+	! fw_called "--force enable" || t_fail "ufw включён, хотя порт подключения панели в нём не разрешён: $(fw_calls)"
+	grep -q '^BAD ufw не включал.*8443' "$WORK/out" || t_fail "не сказано, почему ufw не включён: $(cat "$WORK/out")"
+	! grep -q 'доступны, как раньше.*8443' "$WORK/out" || t_fail "порт 8443 назван доступным: $(cat "$WORK/out")"
 }
 
 test_language_env_is_dropped_at_start() {  # пункт 5: LANGUAGE из окружения (sudo её сохраняет) переводит ответы ufw — в начале скрипта она снимается
