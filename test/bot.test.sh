@@ -2092,13 +2092,25 @@ test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» �
 REALITY='{"network":"tcp","security":"reality"}'
 own_fns() {
 	eval "$(grep -m1 '^state_val() {' "$ROOT/src/install-vpn.sh.in")"
-	eval "$(awk '/^(own_inbound|find_own_inbound|foreign_on_port|port_taken_check|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(own_inbound|find_own_inbound|own_inbound_late|own_to_settings|foreign_on_port|port_taken_check|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
 	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
-	S_INBOUND_ID='' OWN_INBOUND_ID='' OLD_REALITY_PORT='' REALITY_PORT=2083
+	S_INBOUND_ID='' OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_KNOWN=1 REALITY_PORT=2083
 	: > "$WORK/out"; rm -f "$DB" "$STATE" "$STATE".failed-*
+}
+# Ключи Reality в тестах — выдуманные строки: «наш» (из настроек установки) и чужой (подключение хозяина панели).
+KEY_OWN=OURkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+KEY_ALIEN=ALIENkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+reality() {  # reality КЛЮЧ → stream_settings подключения с Reality и этим ключом
+	printf '{"network":"xhttp","security":"reality","realitySettings":{"privateKey":"%s","shortIds":["ab12"]}}' "$1"
+}
+state_put() {  # state_put "ИМЯ='значение'" … → настройки установки ($STATE) из этих строк
+	printf '%s\n' "$@" > "$STATE"
+}
+add_inbound() {  # add_inbound ПОРТ КЛЮЧ — подключение VLESS + Reality с этим ключом; номер панель (SQLite) даёт сама
+	sql "insert into inbounds (port, listen, protocol, settings, stream_settings, enable, tag) values ($1, '', 'vless', '{}', '$(reality "$2")', 1, 'in-$1-tcp')"
 }
 mkdb_tags() {  # mkdb + столбец tag: «in-ПОРТ-tcp»
 	mkdb "$@"
@@ -2114,33 +2126,110 @@ sql() { python3 -I -c 'import sqlite3, sys
 db = sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()' "$DB" "$1"; }
 own() { find_own_inbound; echo "id=$S_INBOUND_ID свой=$OWN_INBOUND_ID порт=$OLD_REALITY_PORT"; }
 
-test_own_inbound_never_a_foreign_one() {  # чужой 3x-ui с VLESS + Reality: его подключение — не своё, ни на первом запуске, ни после
+test_own_inbound_is_the_one_with_our_key() {  # своё — подключение с ключом Reality из настроек установки; чужое VLESS + Reality своим не становится
 	own_fns
-	mkdb_tags "443||vless|{}|$REALITY|1" '8443||vmess|{}|{}|1'
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" '8443||vmess|{}|{}|1'
 	t_eq "id=0 свой= порт=" "$(own)" "первый запуск поверх чужого 3x-ui (настроек установки нет)"
 	: > "$STATE.failed-20261112-000000"
 	t_eq "id=0 свой= порт=" "$(own)" "после сброшенной неудачной попытки (остался только след)"
 	rm -f "$STATE".failed-*
-	echo "S_INBOUND_ID='0'" > "$STATE"
-	t_eq "id=0 свой= порт=" "$(own)" "прошлая попытка до создания подключения не дошла"
-	sql "insert into inbounds (port, listen, protocol, settings, stream_settings, enable, tag) values (2083, '', 'vless', '{}', '$REALITY', 1, 'in-2083-tcp')"
-	echo "S_INBOUND_ID='3'" > "$STATE"
-	t_eq "id=3 свой=3 порт=2083" "$(own)" "своё — то, чей id записан при создании, а не первое VLESS + Reality в базе"
+	state_put "REALITY_PRIV=''" "S_INBOUND_ID='0'"
+	t_eq "id=0 свой= порт=" "$(own)" "прошлая попытка не дошла ни до ключей, ни до подключения"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='0'"
+	t_eq "id=0 свой= порт=" "$(own)" "ключи уже сгенерированы, подключение ещё не создано"
+	add_inbound 2083 "$KEY_OWN"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "подключение создано, а номер записать не успели — оно своё: в нём ключ из настроек"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "обычный повторный запуск"
+	state_put "REALITY_PRIV='$KEY_OWN'"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "настройки прежней версии (номера в них нет) — по ключу"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='1'"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "под записанным номером чужое подключение — своё то, где ключ"
 	sql "update inbounds set port=9443 where id=2; update inbounds set port=8443 where id=3"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'"
 	t_eq "id=3 свой=3 порт=8443" "$(own)" "порт своего подключения поменяли в панели — берётся нынешний"
+	sql "insert into inbounds (port, protocol, stream_settings, enable) values (7001, 'vless', 'null', 1), (7002, 'vless', '[]', 1), (7003, 'vless', '{не json', 1), (7004, 'vless', '{\"security\":\"reality\",\"realitySettings\":[]}', 1)"
+	t_eq "id=3 свой=3 порт=8443" "$(own)" "строки со странным содержимым поиску не мешают"
+	sql "update inbounds set stream_settings='$(reality "$KEY_ALIEN")' where id=3"
+	t_eq "id=0 свой= порт=" "$(own)" "под своим номером — подключение с другим ключом: оно не своё, номер сброшен"
 	sql "delete from inbounds where id=3"
-	t_eq "id=3 свой= порт=" "$(own)" "своё подключение удалили в панели — чужое вместо него своим не становится"
+	t_eq "id=0 свой= порт=" "$(own)" "своё подключение удалили в панели — чужое вместо него своим не становится"
 }
-test_own_inbound_old_install_as_before() {  # настройки прежней версии (id подключения в них нет): своё — первое VLESS + Reality, как раньше
+test_own_inbound_after_db_rollback_same_number_is_foreign() {  # первый запуск поверх чужой панели оборвался: база возвращена из снимка, а номер
+	# созданного подключения остался в настройках. Потом хозяин панели добавил своё подключение — оно получило тот же номер.
+	# Раньше оно становилось «своим»: скрипт не создавал своего, а с --port переносил чужое и закрывал его порт.
 	own_fns
-	mkdb_tags '8443||vmess|{}|{}|1' "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1"
-	printf "%s\n" "S_MODE='nodomain'" "S_DONE='1'" > "$STATE"
-	t_eq "id= свой=2 порт=443" "$(own)" "прежняя версия без домена ставила 443 — второго подключения не будет"
-	printf "%s\n" "S_MODE='nodomain'" "S_INBOUND_ID='мусор'" > "$STATE"
-	t_eq "id= свой=2 порт=443" "$(own)" "нечисловой id в настройках — как будто его нет"
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" '8443||vmess|{}|{}|1' '9000||trojan|{}|{}|1'
+	cp "$DB" "$WORK/db.before"   # снимок базы до первых изменений (xui_stop)
+	add_inbound 2083 "$KEY_OWN"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='4'" "S_REALITY_PORT='2083'"
+	t_eq "id=4 свой=4 порт=2083" "$(own)" "пока база не возвращена — подключение своё"
+	cp -f "$WORK/db.before" "$DB"   # обрыв: on_exit вернул базу, настройки остались
+	t_eq "id=0 свой= порт=" "$(own)" "после возврата базы своего подключения нет"
+	add_inbound 2083 "$KEY_ALIEN"   # хозяин панели
+	t_eq "1:443:in-443-tcp 2:8443:in-8443-tcp 3:9000:in-9000-tcp 4:2083:in-2083-tcp" "$(inbounds)" "подключение хозяина получило тот же номер 4"
+	t_eq "id=0 свой= порт=" "$(own)" "чужое подключение с «нашим» номером — не своё"
+	find_own_inbound
+	REALITY_PORT=2083
+	! ( port_taken_check ) || t_fail "порт занят чужим подключением с «нашим» номером — должен остановиться"
+	t_has "2083" "$(cat "$WORK/out")" "какой порт занят"
+	REALITY_PORT=3000
+	( port_taken_check ) || t_fail "свободный порт из --port: $(cat "$WORK/out")"
+	t_eq "" "$OWN_INBOUND_ID$OLD_REALITY_PORT" "переносить на новый порт нечего: своего подключения нет"
+}
+test_own_inbound_settings_without_key_as_before() {  # в настройках нет ни ключа, ни номера (самые первые версии): своё — первое VLESS + Reality,
+	# как раньше; его ключ становится ключом установки — иначе скрипт сгенерировал бы новый и на следующем запуске своё потерял
+	own_fns
+	mkdb_tags '8443||vmess|{}|{}|1' "443||vless|{}|$(reality "$KEY_OWN")|1" "2083||vless|{}|$(reality "$KEY_ALIEN")|1"
+	state_put "S_MODE='nodomain'" "S_DONE='1'"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "прежняя версия без домена ставила 443 — второго подключения не будет"
+	state_put "S_MODE='nodomain'" "S_INBOUND_ID='мусор'"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "нечисловой номер в настройках — как будто его нет"
+	find_own_inbound
+	unset REALITY_PRIV S_INBOUND_ID   # как после «. $STATE», в котором этих строк нет
+	own_to_settings
+	t_eq "2|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "номер и ключ установки — найденного подключения"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV='$REALITY_PRIV'" "S_INBOUND_ID='$S_INBOUND_ID'"   # так их запишет save_state
+	sql "delete from inbounds where id=1; insert into inbounds (id, port, protocol, stream_settings, enable, tag) values (1, 7000, 'vless', '$(reality "$KEY_ALIEN")', 1, 'in-7000-tcp')"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "следующий запуск узнаёт его уже по ключу, а не как «первое VLESS + Reality» (первое теперь — чужое #1)"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV=''" "S_INBOUND_ID='2'"
+	t_eq "id=0 свой= порт=" "$(own)" "номер без ключа проверить нечем — своим подключение не считается"
 	rm -f "$DB"; mkdb_tags '8443||vmess|{}|{}|1'
-	printf "%s\n" "S_MODE='nodomain'" > "$STATE"
+	state_put "S_MODE='nodomain'"
 	t_eq "id= свой= порт=" "$(own)" "VLESS + Reality в базе нет — своего нет"
+}
+test_own_to_settings_takes_found_not_written() {  # после чтения настроек номер своего подключения — найденного по ключу, а не записанный
+	own_fns
+	S_INBOUND_ID=4 OWN_INBOUND_ID='' OWN_KEY='' REALITY_PRIV=$KEY_OWN; own_to_settings
+	t_eq "0|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "записанный номер не подтвердился — сброшен; ключ установки прежний"
+	S_INBOUND_ID=4 OWN_INBOUND_ID=6 OWN_KEY=$KEY_OWN REALITY_PRIV=$KEY_OWN; own_to_settings
+	t_eq "6|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "номер — того подключения, в котором ключ"
+	S_INBOUND_ID='' OWN_INBOUND_ID='' OWN_KEY='' REALITY_PRIV=''; own_to_settings
+	t_eq "|" "$S_INBOUND_ID|$REALITY_PRIV" "ни номера, ни ключа, ни своего подключения — так и остаётся: ключ сгенерируется дальше"
+	S_INBOUND_ID=3 OWN_INBOUND_ID=3 OWN_KEY=$KEY_ALIEN REALITY_PRIV=$KEY_OWN; own_to_settings
+	t_eq "$KEY_OWN" "$REALITY_PRIV" "ключ из настроек найденным не подменяется"
+}
+test_own_inbound_read_once_python_is_there() {  # в начале запуска python3 может не быть — базу панели прочитать нечем. После его установки своё
+	# подключение читается заново: иначе оно сошло бы за чужое («порт занят») или переехало бы на порт из настроек
+	own_fns
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" "8444||vless|{}|$(reality "$KEY_OWN")|1"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='2'" "S_REALITY_PORT='2083'"
+	(
+		command() { [ "${2:-}" != python3 ] || return 1; builtin command "$@"; }   # python3 «не установлен»
+		find_own_inbound
+		echo "$OWN_KNOWN|$S_INBOUND_ID|$OWN_INBOUND_ID|$OLD_REALITY_PORT"
+	) > "$WORK/early"
+	t_eq "0|2||" "$(cat "$WORK/early")" "прочитать нечем: своё не найдено, но и чужим не объявлено — номер не сброшен"
+	OWN_KNOWN=0 OWN_INBOUND_ID='' OLD_REALITY_PORT='' S_INBOUND_ID=2 PORT_ARG='' REALITY_PORT=2083   # порт — из настроек
+	own_inbound_late
+	t_eq "1|2|8444|8444" "$OWN_KNOWN|$OWN_INBOUND_ID|$OLD_REALITY_PORT|$REALITY_PORT" "python3 появился: своё найдено, порт — его нынешний, а не из настроек"
+	( port_taken_check ) || t_fail "своё подключение на своём порту принято за чужое: $(cat "$WORK/out")"
+	OWN_KNOWN=0 OWN_INBOUND_ID='' OLD_REALITY_PORT='' PORT_ARG=3000 REALITY_PORT=3000
+	own_inbound_late
+	t_eq "2|8444|3000" "$OWN_INBOUND_ID|$OLD_REALITY_PORT|$REALITY_PORT" "с --port порт остаётся заданным, перенос — с нынешнего"
+	sql "delete from inbounds where id=2"
+	own_inbound_late
+	t_eq "2|8444" "$OWN_INBOUND_ID|$OLD_REALITY_PORT" "прочитано — второй раз не читается"
 }
 test_foreign_xui_port_taken_stops_before_question() {  # порт своего подключения занят чужим — стоп до вопросов и изменений
 	local out
@@ -2158,26 +2247,31 @@ test_foreign_xui_port_taken_stops_before_question() {  # порт своего �
 	t_eq 1 "$FOREIGN_XUI" "свободный --port — обычный вопрос и согласие"
 	! grep -q '^DIE' "$WORK/out" || t_fail "остановился на свободном порту: $(cat "$WORK/out")"
 }
-test_port_taken_check_by_state() {  # та же проверка перед изменениями — когда база не читалась в самом начале и на повторных запусках
+test_port_taken_check_own_and_foreign() {  # порт своего подключения занят в панели другим — стоп, пока ничего не изменено; своё — не помеха
 	own_fns
-	mkdb_tags "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1" '3000||vmess|{}|{}|0'
-	S_INBOUND_ID=0 OWN_INBOUND_ID='' REALITY_PORT=2083
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" "2083||vless|{}|$(reality "$KEY_OWN")|1" '3000||vmess|{}|{}|0'
+	OWN_INBOUND_ID='' REALITY_PORT=2083
 	! ( port_taken_check ) || t_fail "своего ещё нет, порт 2083 занят чужим — должен остановиться"
 	t_has "2083" "$(cat "$WORK/out")" "какой порт"; t_has "--port" "$(cat "$WORK/out")" "что делать"
-	S_INBOUND_ID=0 OWN_INBOUND_ID='' REALITY_PORT=2084
+	case $(cat "$WORK/out") in *"по ключу"*) t_fail "первый запуск (настроек нет), а сказано про ключ из настроек" ;; esac
+	OWN_INBOUND_ID='' REALITY_PORT=2084
 	( port_taken_check ) || t_fail "порт 2084 свободен: $(cat "$WORK/out")"
-	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=2083
+	OWN_INBOUND_ID=2 REALITY_PORT=2083
 	( port_taken_check ) || t_fail "на порту своё подключение: $(cat "$WORK/out")"
-	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=443
+	OWN_INBOUND_ID=2 REALITY_PORT=443
 	! ( port_taken_check ) || t_fail "--port 443 на повторном запуске, а там чужое — должен остановиться"
-	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=3000
+	OWN_INBOUND_ID=2 REALITY_PORT=3000
 	! ( port_taken_check ) || t_fail "выключенное чужое подключение тоже занимает порт в панели"
-	S_INBOUND_ID=7 OWN_INBOUND_ID='' REALITY_PORT=2083
-	! ( port_taken_check ) || t_fail "своё подключение удалено, на его порту другое — оно не своё"
+	# Записанный номер сам по себе ничего не значит: своё — только найденное по ключу.
+	: > "$WORK/out"; state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='2'"
 	S_INBOUND_ID=2 OWN_INBOUND_ID='' REALITY_PORT=2083
-	( port_taken_check ) || t_fail "своё подключение в начале запуска было нечем прочитать (нет python3) — оно всё равно своё: $(cat "$WORK/out")"
-	S_INBOUND_ID='' OWN_INBOUND_ID=1 REALITY_PORT=2083
-	( port_taken_check ) || t_fail "настройки прежней версии — как раньше, без этой проверки: $(cat "$WORK/out")"
+	! ( port_taken_check ) || t_fail "номер из настроек без найденного своего подключения — не повод считать подключение своим"
+	t_has "по ключу Reality" "$(cat "$WORK/out")" "повторный запуск: сказано, по чему скрипт узнаёт своё"
+	# Настройки прежних версий (номера в них нет): раньше проверка для них пропускалась, и подключение на своём порту усыновлялось.
+	S_INBOUND_ID='' OWN_INBOUND_ID='' REALITY_PORT=2083
+	! ( port_taken_check ) || t_fail "настройки без номера, на своём порту чужое — должен остановиться"
+	S_INBOUND_ID='' OWN_INBOUND_ID=2 REALITY_PORT=2083
+	( port_taken_check ) || t_fail "настройки без номера, своё найдено — не помеха: $(cat "$WORK/out")"
 }
 test_inbound_move_touches_only_own() {  # --port переносит своё подключение — и только его
 	own_fns
@@ -2203,12 +2297,12 @@ test_tunnel_check_takes_own_client() {  # проверка туннеля — п
 		create table client_inbounds (client_id integer, inbound_id integer);
 		insert into clients (email, sub_id, enable) values ('чужой', 'subforeign', 1), ('свой-выключен', 'suboff', 0), ('свой', 'subown', 1), ('свой2', 'subown2', 1);
 		insert into client_inbounds values (1, 1), (2, 3), (3, 3), (4, 3);"
-	S_INBOUND_ID=3; t_eq subown "$(check_sub_id)" "первый включённый клиент своего подключения (#3)"
-	S_INBOUND_ID=''; t_eq subforeign "$(check_sub_id)" "настройки прежней версии — первый клиент панели, как раньше"
-	S_INBOUND_ID=0; t_eq subforeign "$(check_sub_id)" "своё подключение ещё не создано — как раньше"
-	S_INBOUND_ID=9; t_eq subforeign "$(check_sub_id)" "у своего подключения нет клиентов — как раньше"
+	OWN_INBOUND_ID=3; t_eq subown "$(check_sub_id)" "первый включённый клиент своего подключения (#3)"
+	OWN_INBOUND_ID=''; t_eq subforeign "$(check_sub_id)" "своего подключения нет — первый клиент панели, как раньше"
+	OWN_INBOUND_ID='' S_INBOUND_ID=3; t_eq subforeign "$(check_sub_id)" "записанный номер без найденного своего — не в счёт (под ним может быть чужое)"
+	OWN_INBOUND_ID=9; t_eq subforeign "$(check_sub_id)" "у своего подключения нет клиентов — как раньше"
 	sql "drop table client_inbounds"
-	S_INBOUND_ID=3; t_eq subforeign "$(check_sub_id)" "база без таблицы связей — как раньше"
+	OWN_INBOUND_ID=3; t_eq subforeign "$(check_sub_id)" "база без таблицы связей — как раньше"
 }
 
 # Копия базы чужого 3x-ui (пункт 7).

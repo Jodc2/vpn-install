@@ -329,42 +329,82 @@ else
 	fi
 fi
 # Порт подключения Reality — как у основного сервера, 2083, с доменом и без (--port меняет).
-# Своё подключение — то, чей id скрипт записал в настройки установки, когда создал его (S_INBOUND_ID). 0 — ещё не создано:
-# первый запуск (в том числе поверх чужого 3x-ui) или прошлая попытка до него не дошла. Подключения, которые были в панели
-# до скрипта, своими не считаются никогда: он их не переносит и не трогает.
-# В настройках прежних версий id нет — там, как и раньше, своим считается первое VLESS + Reality в базе: иначе установка
-# прежней версией (без домена ставила 443) получила бы второе подключение.
-own_inbound() {  # → «id порт» своего подключения; пусто — его нет
-	[ "$S_INBOUND_ID" != 0 ] && [ -f "$DB" ] && command -v python3 >/dev/null 2>&1 || return 0
-	python3 - "$DB" "$S_INBOUND_ID" <<'PY' 2>/dev/null || true
-import json, sqlite3, sys
+# Своё подключение — то, в котором стоит ключ Reality из настроек установки (REALITY_PRIV): ключ скрипт генерирует сам и
+# хранит только там, так что подключение с этим ключом создано им. Номер подключения (S_INBOUND_ID) записывается рядом, но
+# одного номера мало: базу панели могут вернуть из копии (оборванный первый запуск), сбросить или заменить, и тот же
+# номер достанется чужому подключению. Подключение с записанным номером, но другим ключом — не своё.
+# Подключения, которые были в панели до скрипта, своими не считаются никогда: он их не переносит и не трогает.
+# В настройках самых первых версий нет ни ключа, ни номера — только там, как и раньше, своим считается первое
+# VLESS + Reality в базе (иначе та установка получила бы второе подключение), и его ключ становится ключом установки.
+own_inbound() {  # own_inbound КЛЮЧ НОМЕР → «номер порт ключ» своего подключения; «-» — его нет; пусто — базу не прочитать
+	[ -f "$DB" ] || { echo -; return 0; }
+	command -v python3 >/dev/null 2>&1 || return 0
+	# Ключ — через окружение, а не аргументом: аргументы процесса видны всем пользователям сервера (ps).
+	OWN_KEY_WANT=$1 python3 -I - "$DB" "$2" <<'PY' 2>/dev/null || true
+import json, os, sqlite3, sys
+key, want = os.environ.get("OWN_KEY_WANT", ""), sys.argv[2]
 db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-if sys.argv[2]:   # id известен: своё — только оно
-    for row in db.execute("select id, port from inbounds where id=?", (int(sys.argv[2]),)):
-        print(*row)
-    sys.exit()
-for iid, port, ss in db.execute("select id, port, stream_settings from inbounds where protocol='vless' order by id"):
+rows = []   # (номер, порт, протокол, ключ Reality) подключений с Reality
+for iid, port, proto, ss in db.execute("select id, port, protocol, stream_settings from inbounds order by id"):
     try:
-        if json.loads(ss or "{}").get("security") == "reality":
-            print(iid, port)
-            break
-    except (ValueError, AttributeError):
-        pass
+        s = json.loads(ss or "{}")
+        if s.get("security") != "reality":
+            continue
+        priv = (s.get("realitySettings") or {}).get("privateKey")
+        rows.append((int(iid), int(port), str(proto or "").lower(), priv if isinstance(priv, str) else ""))
+    except (TypeError, ValueError, AttributeError):   # не JSON, не объект, порт не число — такую строку пропустить
+        continue
+if key:           # своё — только подключение с ключом из настроек (если таких несколько — то, чей номер записан)
+    mine = sorted((r for r in rows if r[3] == key), key=lambda r: str(r[0]) != want)
+elif not want:    # в настройках нет ни ключа, ни номера (самые первые версии): первое VLESS + Reality, как раньше
+    mine = [r for r in rows if r[2] == "vless"]
+else:             # номер без ключа проверить нечем («0» — подключение ещё не создавалось)
+    mine = []
+if mine:
+    print(mine[0][0], mine[0][1], mine[0][3] or "-")
+else:
+    print("-")
 PY
 }
-find_own_inbound() {  # → S_INBOUND_ID (из настроек), OWN_INBOUND_ID и OLD_REALITY_PORT (id и нынешний порт своего подключения)
+find_own_inbound() {  # → OWN_INBOUND_ID и OLD_REALITY_PORT (номер и нынешний порт своего подключения; пусто — его нет),
+	# OWN_KEY (его ключ Reality), S_INBOUND_ID (номер для настроек: найденного подключения; 0 — записанный не подтвердился),
+	# OWN_KNOWN (0 — базу панели было нечем прочитать: своё не найдено, но и «не своим» ничего не объявлено)
+	local got
 	S_INBOUND_ID=$(state_val S_INBOUND_ID || true)
 	[[ $S_INBOUND_ID =~ ^[0-9]+$ ]] || S_INBOUND_ID=
+	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_KNOWN=1
 	# Настроек установки нет — чистый сервер, чужой 3x-ui или сброшенная неудачная попытка: своего подключения ещё нет.
-	[ -f "$STATE" ] || S_INBOUND_ID=0
-	OWN_INBOUND_ID='' OLD_REALITY_PORT=''
-	read -r OWN_INBOUND_ID OLD_REALITY_PORT <<<"$(own_inbound)" || true
+	if [ ! -f "$STATE" ]; then S_INBOUND_ID=0; return 0; fi
+	got=$(own_inbound "$(state_val REALITY_PRIV || true)" "$S_INBOUND_ID")
+	if [ -z "$got" ]; then OWN_KNOWN=0; return 0; fi
+	read -r OWN_INBOUND_ID OLD_REALITY_PORT OWN_KEY <<<"$got" || true
+	if [[ $OWN_INBOUND_ID =~ ^[1-9][0-9]*$ ]] && [[ $OLD_REALITY_PORT =~ ^[0-9]+$ ]]; then
+		S_INBOUND_ID=$OWN_INBOUND_ID
+		[ "$OWN_KEY" != - ] || OWN_KEY=''
+	else
+		OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY=''
+		S_INBOUND_ID=${S_INBOUND_ID:+0}   # записанный номер не подтвердился — он больше ничей; не было номера — так и нет
+	fi
+}
+own_inbound_late() {  # python3 только что поставлен: если в начале запуска базу панели было нечем прочитать — прочитать сейчас.
+	# Иначе своё подключение сошло бы за чужое («порт занят») или переехало бы на порт из настроек.
+	[ "$OWN_KNOWN" != 1 ] || return 0
+	find_own_inbound
+	[ -n "$PORT_ARG" ] || REALITY_PORT=${OLD_REALITY_PORT:-$REALITY_PORT}
+}
+own_to_settings() {  # сразу после чтения настроек ($STATE): номер своего подключения — подтверждённый ключом (find_own_inbound),
+	# а не просто записанный. В настройках самых первых версий ключа нет — там ключ установки берётся из найденного
+	# подключения: иначе скрипт сгенерировал бы новый, и на следующем запуске своё подключение перестал бы узнавать.
+	S_INBOUND_ID=${OWN_INBOUND_ID:-${S_INBOUND_ID:+0}}
+	[ -n "${REALITY_PRIV:-}" ] || REALITY_PRIV=$OWN_KEY
 }
 port_taken_check() {  # порт своего подключения занят в панели другим — остановиться, пока ничего не изменено
-	local other
-	[ -n "$S_INBOUND_ID" ] || return 0   # настройки прежней версии: своё подключение там — по признакам, как раньше
-	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-$S_INBOUND_ID}")   # своё — и то, что в начале было нечем прочитать
-	[ -z "$other" ] || die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N"
+	local other why=""
+	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-0}")
+	[ -n "$other" ] || return 0
+	# Повторный запуск: подсказать, почему подключение на своём же порту могло оказаться «другим».
+	[ ! -f "$STATE" ] || why=" Своё подключение скрипт узнаёт по ключу Reality из $STATE — в этом такого ключа нет."
+	die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N.$why"
 }
 inbound_move() {  # inbound_move ID СТАРЫЙ_ПОРТ НОВЫЙ_ПОРТ — перенести своё подключение, и только его (x-ui остановлен)
 	# Имя подключения 3x-ui содержит порт (in-2083-tcp, в старых версиях inbound-2083) — заменить в нём номер.
@@ -1091,8 +1131,8 @@ check_sub_id() {  # subId клиента, по ссылке которого п�
 	# У чужих подключений панели свои клиенты и свои адреса в ссылках — проверка по ним была бы не о том. Своё подключение
 	# неизвестно (настройки прежних версий) или клиентов у него нет — первый включённый клиент панели, как раньше.
 	local sid=""
-	if [[ ${S_INBOUND_ID:-} =~ ^[1-9][0-9]*$ ]]; then
-		sid=$(sqlite3 -readonly "$DB" "select c.sub_id from clients c join client_inbounds ci on ci.client_id = c.id where ci.inbound_id = $S_INBOUND_ID and c.enable = 1 and c.sub_id <> '' order by c.id limit 1;" 2>/dev/null || true)
+	if [[ ${OWN_INBOUND_ID:-} =~ ^[1-9][0-9]*$ ]]; then
+		sid=$(sqlite3 -readonly "$DB" "select c.sub_id from clients c join client_inbounds ci on ci.client_id = c.id where ci.inbound_id = $OWN_INBOUND_ID and c.enable = 1 and c.sub_id <> '' order by c.id limit 1;" 2>/dev/null || true)
 	fi
 	[ -n "$sid" ] || sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;" 2>/dev/null || true)
 	echo "$sid"
@@ -2417,6 +2457,7 @@ for try in 1 2 3 4 5 6; do
 	sleep 20
 done
 "${APT[@]}" install iproute2 curl ca-certificates python3 >/dev/null || die "не установились iproute2, curl, python3"
+own_inbound_late
 if [ "$MODE" = domain ]; then
 	for p in 80 443; do
 		u=$(port_users "$p")
@@ -2425,7 +2466,7 @@ if [ "$MODE" = domain ]; then
 fi
 u=$(port_users "$REALITY_PORT")
 case $u in "" | xray* | x-ui*) ;; *) die "порт $REALITY_PORT занят: $u— освободите его (на этом сервере не должно быть другого сайта)" ;; esac
-port_taken_check   # слушает xray — а чьё подключение? (python3 уже есть: базу есть чем прочитать)
+port_taken_check   # слушает xray — а чьё подключение?
 if [ "$MODE" = domain ]; then ok "порты 80, 443 и $REALITY_PORT свободны"; else ok "порт $REALITY_PORT свободен"; fi
 
 detect_ips
@@ -2470,6 +2511,7 @@ elif [ "$FOREIGN_XUI" = 1 ]; then   # чужой 3x-ui (согласие — в 
 	foreign_db_copy
 fi
 bot_keep_decision   # «нет» и --no-bot сказаны раньше, чем прочитаны прошлые настройки, — они главнее прочитанного
+own_to_settings     # номер своего подключения — подтверждённый ключом, а не просто прочитанный из настроек
 : "${PANEL_USER:=$(rnd "$LOWER$DIGITS" 10)}"
 : "${PANEL_PASS:=$(rnd "$LOWER${LOWER^^}$DIGITS" 22)}"
 : "${WEB_PORT:=$(free_port)}"
@@ -2935,9 +2977,8 @@ wait_port ":$WEB_PORT" 40 || die "панель x-ui не поднялась на
 # API панели — по одноразовому токену, после настройки токен удаляется.
 api_open
 port_taken_check   # ещё раз, перед самим созданием: панель уже работает, и база с начала запуска могла измениться
-INBOUND_ID=${OWN_INBOUND_ID:-$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")}
-if [ -n "$INBOUND_ID" ]; then
-	ok "подключение на :$REALITY_PORT уже есть (#$INBOUND_ID), клиенты прежние"
+if [ -n "$OWN_INBOUND_ID" ]; then
+	ok "подключение на :$REALITY_PORT уже есть (#$OWN_INBOUND_ID), клиенты прежние"
 else
 	if [ "$MODE" = domain ]; then TARGET=127.0.0.1:8443; SNI=$DOMAIN; else TARGET=$REALITY_SNI:443; SNI=$REALITY_SNI; fi
 	python3 - "$WORK/inbound.json" "$SNI" "$TARGET" "$SHARE_ADDR" "$REALITY_PORT" "$CLIENTS" "$REALITY_PRIV" "$REALITY_PUB" "$SHORT_IDS" <<'PY'
@@ -2968,15 +3009,17 @@ json.dump({"up": 0, "down": 0, "total": 0, "remark": "", "enable": True, "expiry
 PY
 	RESP=$(api POST inbounds/add -H 'Content-Type: application/json' --data-binary @"$WORK/inbound.json")
 	api_ok <<<"$RESP" || die "панель не приняла подключение: $RESP"
-	INBOUND_ID=$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")
+	# Созданное подключение — то, в котором ключ из настроек: его номер и записывается, а не «того, что стоит на порту».
+	find_own_inbound
+	[ -n "$OWN_INBOUND_ID" ] || die "панель приняла подключение, но в её базе его не видно — запустите скрипт ещё раз"
 	if [ "$MODE" = domain ]; then
 		ok "подключение VLESS + XHTTP + Reality на :$REALITY_PORT, клиентов: $CLIENTS"
 	else
 		ok "подключение VLESS + XHTTP + Reality на :$REALITY_PORT под $REALITY_SNI, клиентов: $CLIENTS"
 	fi
 fi
-# Своё подключение дальше узнаётся только по этому id — записать сразу, пока запуск не оборвался.
-S_INBOUND_ID=${INBOUND_ID:-$S_INBOUND_ID}
+# Номер своего подключения — в настройки сразу, пока запуск не оборвался.
+S_INBOUND_ID=$OWN_INBOUND_ID
 save_state
 
 if [ "$EXIT_MODE" != direct ] && [ "$HAVE_WARP" = 0 ]; then
