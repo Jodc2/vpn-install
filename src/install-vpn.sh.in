@@ -499,6 +499,13 @@ PY
 }
 find_own_inbound
 S_REALITY_PORT=$(state_val S_REALITY_PORT || true)
+forget_failed_state() {  # настройки неудачной попытки — в сторону (по этому следу foreign_xui_check потом узнает свой 3x-ui),
+	# а в памяти от них не остаётся ничего: дальше установка идёт как на чистом сервере. В том числе номер подключения —
+	# иначе он попал бы в новые настройки, хотя своего подключения ещё нет.
+	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"
+	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' S_INBOUND_ID=0 CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
+	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY=''
+}
 reset_failed_attempt() {  # смена варианта после неудачной первой установки: убрать то, что успела сделать прошлая попытка
 	local d=$S_DOMAIN_OLD ip
 	ip=$(state_val S_IP_CERT_IP || true)
@@ -513,8 +520,7 @@ reset_failed_attempt() {  # смена варианта после неудач�
 		[ ! -x /root/.acme.sh/acme.sh ] || /root/.acme.sh/acme.sh --remove -d "$ip" --ecc >/dev/null 2>&1 || true
 		rm -rf "/root/.acme.sh/${ip}_ecc" /etc/x-ui/ip-cert
 	fi
-	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"   # по этому следу foreign_xui_check потом узнает свой 3x-ui
-	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' S_INBOUND_ID=0 CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
+	forget_failed_state
 	exit_ssh_defaults
 }
 if [ "${MODE_CHANGED:-0}" = 1 ]; then

@@ -2305,7 +2305,7 @@ test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» �
 REALITY='{"network":"tcp","security":"reality"}'
 own_fns() {
 	eval "$(grep -m1 '^state_val() {' "$ROOT/src/install-vpn.sh.in")"
-	eval "$(awk '/^(own_inbound|find_own_inbound|own_inbound_late|own_to_settings|foreign_on_port|port_taken_check|service_ports|service_port_check|xui_inbound_ports|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(own_inbound|find_own_inbound|own_inbound_late|own_to_settings|forget_failed_state|foreign_on_port|port_taken_check|service_ports|service_port_check|xui_inbound_ports|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -2735,6 +2735,107 @@ restore_ssh() {
 test_restore_ssh_header_only_with_content() {  # заголовок «SSH» без единой строки под ним — когда в бэкапе нет ни ключей, ни настроек SSH
 	t_eq "" "$(restore_ssh есть)" "печатать нечего — нет и заголовка"
 	t_eq $'== SSH\nWARN sshd не установлен — настройки SSH пропущены' "$(restore_ssh нет)" "есть что сказать — заголовок один раз, перед сообщением"
+}
+
+# Привязки к основному потоку установщика (пункт 3 второй порции). Функции проверены выше — эти тесты держат их вызовы:
+# без них «функцию забыли позвать» или «позвали не там» не видел ни один тест. Способ — номера строк шаблона, как в
+# test_decline_survives_state_reload. tl 'РЕГВЫР' [ПОСЛЕ] → номер первой подходящей строки шаблона после названной.
+tl() {
+	RE=$1 awk -v after="${2:-0}" 'NR > after && $0 ~ ENVIRON["RE"] {print NR; exit}' "$ROOT/src/install-vpn.sh.in"
+}
+in_order() {  # in_order 'что проверяется' N… — все номера строк нашлись и идут по возрастанию
+	local what=$1 prev=0 n
+	shift
+	for n; do
+		[[ $n =~ ^[0-9]+$ ]] && [ "$n" -gt "$prev" ] || t_fail "$what — строки шаблона не на месте: $*"
+		prev=$n
+	done
+}
+test_flow_firewall_step_is_called() {  # шаг фаервола: функция зовётся под своим заголовком, не при --no-ufw, и порты SSH к этому времени известны
+	local a b c d
+	a=$(tl '^say "Фаервол ufw"$'); d=$(tl '^if \[ "\$DO_UFW" = 1 \]; then$' "$a"); b=$(tl '^\tfw_step$' "$a"); c=$(tl '^say "' "$a")
+	in_order "fw_step — между заголовком «Фаервол ufw» и следующим шагом, под условием DO_UFW" "$a" "$d" "$b" "$c"
+	in_order "порты SSH и порт нынешнего входа известны до шага фаервола" "$(tl '^SSH_PORTS=\$\(ssh_ports\)$')" "$(tl '^SSH_NOW_PORT=\$\(ssh_conn_port\)')" "$a"
+}
+test_flow_port_checks_before_changes() {  # сверка портов с подключениями панели: до первых изменений и ещё раз — перед созданием подключения
+	local srv py late chk users pk api chk2 add find
+	srv=$(tl '^say "Проверка сервера"$'); py=$(tl 'install iproute2 curl ca-certificates python3 ' "$srv")
+	late=$(tl '^own_inbound_late$' "$py"); chk=$(tl '^port_taken_check( |$)' "$late"); users=$(tl 'port_users ' "$py"); pk=$(tl '^say "Пакеты"$' "$srv")
+	in_order "в «Проверке сервера»: python3 → своё подключение → сверка с панелью → кто слушает порт → дальше" "$srv" "$py" "$late" "$chk" "$users" "$pk"
+	api=$(tl '^api_open$' "$pk"); chk2=$(tl '^port_taken_check( |$)' "$api"); add=$(tl 'api POST inbounds/add ' "$api")
+	in_order "перед созданием подключения — ещё раз" "$api" "$chk2" "$add"
+	find=$(tl '^find_own_inbound$')
+	in_order "первый поиск своего подключения — в начале, до сброса неудачной попытки и выбора порта" \
+		"$find" "$(tl '^if \[ "\$\{MODE_CHANGED:-0\}" = 1 \]; then$' "$find")" "$(tl 'REALITY_PORT=\$\{OLD_REALITY_PORT:-' "$find")" "$srv"
+}
+test_flow_created_inbound_known_by_key_and_saved() {  # своё подключение — найденное по ключу; «то, что стоит на порту» своим не становится;
+	# номер созданного — сразу в настройки
+	local f=$ROOT/src/install-vpn.sh.in api chk have add okl find sid
+	api=$(tl '^api_open$' "$(tl '^say "3x-ui: подписка')"); chk=$(tl '^port_taken_check( |$)' "$api")
+	have=$(tl '^if \[ -n "\$OWN_INBOUND_ID" \]; then$' "$chk"); add=$(tl 'api POST inbounds/add ' "$have")
+	okl=$(tl 'api_ok <<<"\$RESP" \|\| die ' "$add"); find=$(tl '^\tfind_own_inbound( |$)' "$okl"); sid=$(tl '^S_INBOUND_ID=\$OWN_INBOUND_ID$' "$find")
+	in_order "создавать ли подключение, решает найденное своё; номер созданного — поиском по ключу" "$api" "$chk" "$have" "$add" "$okl" "$find" "$sid"
+	t_eq "save_state" "$(sed -n "$((sid + 1))p" "$f")" "номер записывается в настройки сразу"
+	! grep -nE 'INBOUND_ID=.*select id from inbounds where port' "$f" || t_fail "номер подключения берётся запросом по порту — так своим становилось чужое"
+}
+test_flow_foreign_db_copy_before_changes() {  # копия базы чужого 3x-ui — средствами SQLite (foreign_db_copy), сразу после чтения настроек, до изменений
+	local f=$ROOT/src/install-vpn.sh.in st el cp save stop a b
+	st=$(tl '^\t\. "\$STATE"$' "$(tl '^say "Пакеты"$')"); el=$(tl '^elif \[ "\$FOREIGN_XUI" = 1 \]; then' "$st"); cp=$(tl '^\tforeign_db_copy$' "$el")
+	save=$(tl '^save_state$' "$st"); stop=$(tl '^xui_stop$' "$st")
+	in_order "foreign_db_copy — в ветке чужого 3x-ui, до первой записи настроек и до остановки панели" "$st" "$el" "$cp" "$save" "$stop"
+	a=$(tl '^foreign_db_copy\(\) \{'); b=$(tl '^}$' "$a")
+	# Имя копии («…before-install-…») встречается только внутри foreign_db_copy: мимо неё (cp -a) копию никто не делает.
+	t_eq "" "$(grep -n 'before-install-' "$f" | awk -F: -v a="$a" -v b="$b" '$1 < a || $1 > b' | head -3)" "копия базы делается в обход foreign_db_copy"
+	grep -q '^	db_copy "\$DB" ' <(sed -n "${a},${b}p" "$f") || t_fail "foreign_db_copy копирует базу не через db_copy"
+}
+test_flow_port_move_only_own_inbound() {  # --port переносит подключение по номеру своего, найденного по ключу, — и только если оно найдено
+	local f=$ROOT/src/install-vpn.sh.in m cond mv
+	m=$(tl '^MOVED_FROM=$'); cond=$(tl '^if \[ -n "\$OLD_REALITY_PORT" \] && \[ "\$OLD_REALITY_PORT" != "\$REALITY_PORT" \]; then$' "$m"); mv=$(tl 'inbound_move ' "$m")
+	in_order "перенос — под условием «своё подключение есть и стоит на другом порту»" "$m" "$cond" "$mv" "$(tl '^fi$' "$cond")"
+	case $(sed -n "${mv}p" "$f") in
+		*'inbound_move "$OWN_INBOUND_ID" "$OLD_REALITY_PORT" "$REALITY_PORT" '*) ;;
+		*) t_fail "перенос подключения — не по номеру своего: $(sed -n "${mv}p" "$f")" ;;
+	esac
+	t_eq 1 "$(grep -c '^[^#]*inbound_move "' "$f")" "вызов inbound_move один"
+}
+test_failed_attempt_is_forgotten() {  # смена варианта после неудачной первой установки: от прошлой попытки в памяти не остаётся ничего —
+	# в том числе номера подключения (он попал бы в новые настройки, хотя своего подключения ещё нет)
+	local a
+	own_fns
+	state_put "S_MODE='domain'" "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='4'"
+	S_MODE=domain S_DOMAIN_OLD=old.example.com S_EXIT=warp S_REALITY_PORT=2084 S_INBOUND_ID=4 CHAIN_IP=203.0.113.9 CHAIN_SSH_PORT=2222
+	OWN_INBOUND_ID=4 OLD_REALITY_PORT=2084 OWN_KEY=$KEY_OWN
+	forget_failed_state
+	[ ! -e "$STATE" ] || t_fail "настройки неудачной попытки остались на месте"
+	compgen -G "$STATE.failed-*" > /dev/null || t_fail "от неудачной попытки не осталось следа — свой 3x-ui потом сойдёт за чужой"
+	t_eq "|||0||" "$S_MODE|$S_DOMAIN_OLD|$S_REALITY_PORT|$S_INBOUND_ID|$CHAIN_IP|$CHAIN_SSH_PORT" "прошлые настройки забыты, номер подключения — «ещё не создано»"
+	t_eq "||" "$OWN_INBOUND_ID|$OLD_REALITY_PORT|$OWN_KEY" "и своего подключения больше нет"
+	MODE=nodomain DOMAIN='' PANEL_USER=u PANEL_PASS=p WEB_PORT=54321 WEB_PATH=/w/ SUB_PATH=/s/ CLASH_PATH=/c/ JSON_PATH=/j/ EXIT_MODE=direct
+	save_state
+	t_eq 0 "$(state_val S_INBOUND_ID)" "в новые настройки номер прошлой попытки не попал"
+	a=$(tl '^reset_failed_attempt\(\) \{')
+	in_order "reset_failed_attempt зовёт forget_failed_state, а её саму зовут при смене варианта" \
+		"$a" "$(tl '^\tforget_failed_state$' "$a")" "$(tl '^}$' "$a")" "$(tl '^if \[ "\$\{MODE_CHANGED:-0\}" = 1 \]; then$' "$a")" "$(tl '^\treset_failed_attempt$' "$a")"
+}
+test_flow_own_inbound_settled_after_state_read() {  # номер и ключ своего подключения выставляются сразу после чтения настроек — до их первой записи
+	local st own
+	st=$(tl '^\t\. "\$STATE"$' "$(tl '^say "Пакеты"$')"); own=$(tl '^own_to_settings( |$)' "$st")
+	in_order "own_to_settings — между чтением настроек и их первой записью, раньше генерации ключей" \
+		"$st" "$own" "$(tl '^save_state$' "$st")" "$(tl '^if \[ -z "\$\{REALITY_PRIV:-\}" \]; then$' "$st")"
+}
+test_flow_ip_cert_port80_before_issue() {  # сертификат на IP: порт 80 в ufw проверяется перед выпуском; что открыл скрипт — он же убирает при неудаче
+	local a b c d
+	a=$(tl '^issue_ip_cert\(\) \{'); b=$(tl '^\tip_cert_port80$' "$a"); c=$(tl '"\$ACME" --issue ' "$a"); d=$(tl '\[ "\$OPENED80" = 0 \] \|\| ufw delete allow 80/tcp' "$c")
+	in_order "ip_cert_port80 — в issue_ip_cert, до выпуска; при неудаче правило убирается" "$a" "$b" "$c" "$d" "$(tl '^}$' "$a")"
+}
+test_every_ufw_status_is_asked_in_english() {  # «ufw status» читается по-английски, а ufw (Python, gettext) переводит ответ по LANGUAGE даже при
+	# LC_ALL=C: каждый вызов в шаблоне — с «LANGUAGE=C LC_ALL=C». Упоминания в сообщениях (после ok/warn/bad/die/echo) — не вызовы.
+	local f=$ROOT/src/install-vpn.sh.in bad calls
+	bad=$(grep -n 'ufw status' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' | sed 's/LANGUAGE=C LC_ALL=C ufw status//g' |
+		{ grep 'ufw status' || true; } | { grep -vE '(^|[^[:alnum:]_])(ok|warn|bad|die|echo|printf) +["'"'"'][^"'"'"']*ufw status' || true; })
+	t_eq "" "$bad" "вызов «ufw status» без LANGUAGE=C LC_ALL=C"
+	calls=$(grep -c 'LANGUAGE=C LC_ALL=C ufw status' "$f")
+	[ "$calls" -ge 2 ] || t_fail "вызовов «LANGUAGE=C LC_ALL=C ufw status» в шаблоне: $calls — страж ничего не сторожит"
 }
 
 # ——— запуск под sudo: SSH_CONNECTION стёрта, а знать о своём входе скрипту нужно ———
