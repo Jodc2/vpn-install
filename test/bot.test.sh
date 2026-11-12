@@ -1184,6 +1184,37 @@ test_decline_survives_state_reload() {  # «нет» и --no-bot сказаны 
 	[ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ] || t_fail "установщик не зовёт bot_keep_decision между чтением настроек и их записью (строки $a, $b, $c)"
 	! grep -nE '(^|[^_A-Z])S_BOT=0' "$f" || t_fail "отказ от бота записан мимо bot_decline"
 }
+test_no_bot_does_not_forget_working_bot() {  # --no-bot на сервере с работающим ботом — «в этот раз не трогать», а не «бота нет»: воркер-то жив
+	S_BOT=1
+	bot_decline
+	t_eq 1 "$S_BOT" "бот не забыт"
+	S_BOT=1   # настройки прошлого запуска перечитаны
+	bot_keep_decision
+	t_eq 1 "$S_BOT" "и после перечитывания настроек"
+	unset BOT_DECLINED; S_BOT=''
+	bot_decline
+	t_eq 0 "$S_BOT" "бота не было — отказ запомнен"
+}
+test_decide_no_bot_still_tells_about_stale_bot() {  # --no-bot, а порт SSH (домен, выход) сменился: бот знает прежние настройки — молчать нельзя, но и токен не спрашиваем
+	MODE=domain DNS_NOT_CF=0 BOT_ARG=0 S_BOT=1 S_BOT_USER=my_vpn_bot DOMAIN=vpn.example.com S_DOMAIN_OLD=vpn.example.com
+	EXIT_MODE=direct S_EXIT=direct S_BOT_SSH_PORT=22 SSH_PORT_NOW=2222 BOT_RESULT='' BOT_SKIP='' BOT_ERR=''
+	bot_decide
+	t_eq 0 "$BOT_DO" "бота не разворачиваем"
+	t_eq 1 "$BOT_KEEP" "о работающем боте установщик скажет"
+	t_eq 0 "$BOT_STALE" "токен Cloudflare при --no-bot не спрашиваем"
+	t_has "знает прежние настройки" "$(bot_summary)" "итог предупреждает"
+	t_has "--bot" "$(bot_summary)" "и говорит, чем обновить"
+	SSH_PORT_NOW=22
+	bot_decide
+	case $(bot_summary) in *"знает прежние"*) t_fail "предупреждение без причины" ;; esac
+	# бот устарел, токен спросили, человек нажал Enter («оставить как есть») — итог тоже не молчит
+	BOT_ARG='' SSH_PORT_NOW=2222
+	bot_decide
+	t_eq 1 "$BOT_STALE" "без --no-bot — как раньше: устарел, предложим обновить"
+	t_has "знает прежние настройки" "$(bot_summary)" "не обновили — сказать в итоге"
+	BOT_RESULT=ok
+	case $(bot_summary) in *"знает прежние"*) t_fail "обновили — предупреждать не о чем" ;; esac
+}
 test_summary_says_bot_not_updated() {  # бот есть, а обновить его в этот раз не вышло (нет токена) — итог не должен молчать
 	local out
 	S_BOT=1 S_BOT_USER=my_vpn_bot BOT_RESULT='' BOT_ERR='' BOT_SKIP="не дан токен Cloudflare" VPN_BOT_ADMIN_ID=42

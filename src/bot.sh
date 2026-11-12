@@ -981,8 +981,10 @@ print("RESULT " + ("; ".join(bad) if bad else "ok"))' "$(bot_http '/selftest?par
 
 # «Нет» на вопрос о боте и --no-bot запоминаются. Говорятся они до того, как установщик перечитывает настройки
 # прошлого запуска («. $STATE»), а те затирали S_BOT прежним значением — отказ забывался, и вопрос задавался снова.
-bot_decline() { BOT_DECLINED=1; S_BOT=0; }
-bot_keep_decision() { [ "${BOT_DECLINED:-0}" != 1 ] || S_BOT=0; }   # после перечитывания настроек — вернуть отказ
+# Работающего бота отказ не забывает: «--no-bot» при нём значит «в этот раз не трогать» — воркер жив, и установщик
+# должен о нём помнить (и предупредить, если бот знает прежние настройки).
+bot_decline() { BOT_DECLINED=1; [ "${S_BOT:-}" = 1 ] || S_BOT=0; }
+bot_keep_decision() { [ "${BOT_DECLINED:-0}" != 1 ] || [ "${S_BOT:-}" = 1 ] || S_BOT=0; }   # после перечитывания настроек — вернуть отказ
 
 bot_summary() {  # строки итога установки про бота (в файл с данными доступа)
 	if [ "${S_BOT:-}" = 1 ]; then
@@ -991,6 +993,10 @@ bot_summary() {  # строки итога установки про бота (�
 		echo "  клиенты, статистика, проверка блокировки раз в 3 часа, бэкапы, переезд на новый сервер кнопкой"
 		[ "${BOT_RESULT:-}" != fail ] || echo "  ⚠ в этот раз бот не обновился: ${BOT_ERR:-} (повторить: bash install-vpn.sh --bot)"
 		[ -z "${BOT_SKIP:-}" ] || echo "  ⚠ в этот раз бот не обновлён: $BOT_SKIP (повторить: bash install-vpn.sh --bot)"
+		# Бот не обновлён, а то, на что он опирается, сменилось: при переезде он пошёл бы не туда.
+		if [ "${BOT_OUTDATED:-0}" = 1 ] && [ "${BOT_RESULT:-}" != ok ] && [ -z "${BOT_SKIP:-}" ]; then
+			echo "  ⚠ бот знает прежние настройки (домен, выход или порт SSH) — обновите его: bash install-vpn.sh --bot"
+		fi
 		if { [ -n "${BOT_SKIP:-}" ] || [ "${BOT_RESULT:-}" = fail ]; } && [ -n "${VPN_BOT_ADMIN_ID:-}" ]; then
 			echo "  ⚠ админ $VPN_BOT_ADMIN_ID не добавлен"
 		fi
@@ -1001,21 +1007,29 @@ bot_summary() {  # строки итога установки про бота (�
 	fi
 }
 
-bot_decide() {  # → BOT_DO (разворачивать сейчас), BOT_KEEP (бот есть — не трогать), BOT_STALE, BOT_ASK (спросить [y/N])
-	BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_ASK=0
+bot_decide() {  # → BOT_DO (разворачивать сейчас), BOT_KEEP (бот есть — не трогать), BOT_STALE (предложить обновить),
+	# BOT_OUTDATED (бот знает прежние настройки — сказать в итоге), BOT_ASK (спросить [y/N])
+	BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_OUTDATED=0 BOT_ASK=0
 	[ "${MODE:-}" = domain ] || return 0
 	[ "${DNS_NOT_CF:-0}" != 1 ] || return 0   # домен не в Cloudflare — боту не на чем работать
-	[ "${BOT_ARG:-}" != 0 ] || return 0
 	if [ "${S_BOT:-}" = 1 ]; then
 		# Повтор меняет то, на что бот опирается, — без обновления он открыл бы при переезде порт не там.
 		if [ "${DOMAIN:-}" != "${S_DOMAIN_OLD:-}" ] || [ "${EXIT_MODE:-}" != "${S_EXIT:-}" ] ||
 			{ [ -n "${EXIT_HOST:-}" ] && [ "$EXIT_HOST" != "${CHAIN_IP:-}" ]; } ||
 			{ [ -n "${EXIT_PORT_ARG:-}" ] && [ "$EXIT_PORT_ARG" != "${CHAIN_PORT:-}" ]; } ||
 			{ [ -n "${S_BOT_SSH_PORT:-}" ] && [ -n "${SSH_PORT_NOW:-}" ] && [ "$S_BOT_SSH_PORT" != "$SSH_PORT_NOW" ]; }; then
-			BOT_STALE=1
+			BOT_OUTDATED=1
 		fi
+		if [ "${BOT_ARG:-}" = 0 ]; then
+			BOT_KEEP=1   # --no-bot: бота в этот раз не трогаем и токен не спрашиваем, но о нём помним
+			return 0
+		fi
+		BOT_STALE=$BOT_OUTDATED
 		if [ -n "${BOT_CF_TOKEN:-}" ] || [ "${BOT_ARG:-}" = 1 ]; then BOT_DO=1; else BOT_KEEP=1; fi
-	elif [ "${BOT_ARG:-}" = 1 ]; then
+		return 0
+	fi
+	[ "${BOT_ARG:-}" != 0 ] || return 0
+	if [ "${BOT_ARG:-}" = 1 ]; then
 		BOT_DO=1
 	elif [ -z "${S_BOT:-}" ] && bot_tty_ok; then
 		BOT_ASK=1
