@@ -730,16 +730,32 @@ fi
 
 say "Фаервол ufw"
 if [ "$DO_UFW" = 1 ]; then
-	OPEN=$( {
+	# Порты SSH: из настроек sshd и тот, через который вошли сейчас (в том числе бот при переезде).
+	SSH_OPEN=$( {
 		sshd -T 2>/dev/null | awk '$1=="port"{print $2"/tcp"}'
 		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
+	} | sort -u | tr '\n' ' ')
+	OPEN=$( {
+		for p in $SSH_OPEN; do echo "$p"; done
 		if [ "$HAS_NGINX" = 1 ]; then echo 80/tcp; echo 443/tcp; fi
 		# Без домена панель может быть открыта по IP (install-vpn.sh) — её порт тоже.
 		if [ -z "$DOMAIN" ] && [ "$(setting webListen)" != 127.0.0.1 ]; then echo "$(setting webPort)/tcp"; fi
 		inbound_ports "$DB"
 	} | sort -u -t/ -k1,1n -k2)
-	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
-	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился"; fi
+	SSH_LOST=""
+	for p in $OPEN; do
+		ufw allow "$p" >/dev/null && continue
+		bad "ufw allow $p не прошёл"
+		case " $SSH_OPEN " in *" $p "*) SSH_LOST="$SSH_LOST ${p%/tcp}" ;; esac
+	done
+	if [ -n "$SSH_LOST" ]; then
+		# Перенос идёт без человека за консолью: включить фаервол, в котором SSH не разрешён, — остаться без входа на сервер.
+		bad "ufw не включал: не удалось разрешить в нём порт SSH$SSH_LOST — с включённым фаерволом на сервер было бы не войти. Разберитесь с ufw и включите его сами: ufw allow ПОРТ/tcp && ufw enable"
+	elif ufw --force enable >/dev/null 2>&1; then
+		ok "включён, открыто: $(echo $OPEN)"
+	else
+		bad "ufw не включился"
+	fi
 else
 	warn "фаервол не трогали (--no-ufw)"
 fi

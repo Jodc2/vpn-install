@@ -2383,6 +2383,47 @@ test_ssh_key_only_ignores_cloud_stub_key() {  # в облачных образа
 	root_has_own_key "$f" || t_fail "настоящий ключ рядом с заглушкой не увиден"
 }
 
+# ——— restore.sh: фаервол на новом сервере (переезд из бота идёт без человека) ———
+restore_fw() {  # restore_fw 'ПОРТЫ' — шаг «Фаервол ufw» из restore.sh с заглушками; «ufw allow» для названных портов не проходит
+	local code
+	code=$(awk '/^say "Фаервол ufw"$/ {on = 1; print; next} on && /^say "/ {exit} on' "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh")
+	[ -n "$code" ] || t_fail "шаг «Фаервол ufw» в restore.sh не найден"
+	: > "$WORK/ufw.calls"
+	(
+		say() { :; }
+		ok() { echo "OK $*"; }
+		warn() { echo "WARN $*"; }
+		bad() { echo "BAD $*"; }
+		sshd() { echo "port 22"; }
+		ufw() {
+			echo "$*" >> "$WORK/ufw.calls"
+			if [ "$1" = allow ]; then case " $FAIL_ALLOW " in *" $2 "*) return 1 ;; esac; fi
+			return 0
+		}
+		setting() { echo 127.0.0.1; }
+		inbound_ports() { echo 2083/tcp; }
+		DO_UFW=1 HAS_NGINX=0 DOMAIN=vpn.example.com DB=$WORK/x.db FAIL_ALLOW=$1
+		export SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222'
+		eval "$code"
+	)
+}
+test_restore_fw_ssh_allow_failure_leaves_ufw_off() {  # не разрешился порт SSH — ufw не включать: на новый сервер после переезда было бы не войти
+	local out
+	out=$(restore_fw "")
+	grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "без сбоев ufw не включился: $(tr '\n' ';' < "$WORK/ufw.calls")"
+	grep -qx 'allow 22/tcp' "$WORK/ufw.calls" && grep -qx 'allow 2222/tcp' "$WORK/ufw.calls" || t_fail "порты SSH (sshd -T и нынешний вход) не разрешены"
+	for p in 22/tcp 2222/tcp; do
+		out=$(restore_fw "$p")
+		! grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "ufw включён, хотя $p не разрешился: $(tr '\n' ';' < "$WORK/ufw.calls")"
+		t_has "BAD" "$out" "об этом сказано"
+		t_has "${p%/tcp}" "$out" "порт назван"
+		case $out in *"OK включён"*) t_fail "написано «включён»" ;; esac
+	done
+	out=$(restore_fw "2083/tcp")   # не SSH — как раньше: сказать и включить (без VPN-порта перенос и так считается неудачным)
+	grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "сбой не на порту SSH не должен мешать включению"
+	t_has "BAD ufw allow 2083/tcp" "$out" "сбой назван"
+}
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.
