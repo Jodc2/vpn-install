@@ -18,6 +18,7 @@ MIN_RAM_MB=${PW_MIN_RAM_MB:-200}     # роутер на 256 МБ показыв
 MIN_ROOT_MB=${PW_MIN_ROOT_MB:-50}    # xray-core, гео-базы и PassWall2 занимают ~40 МБ
 LOG=/tmp/passwall2-install.log
 W=/tmp/passwall2-install
+KEEP_W=   # 1 — временную папку в конце не удалять (в ней пакет, которым чинится роутер)
 
 say() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok() { printf '  \033[32mOK\033[0m    %s\n' "$*"; }
@@ -62,14 +63,39 @@ asset() {  # asset РЕГУЛЯРКА → ссылка на файл выпус�
 	jsonfilter -i "$W/release.json" -e '@.assets[*].browser_download_url' 2> /dev/null | grep -E "$1" | head -n 1
 }
 
+plain_dnsmasq() {  # стоит обычный dnsmasq? (у apk «info -e dnsmasq» отвечает «да» и на dnsmasq-full: тот его заменяет)
+	if [ "$PM" = apk ]; then
+		apk list --installed 2> /dev/null | grep -q '^dnsmasq-[0-9]'
+	else
+		opkg list-installed 2> /dev/null | grep -q '^dnsmasq - '
+	fi
+}
+
+restore_dnsmasq() {  # вернуть обычный dnsmasq из файла, скачанного заранее (сети уже может не быть); 0 — он снова стоит
+	if [ "$PM" = apk ]; then
+		run apk del dnsmasq-full   # убрать из списка пакетов системы; что apk при этом ничего не скачает — не страшно
+		run apk add --allow-untrusted "$W"/dnsmasq-[0-9]*.apk
+		run apk add dnsmasq        # в списке снова просто «dnsmasq», а не привязка к файлу: с ней следующая замена не пройдёт
+	else
+		run opkg install "$W"/dnsmasq_*.ipk
+	fi
+	plain_dnsmasq || return 1
+	[ ! -f "$W/dhcp.before" ] || cp -p "$W/dhcp.before" /etc/config/dhcp
+	run /etc/init.d/dnsmasq enable
+	run /etc/init.d/dnsmasq restart
+	return 0
+}
+
 swap_dnsmasq() {  # dnsmasq → dnsmasq-full (без него PassWall2 не разводит трафик по доменам); при сбое — откат
 	if pm_has dnsmasq-full; then
 		ok "dnsmasq-full уже стоит"
 		return 0
 	fi
 	cp -p /etc/config/dhcp "$W/dhcp.before" 2> /dev/null || true
+	# И opkg, и apk сначала снимают dnsmasq и только потом ставят dnsmasq-full. Пока dnsmasq снят, на роутере нет DNS —
+	# докачать недостающее уже нечем. Поэтому всё нужное скачивается заранее, а обычный dnsmasq — ещё и файлом для отката.
 	if [ "$PM" = apk ]; then
-		pm_add dnsmasq-full || die "не встал dnsmasq-full (apk) — обычный dnsmasq остался, ничего не сломано"
+		(cd "$W" && run apk fetch dnsmasq) || die "не скачался dnsmasq (нужен, чтобы вернуть его при сбое) — ничего не изменено"
 	else
 		# opkg не заменяет пакет сам: зависимости и оба пакета — заранее, пока DNS работает; замена — из файлов.
 		deps=$(opkg info dnsmasq-full 2> /dev/null | sed -n 's/^Depends: //p' | head -n 1 | tr ',' '\n' |
@@ -78,15 +104,50 @@ swap_dnsmasq() {  # dnsmasq → dnsmasq-full (без него PassWall2 не р�
 		[ -z "$deps" ] || pm_add $deps || die "не встали зависимости dnsmasq-full ($deps) — ничего не изменено"
 		(cd "$W" && run opkg download dnsmasq-full && run opkg download dnsmasq) ||
 			die "не скачались dnsmasq-full и dnsmasq — ничего не изменено"
-		run opkg remove dnsmasq || die "обычный dnsmasq не удаляется (от него зависят другие пакеты) — ничего не изменено"
-		if ! run opkg install "$W"/dnsmasq-full_*.ipk; then
-			run opkg install "$W"/dnsmasq_*.ipk
-			[ ! -f "$W/dhcp.before" ] || cp -p "$W/dhcp.before" /etc/config/dhcp
-			run /etc/init.d/dnsmasq enable
-			run /etc/init.d/dnsmasq restart
-			die "dnsmasq-full не встал — вернул обычный dnsmasq с прежними настройками"
-		fi
 	fi
+	# Замену не прерывать: обрыв SSH (HUP) или Ctrl-C между снятием dnsmasq и установкой dnsmasq-full оставил бы роутер
+	# без DHCP и DNS. Сигналы не слышит и сам менеджер пакетов — он наследует это от скрипта.
+	trap '' HUP INT TERM
+	said=ok
+	if [ "$PM" = apk ]; then
+		# --cache-predownload: скачать всё до первого изменения. Без него apk снимает dnsmasq, а потом качает (OpenWrt 25.12).
+		run apk add --cache-predownload dnsmasq-full || said=error
+	else
+		run opkg remove dnsmasq || {
+			trap - HUP INT TERM
+			die "обычный dnsmasq не удаляется (от него зависят другие пакеты) — ничего не изменено"
+		}
+		run opkg install "$W"/dnsmasq-full_*.ipk || said=error
+	fi
+	# Что получилось — по списку установленных пакетов, а не по коду возврата менеджера.
+	res=ok
+	if ! pm_has dnsmasq-full; then
+		if plain_dnsmasq; then res=untouched; elif restore_dnsmasq; then res=restored; else res=broken; fi
+	fi
+	trap - HUP INT TERM
+	case $res in
+		untouched) die "dnsmasq-full не встал, замена не началась — обычный dnsmasq на месте, ничего не изменено" ;;
+		restored) die "dnsmasq-full не встал — вернул обычный dnsmasq с прежними настройками" ;;
+		broken)
+			KEEP_W=1   # скачанный dnsmasq в конце не удалять: им роутер и чинится; остальное память не занимает
+			rm -rf "$W/p" "$W/app.$EXT" "$W/ru.$EXT" "$W/pkgs.zip" "$W/release.json"
+			if [ "$PM" = apk ]; then
+				fix="  apk del dnsmasq-full
+  apk add --allow-untrusted $W/dnsmasq-[0-9]*.apk
+  apk add dnsmasq"
+			else
+				fix="  opkg install $W/dnsmasq_*.ipk"
+			fi
+			[ ! -f "$W/dhcp.before" ] || fix="$fix
+  cp -p $W/dhcp.before /etc/config/dhcp"
+			die "dnsmasq-full не встал, и вернуть обычный dnsmasq не получилось — роутер остался БЕЗ DHCP и DNS:
+устройства в сети не получат адрес и не откроют сайты. Роутер не перезагружайте (скачанный dnsmasq лежит
+в памяти, в $W, а скачать его заново без DNS нечем) и выполните на нём:
+$fix
+  /etc/init.d/dnsmasq enable; /etc/init.d/dnsmasq restart" ;;
+	esac
+	[ "$said" = ok ] || warn "dnsmasq-full встал, но менеджер пакетов сообщил об ошибке — подробности в $LOG"
+	[ "$PM" != apk ] || run apk cache purge || true   # заранее скачанные пакеты из кэша в памяти больше не нужны
 	# Настройки DHCP и DNS — прежние: новый пакет кладёт свой файл рядом (dhcp-opkg / dhcp.apk-new).
 	rm -f /etc/config/dhcp-opkg /etc/config/dhcp.apk-new
 	if [ -f "$W/dhcp.before" ] && ! cmp -s "$W/dhcp.before" /etc/config/dhcp; then cp -p "$W/dhcp.before" /etc/config/dhcp; fi
@@ -97,7 +158,7 @@ swap_dnsmasq() {  # dnsmasq → dnsmasq-full (без него PassWall2 не р�
 
 main() {
 	: > "$LOG"
-	trap 'rm -rf "$W"' EXIT
+	trap '[ -n "$KEEP_W" ] || rm -rf "$W"' EXIT
 	rm -rf "$W"
 	mkdir -p "$W"
 
