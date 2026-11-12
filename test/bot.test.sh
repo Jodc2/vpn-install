@@ -2951,12 +2951,12 @@ echo "база до запуска" > "$WORK/db.before"
 echo "база, изменённая запуском" > "$DB"
 EOF
 		awk '/^on_exit\(\) \{/,/^}/' "$f"
-		grep -E "^trap (on_exit EXIT|'[^']*' (INT|HUP|TERM))( |\$)" "$f"   # ловушки основного скрипта
+		grep -E "^trap (on_exit EXIT|'[^']*' (INT|HUP|TERM|PIPE))( |\$)" "$f"   # ловушки основного скрипта
 		grep -m1 '^exec > >(' "$f"                                          # вывод — на экран и в журнал
 		cat <<'EOF'
 echo "работаю"
 : > "$T/ready"
-for _ in $(seq 1 "${WORK_STEPS:-60}"); do sleep 0.5; done
+for _ in $(seq 1 "${WORK_STEPS:-60}"); do [ -z "${CHATTY:-}" ] || echo "шаг"; sleep 0.5; done
 [ -z "${FAIL_AT_END:-}" ] || exit 1
 echo "дошёл до конца"
 EOF
@@ -2967,7 +2967,7 @@ EOF
 sig_run() {  # sig_run ДЕЙСТВИЕ → код возврата $WORK/exit.sh. Действие — когда сценарий уже «работает»: int (Ctrl-C), int2 (ещё два
 	# Ctrl-C во время отката), hup (терминал пропал; сценарий — задание интерактивной оболочки, как при входе по SSH),
 	# termgrp (SIGTERM группе процессов), int_in_rollback (сценарий падает сам, а Ctrl-C приходит уже во время отката),
-	# tee_killed (tee убит, потом SIGTERM сценарию: печатать некуда вовсе), none (не мешать)
+	# tee_killed (tee убит, потом SIGTERM сценарию: печатать некуда вовсе), tee_killed_only (tee убит — и всё), none (не мешать)
 	python3 -I - "$WORK" "$1" <<'EOF'
 import os, pty, select, signal, sys, time
 work, action = sys.argv[1:3]
@@ -3033,7 +3033,7 @@ elif action == "int_in_rollback":
     for _ in range(2):
         time.sleep(0.3)
         os.write(fd, b"\x03")
-elif action == "tee_killed":
+elif action in ("tee_killed", "tee_killed_only"):
     for d in os.listdir("/proc"):
         try:
             f = open("/proc/%s/stat" % d).read().rsplit(")", 1)
@@ -3042,7 +3042,8 @@ elif action == "tee_killed":
         except (OSError, ValueError, IndexError):
             pass
     time.sleep(0.3)
-    os.kill(pid, signal.SIGTERM)
+    if action == "tee_killed":
+        os.kill(pid, signal.SIGTERM)
 status, end = None, time.time() + 45
 while time.time() < end:
     if not closed:
@@ -3141,6 +3142,32 @@ EOF
 	t_eq "база" "$(cat "$WORK/snapshot")" "снимок — база до первых изменений"
 	t_eq "база" "$(cat "$WORK/x-ui.db")" "при ошибке после изменений база возвращена из снимка"
 }
+test_exit_tee_gone_rolls_back() {  # tee, через который идёт весь вывод, убит: следующая же строка вывода убивала скрипт (SIGPIPE) — с кодом 0
+	# в on_exit и без отката. Теперь это такой же обрыв, как остальные
+	local calls
+	exit_script
+	t_eq 141 "$(CHATTY=1 sig_run tee_killed_only)" "код возврата"
+	calls=$({ cat "$WORK/calls" 2> /dev/null || true; } | tr '\n' ';')
+	[[ $calls == *"systemctl stop x-ui;"*"systemctl start x-ui;"* ]] || t_fail "x-ui не запущен снова (вызовы: ${calls:-нет})"
+	t_eq "база до запуска" "$(cat "$WORK/x-ui.db")" "база 3x-ui возвращена"
+}
+test_exit_output_reader_gone_install_goes_on() {  # запуск без терминала (ssh сервер 'bash install-vpn.sh …', бот), связь пропала: читать вывод
+	# некому, сигнала скрипту никто не шлёт. Раньше tee умирал на первой же строке, за ним — скрипт, посреди установки и без
+	# отката. Теперь установка идёт дальше и доходит до конца, а журнал пишется целиком
+	exit_script
+	(
+		set +e
+		WORK_STEPS=4 CHATTY=1 python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # как у человека и у sshd: Python её игнорирует, и потомки это наследуют
+os.execvp("bash", ["bash", sys.argv[1]])' "$WORK/exit.sh" 2>&1
+		echo "$?" > "$WORK/rc"
+	) | head -c 4 > /dev/null   # читатель вывода исчезает почти сразу
+	t_eq 0 "$(cat "$WORK/rc")" "сценарий доработал до конца"
+	grep -q 'дошёл до конца' "$WORK/install.log" || t_fail "журнал оборвался вместе с читателем вывода: $(tr '\n' ';' < "$WORK/install.log")"
+	t_eq 4 "$(grep -c '^шаг' "$WORK/install.log")" "в журнале — все шаги"
+	[ ! -e "$WORK/calls" ] || t_fail "установка не падала, а x-ui откатывали: $(tr '\n' ';' < "$WORK/calls")"
+	t_eq "база, изменённая запуском" "$(cat "$WORK/x-ui.db")" "база — новая"
+}
 test_exit_without_signal_as_before() {  # без сигнала — как раньше: успешный запуск ничего не откатывает, ошибка — откатывает
 	exit_script
 	t_eq 0 "$(WORK_STEPS=2 sig_run none)" "успешный запуск"
@@ -3155,7 +3182,7 @@ test_flow_signal_traps_next_to_exit_trap() {  # ловушки сигналов 
 	local a
 	a=$(tl '^trap on_exit EXIT$')
 	in_order "ловушки INT, HUP, TERM — сразу после «trap on_exit EXIT», до вывода через tee и «Проверки сервера»" \
-		"$a" "$(tl "^trap '.*exit 130' INT\$" "$a")" "$(tl "^trap '.*exit 129' HUP\$" "$a")" "$(tl "^trap '.*exit 143' TERM\$" "$a")" \
+		"$a" "$(tl "^trap '.*exit 130' INT\$" "$a")" "$(tl "^trap '.*exit 129' HUP\$" "$a")" "$(tl "^trap '.*exit 143' TERM\$" "$a")" "$(tl "^trap '.*exit 141' PIPE\$" "$a")" \
 		"$(tl '^exec > >\(' "$a")" "$(tl '^say "Проверка сервера"$' "$a")"
 }
 
