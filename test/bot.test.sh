@@ -2064,6 +2064,23 @@ test_fw_keeps_rule_of_port_someone_listens_on() {  # правило ufw не у�
 		fw_called "delete allow 80/tcp" || t_fail "на 80/tcp снаружи никто не слушает ($addr) — правило убирается как раньше: $(fw_calls)"
 	done
 }
+test_fw_failed_enable_is_rolled_back() {  # «ufw --force enable» не удался, а до запуска ufw был выключен. После ошибки ufw оставляет политику
+	# «всё закрыто», а правила мог не загрузить (на настоящем ufw 0.36.1 с негодным правилом: INPUT DROP, правила для SSH
+	# нет, «ufw --force disable» возвращает ACCEPT) — вернуть выключенное состояние и сказать об этом
+	fw_env; UFW_FAIL="--force enable"
+	fw_step
+	t_eq "--force enable;--force disable;" "$(grep -- '^--force' "$WORK/ufw.calls" | tr '\n' ';')" "после неудачного включения — возврат в выключенное состояние"
+	grep -q '^BAD ufw не включился.*выключенное состояние' "$WORK/out" || t_fail "не сказано, что ufw возвращён в выключенное состояние: $(cat "$WORK/out")"
+	! grep -q 'включён, открыто' "$WORK/out" || t_fail "сказано «включён»: $(cat "$WORK/out")"
+	fw_env; UFW_FAIL=$'--force enable\n--force disable'
+	fw_step
+	grep -q '^BAD ufw не включился, и выключить его обратно не удалось' "$WORK/out" || t_fail "не сказано, что и выключить не вышло: $(cat "$WORK/out")"
+	grep -q 'SSH' "$WORK/out" || t_fail "не сказано проверить вход по SSH: $(cat "$WORK/out")"
+	fw_env; UFW_SAYS=$ACTIVE UFW_FAIL="--force enable"   # ufw был включён и до запуска: выключать его — не скрипту
+	fw_step
+	! fw_called "--force disable" || t_fail "ufw был включён до запуска, а скрипт его выключил: $(fw_calls)"
+	grep -q '^BAD ufw не включился' "$WORK/out" || t_fail "о сбое не сказано: $(cat "$WORK/out")"
+}
 # Порты соседнего VPN (WireGuard, Amnezia в Docker — detect_other_vpn): пункт 6 второй порции.
 test_fw_other_vpn_port_failure_leaves_ufw_off() {  # ufw выключен, порт соседнего VPN в нём не разрешился: включённый фаервол отрубил бы тот VPN.
 	# Раньше ufw включался, а сообщение говорило «открыл его порты»
