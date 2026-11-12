@@ -3309,8 +3309,16 @@ else
 	fi
 fi
 
-fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в ufw; 1 — не тронуто: на этом порту работает подключение панели
+listens_outside() {  # listens_outside ПОРТ — на этом TCP-порту кто-то слушает не только на localhost
+	{ ss -Htln 2>/dev/null || true; } | awk -v p="$1" '
+		{ n = split($4, a, ":") }
+		a[n] == p && $4 !~ /^(127\.|\[::1\])/ { found = 1 }
+		END { exit !found }'
+}
+fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в ufw; 1 — не тронуто: на этом порту работает подключение панели или
+	# снаружи слушает кто-то ещё (сайт хозяина сервера на :80) — скрипту порт не нужен, но и закрывать его не ему
 	case " $FW_INBOUND " in *" ${1%/*}/"*) return 1 ;; esac
+	! listens_outside "${1%/*}" || return 1
 	ufw delete allow "$1" >/dev/null 2>&1 || true
 }
 fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить

@@ -1728,7 +1728,7 @@ test_inbound_ports_odd_row_keeps_the_rest() {  # settings или stream_settings
 # Шаг «Фаервол ufw» целиком: ufw — заглушка (ответ на status — $UFW_SAYS, код — $UFW_STATUS_RC; команды из $UFW_FAIL
 # не проходят), всё, что скрипт у неё просит, — построчно в $WORK/ufw.calls; правила ufw — файл $UFW_RULES.
 fw_env() {
-	eval "$(awk '/^(fw_step|fw_close|xui_inbound_ports|ufw_active|ufw_state|ufw_allows)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(fw_step|fw_close|listens_outside|xui_inbound_ports|ufw_active|ufw_state|ufw_allows)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	say() { :; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1745,7 +1745,12 @@ fw_env() {
 		while IFS= read -r f; do [ "$f" != "$*" ] || return 1; done <<< "$UFW_FAIL"
 		[ "$*" != "--force enable" ] || UFW_SAYS="Status: active"
 	}
-	ss() { cat "$WORK/ss.out" 2> /dev/null || true; }
+	ss() {  # $WORK/ss.out — как у «ss -Htuln» (первый столбец — tcp или udp); без «u» в ключах — только TCP и без этого столбца
+		case ${1:-} in
+			-*u*) cat "$WORK/ss.out" 2> /dev/null || true ;;
+			*) { grep '^tcp' "$WORK/ss.out" 2> /dev/null || true; } | sed 's/^tcp *//' ;;
+		esac
+	}
 	port_users() { :; }
 	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env UFW_RULES=$WORK/user.rules
 	MODE=nodomain PANEL_PUBLIC=0 SUB_TLS=0 SUB_PORT=2096 WEB_PORT=54321 REALITY_PORT=2083 SSH_PORTS=22
@@ -2038,6 +2043,27 @@ test_fw_failed_port_is_not_reported_open() {  # пункт 9б: порт, кот
 	grep -q '^OK включён, открыто: 22/tcp 2083/tcp$' "$WORK/out" || t_fail "итог: $(cat "$WORK/out")"
 }
 
+test_fw_keeps_rule_of_port_someone_listens_on() {  # правило ufw не убирается, если на порту снаружи кто-то слушает (не только панель).
+	# Без домена и без сертификата на IP порт 80 скрипту не нужен — и сайт хозяина сервера на :80 терял разрешение молча
+	local addr
+	for addr in '0.0.0.0:80' '[::]:80' '*:80' '203.0.113.7:80'; do
+		fw_env; UFW_SAYS=$ACTIVE
+		printf '%s\n' "tcp   LISTEN 0      511    $addr       0.0.0.0:*" \
+			'tcp   LISTEN 0      4096       127.0.0.1:2096      0.0.0.0:*' \
+			'tcp   LISTEN 0      4096       127.0.0.1:54321     0.0.0.0:*' \
+			'udp   UNCONN 0      0            0.0.0.0:68        0.0.0.0:*' > "$WORK/ss.out"
+		fw_step
+		! fw_called "delete allow 80/tcp" || t_fail "убрано разрешение порта 80, на котором слушают ($addr): $(fw_calls)"
+		fw_called "delete allow 2096/tcp" || t_fail "подписка слушает только localhost — её порт снаружи не нужен: $(fw_calls)"
+		fw_called "delete allow 54321/tcp" || t_fail "панель слушает только localhost (--panel-local) — её порт снаружи не нужен: $(fw_calls)"
+	done
+	for addr in '127.0.0.1:80' '[::1]:80' '0.0.0.0:8080' '0.0.0.0:180' '0.0.0.0:8'; do   # только localhost или другой порт — не причина оставлять
+		fw_env; UFW_SAYS=$ACTIVE
+		printf '%s\n' "tcp   LISTEN 0      511    $addr       0.0.0.0:*" 'udp   UNCONN 0      0            0.0.0.0:80        0.0.0.0:*' > "$WORK/ss.out"
+		fw_step
+		fw_called "delete allow 80/tcp" || t_fail "на 80/tcp снаружи никто не слушает ($addr) — правило убирается как раньше: $(fw_calls)"
+	done
+}
 # Порты соседнего VPN (WireGuard, Amnezia в Docker — detect_other_vpn): пункт 6 второй порции.
 test_fw_other_vpn_port_failure_leaves_ufw_off() {  # ufw выключен, порт соседнего VPN в нём не разрешился: включённый фаервол отрубил бы тот VPN.
 	# Раньше ufw включался, а сообщение говорило «открыл его порты»
