@@ -405,60 +405,85 @@ else
 	fi
 fi
 # Порт подключения Reality — как у основного сервера, 2083, с доменом и без (--port меняет).
-# Своё подключение — то, в котором стоит ключ Reality из настроек установки (REALITY_PRIV): ключ скрипт генерирует сам и
-# хранит только там, так что подключение с этим ключом создано им. Номер подключения (S_INBOUND_ID) записывается рядом, но
-# одного номера мало: базу панели могут вернуть из копии (оборванный первый запуск), сбросить или заменить, и тот же
-# номер достанется чужому подключению. Подключение с записанным номером, но другим ключом — не своё.
+# Своё подключение скрипт узнаёт по настройкам установки ($STATE), по порядку:
+#  а) в подключении стоит ключ Reality из настроек (REALITY_PRIV) — какой бы номер ни был записан: ключ скрипт генерирует
+#     сам и хранит только там, так что подключение с этим ключом создано им;
+#  б) иначе — подключение с записанным номером (S_INBOUND_ID), если оно стоит на записанном порту (S_REALITY_PORT): ключи
+#     ему сменили в панели — это обычное обслуживание, и повторный запуск от него ломаться не должен;
+#  в) в настройках прежних версий номера нет: по ключу, иначе — VLESS + Reality на записанном порту; нет ни ключа, ни
+#     порта (самые первые версии) — первое VLESS + Reality в базе, как тогда;
+#  г) во всех остальных случаях своего нет. Номер совпал, а ни ключ, ни порт — нет: это чужое подключение, которому
+#     достался тот же номер (базу панели сбросили, заменили или вернули из копии).
 # Подключения, которые были в панели до скрипта, своими не считаются никогда: он их не переносит и не трогает.
-# В настройках самых первых версий нет ни ключа, ни номера — только там, как и раньше, своим считается первое
-# VLESS + Reality в базе (иначе та установка получила бы второе подключение), и его ключ становится ключом установки.
-own_inbound() {  # own_inbound КЛЮЧ НОМЕР → «номер порт ключ» своего подключения; «-» — его нет; пусто — базу не прочитать
+# Ключи найденного подключения становятся ключами установки (own_to_settings): иначе на следующем запуске оно узнавалось
+# бы хуже, а при пересоздании получило бы прежние ключи.
+own_inbound() {  # own_inbound КЛЮЧ НОМЕР ПОРТ → «номер порт ключ открытый_ключ shortIds» своего подключения (чего нет — «-»);
+	# «-» — своего нет; пусто — базу не прочитать
 	[ -f "$DB" ] || { echo -; return 0; }
 	command -v python3 >/dev/null 2>&1 || return 0
 	# Ключ — через окружение, а не аргументом: аргументы процесса видны всем пользователям сервера (ps).
-	OWN_KEY_WANT=$1 python3 -I - "$DB" "$2" <<'PY' 2>/dev/null || true
-import json, os, sqlite3, sys
-key, want = os.environ.get("OWN_KEY_WANT", ""), sys.argv[2]
+	OWN_KEY_WANT=$1 python3 -I - "$DB" "$2" "$3" <<'PY' 2>/dev/null || true
+import json, os, re, sqlite3, sys
+key, want, port = os.environ.get("OWN_KEY_WANT", ""), sys.argv[2], sys.argv[3]
 db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-rows = []   # (номер, порт, протокол, ключ Reality) подключений с Reality
-for iid, port, proto, ss in db.execute("select id, port, protocol, stream_settings from inbounds order by id"):
+
+
+def b64(v):  # ключ Reality — base64url; всё остальное в настройки установки не переносится
+    return v if isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_-]+", v) else ""
+
+
+rows = []   # все подключения: (номер, порт, это VLESS + Reality?, ключ, открытый ключ, shortIds)
+for iid, p, proto, ss in db.execute("select id, port, protocol, stream_settings from inbounds order by id"):
+    try:
+        iid, p = int(iid), int(p)
+    except (TypeError, ValueError):
+        continue
+    vr, priv, pub, sids = False, "", "", ""
     try:
         s = json.loads(ss or "{}")
-        if s.get("security") != "reality":
-            continue
-        priv = (s.get("realitySettings") or {}).get("privateKey")
-        rows.append((int(iid), int(port), str(proto or "").lower(), priv if isinstance(priv, str) else ""))
-    except (TypeError, ValueError, AttributeError):   # не JSON, не объект, порт не число — такую строку пропустить
-        continue
-if key:           # своё — только подключение с ключом из настроек (если таких несколько — то, чей номер записан)
-    mine = sorted((r for r in rows if r[3] == key), key=lambda r: str(r[0]) != want)
-elif not want:    # в настройках нет ни ключа, ни номера (самые первые версии): первое VLESS + Reality, как раньше
-    mine = [r for r in rows if r[2] == "vless"]
-else:             # номер без ключа проверить нечем («0» — подключение ещё не создавалось)
-    mine = []
-if mine:
-    print(mine[0][0], mine[0][1], mine[0][3] or "-")
-else:
-    print("-")
+        if s.get("security") == "reality":
+            vr = str(proto or "").lower() == "vless"
+            rs = s.get("realitySettings") or {}
+            priv, pub = b64(rs.get("privateKey")), b64((rs.get("settings") or {}).get("publicKey"))
+            ids = rs.get("shortIds")
+            if isinstance(ids, list) and all(isinstance(i, str) and re.fullmatch(r"[0-9A-Fa-f]*", i) for i in ids):
+                sids = ",".join(ids)
+    except (TypeError, ValueError, AttributeError):   # не JSON, не объект — подключение без Reality
+        pass
+    rows.append((iid, p, vr, priv, pub, sids))
+mine = None
+if key:   # а) ключ из настроек (если таких подключений несколько — то, чей номер записан)
+    mine = next(iter(sorted((r for r in rows if r[3] == key), key=lambda r: str(r[0]) != want)), None)
+if mine is None and want.isdigit() and int(want) > 0 and port.isdigit():   # б) записанный номер на записанном порту
+    mine = next((r for r in rows if r[0] == int(want) and r[1] == int(port)), None)
+if mine is None and not want:   # в) настройки без номера
+    if port.isdigit():
+        mine = next((r for r in rows if r[2] and r[1] == int(port)), None)
+    elif not key:
+        mine = next((r for r in rows if r[2]), None)
+print(" ".join(str(v) if v != "" else "-" for v in (mine[0], mine[1], mine[3], mine[4], mine[5])) if mine else "-")
 PY
 }
 find_own_inbound() {  # → OWN_INBOUND_ID и OLD_REALITY_PORT (номер и нынешний порт своего подключения; пусто — его нет),
-	# OWN_KEY (его ключ Reality), S_INBOUND_ID (номер для настроек: найденного подключения; 0 — записанный не подтвердился),
-	# OWN_KNOWN (0 — базу панели было нечем прочитать: своё не найдено, но и «не своим» ничего не объявлено)
+	# OWN_KEY, OWN_PUB, OWN_SIDS (его нынешние ключи Reality и shortIds), S_INBOUND_ID (номер для настроек: найденного
+	# подключения; 0 — записанный не подтвердился), OWN_KNOWN (0 — базу панели было нечем прочитать: своё не найдено,
+	# но и «не своим» ничего не объявлено)
 	local got
 	S_INBOUND_ID=$(state_val S_INBOUND_ID || true)
 	[[ $S_INBOUND_ID =~ ^[0-9]+$ ]] || S_INBOUND_ID=
-	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_KNOWN=1
+	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_PUB='' OWN_SIDS='' OWN_KNOWN=1
 	# Настроек установки нет — чистый сервер, чужой 3x-ui или сброшенная неудачная попытка: своего подключения ещё нет.
 	if [ ! -f "$STATE" ]; then S_INBOUND_ID=0; return 0; fi
-	got=$(own_inbound "$(state_val REALITY_PRIV || true)" "$S_INBOUND_ID")
+	got=$(own_inbound "$(state_val REALITY_PRIV || true)" "$S_INBOUND_ID" "$(state_val S_REALITY_PORT || true)")
 	if [ -z "$got" ]; then OWN_KNOWN=0; return 0; fi
-	read -r OWN_INBOUND_ID OLD_REALITY_PORT OWN_KEY <<<"$got" || true
+	read -r OWN_INBOUND_ID OLD_REALITY_PORT OWN_KEY OWN_PUB OWN_SIDS <<<"$got" || true
 	if [[ $OWN_INBOUND_ID =~ ^[1-9][0-9]*$ ]] && [[ $OLD_REALITY_PORT =~ ^[0-9]+$ ]]; then
 		S_INBOUND_ID=$OWN_INBOUND_ID
 		[ "$OWN_KEY" != - ] || OWN_KEY=''
+		[ "$OWN_PUB" != - ] || OWN_PUB=''
+		[ "$OWN_SIDS" != - ] || OWN_SIDS=''
 	else
-		OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY=''
+		OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_PUB='' OWN_SIDS=''
 		S_INBOUND_ID=${S_INBOUND_ID:+0}   # записанный номер не подтвердился — он больше ничей; не было номера — так и нет
 	fi
 }
@@ -468,11 +493,15 @@ own_inbound_late() {  # python3 только что поставлен: если
 	find_own_inbound
 	[ -n "$PORT_ARG" ] || REALITY_PORT=${OLD_REALITY_PORT:-$REALITY_PORT}
 }
-own_to_settings() {  # сразу после чтения настроек ($STATE): номер своего подключения — подтверждённый ключом (find_own_inbound),
-	# а не просто записанный. В настройках самых первых версий ключа нет — там ключ установки берётся из найденного
-	# подключения: иначе скрипт сгенерировал бы новый, и на следующем запуске своё подключение перестал бы узнавать.
+own_to_settings() {  # сразу после чтения настроек ($STATE): номер своего подключения — подтверждённый (find_own_inbound), а не
+	# просто записанный; ключи установки — те, что стоят в нём сейчас. Их могли сменить в панели, а в настройках самых
+	# первых версий их не было вовсе. Переносится пара целиком (закрытый и открытый): нет в подключении открытого ключа —
+	# ключи установки остаются прежними, иначе пересозданное подключение получило бы несогласованную пару.
 	S_INBOUND_ID=${OWN_INBOUND_ID:-${S_INBOUND_ID:+0}}
-	[ -n "${REALITY_PRIV:-}" ] || REALITY_PRIV=$OWN_KEY
+	[ -n "$OWN_KEY" ] && [ -n "$OWN_PUB" ] && [ "$OWN_KEY" != "${REALITY_PRIV:-}" ] || return 0
+	[ -z "${REALITY_PRIV:-}" ] || ok "ключи Reality своего подключения сменили в панели — запомнил нынешние"
+	REALITY_PRIV=$OWN_KEY REALITY_PUB=$OWN_PUB
+	[ -z "$OWN_SIDS" ] || SHORT_IDS=$OWN_SIDS
 }
 port_taken_check() {  # порт своего подключения или порт, который скрипт занимает сам, занят в панели другим подключением —
 	# остановиться, пока ничего не изменено
@@ -480,7 +509,7 @@ port_taken_check() {  # порт своего подключения или по
 	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-0}")
 	if [ -n "$other" ]; then
 		# Повторный запуск: подсказать, почему подключение на своём же порту могло оказаться «другим».
-		[ ! -f "$STATE" ] || why=" Своё подключение скрипт узнаёт по ключу Reality из $STATE — в этом такого ключа нет."
+		[ ! -f "$STATE" ] || why=" Своё подключение скрипт узнаёт по ключу Reality из $STATE или по записанным там же номеру и порту — у этого не совпало ни то, ни другое."
 		die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N.$why"
 	fi
 	service_port_check "$MODE"   # и порты, которые скрипт занимает сам: подписка, с доменом — nginx
@@ -504,7 +533,7 @@ forget_failed_state() {  # настройки неудачной попытки 
 	# иначе он попал бы в новые настройки, хотя своего подключения ещё нет.
 	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"
 	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' S_INBOUND_ID=0 CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
-	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY=''
+	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_PUB='' OWN_SIDS=''
 }
 reset_failed_attempt() {  # смена варианта после неудачной первой установки: убрать то, что успела сделать прошлая попытка
 	local d=$S_DOMAIN_OLD ip
@@ -2442,6 +2471,9 @@ on_exit() {
 			systemctl stop x-ui >/dev/null 2>&1 || true
 			if [ -s "$WORK/db.before" ] && cp -f "$WORK/db.before" "$DB"; then
 				rm -f "$DB-wal" "$DB-shm"
+				# Своё подключение создано в этом запуске и исчезло вместе с возвращённой базой: его номер в настройках
+				# больше ничей — под ним окажется подключение, которое хозяин панели создаст следующим. Номер — «ещё не создано».
+				if [ "${OWN_CREATED:-0}" = 1 ] && [ -f "$STATE" ]; then sed -i "s/^S_INBOUND_ID='[^']*'\$/S_INBOUND_ID='0'/" "$STATE" 2>/dev/null; fi
 				printf '  база 3x-ui возвращена такой, как была до запуска\n' >&2
 			fi
 			{ systemctl start x-ui >/dev/null 2>&1 && printf '  x-ui запущен снова — VPN работает, как до запуска скрипта\n' >&2; } || true
@@ -2620,7 +2652,7 @@ elif [ "$FOREIGN_XUI" = 1 ]; then   # чужой 3x-ui (согласие — в 
 	foreign_db_copy
 fi
 bot_keep_decision   # «нет» и --no-bot сказаны раньше, чем прочитаны прошлые настройки, — они главнее прочитанного
-own_to_settings     # номер своего подключения — подтверждённый ключом, а не просто прочитанный из настроек
+own_to_settings     # номер и ключи своего подключения — нынешние, а не просто прочитанные из настроек
 : "${PANEL_USER:=$(rnd "$LOWER$DIGITS" 10)}"
 : "${PANEL_PASS:=$(rnd "$LOWER${LOWER^^}$DIGITS" 22)}"
 : "${WEB_PORT:=$(free_port)}"
@@ -3121,6 +3153,7 @@ PY
 	# Созданное подключение — то, в котором ключ из настроек: его номер и записывается, а не «того, что стоит на порту».
 	find_own_inbound
 	[ -n "$OWN_INBOUND_ID" ] || die "панель приняла подключение, но в её базе его не видно — запустите скрипт ещё раз"
+	OWN_CREATED=1   # для on_exit: оборвётся запуск и вернётся прежняя база — этот номер из настроек надо убрать
 	if [ "$MODE" = domain ]; then
 		ok "подключение VLESS + XHTTP + Reality на :$REALITY_PORT, клиентов: $CLIENTS"
 	else
