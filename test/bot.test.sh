@@ -1624,12 +1624,12 @@ test_no_password_login_nag() {  # решение владельца 11.11: бе�
 }
 
 # ——— Чужой 3x-ui: вопрос в самом начале, порты его подключений фаервол не закрывает ———
-xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports / fw_kept_ports; die/ok/warn — строками в $WORK/out
-	eval "$(awk '/^(foreign_xui_check|foreign_on_port|xui_inbound_ports|fw_kept_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports; die/ok/warn — строками в $WORK/out
+	eval "$(awk '/^(foreign_xui_check|foreign_on_port|service_ports|service_port_check|xui_inbound_ports|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
-	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
+	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG='' DOMAIN='' NO_DOMAIN=0 SUB_PORT=2096
 	: > "$WORK/out"
 }
 mkdb() {  # mkdb "порт|listen|протокол|settings|stream|enable" … → $DB с таблицей inbounds, как у 3x-ui
@@ -1706,12 +1706,6 @@ test_inbound_ports_by_protocol() {  # порты включённых подкл
 		'8444||vless|{}|{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]}}|1'
 	t_eq "1080/tcp 1080/udp 1081/tcp 1081/udp 2083/tcp 4443/udp 8443/tcp 8444/tcp 8444/udp 51820/udp" "$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "порты"
 }
-test_fw_kept_ports_long_active_ufw() {  # длинный вывод включённого ufw: «| grep -q» под pipefail читал его как «выключен»
-	xui_fns
-	mkdb '8443||vmess|{}|{"network":"ws"}|1'
-	ufw() { echo "Status: active"; seq 1 200000 | sed 's/^/22\/tcp ALLOW IN Anywhere # /'; }
-	t_eq "" "$(fw_kept_ports)" "включённый ufw — порты не открываем"
-}
 test_no_ufw_status_pipelines() {  # «ufw status | grep» под pipefail путает «включён» с «выключен» — только через переменную
 	! grep -nE '^[^#]*ufw status[^|#]*\| *grep' "$ROOT/src/install-vpn.sh.in" || t_fail "остался конвейер ufw status | grep"
 }
@@ -1719,15 +1713,6 @@ test_inbound_ports_no_db() {
 	xui_fns
 	declare -F xui_inbound_ports > /dev/null || t_fail "нет xui_inbound_ports в шаблоне"
 	t_eq "" "$(xui_inbound_ports)" "без базы — ничего"
-}
-test_fw_kept_ports_only_when_ufw_was_off() {  # фаервол уже включён — его правила остаются как есть, лишнего не открываем
-	xui_fns
-	mkdb '8443||vmess|{}|{"network":"ws"}|1'
-	ufw() { echo "Status: inactive"; }
-	t_eq "8443/tcp" "$(fw_kept_ports)" "ufw выключен — порты подключений остаются открытыми"
-	ufw() { printf 'Status: active\n\nTo Action From\n'; }
-	t_eq "" "$(fw_kept_ports)" "ufw включён — не трогаем"
-	grep -q 'OTHER_VPN_PORTS \$KEEP' "$ROOT/src/install-vpn.sh.in" || t_fail "шаг фаервола не открывает порты подключений панели"
 }
 
 # ——— ревью 12.11: ядро установщика ———
@@ -1774,7 +1759,7 @@ test_inbound_ports_odd_row_keeps_the_rest() {  # settings или stream_settings
 # Шаг «Фаервол ufw» целиком: ufw — заглушка (ответ на status — $UFW_SAYS, код — $UFW_STATUS_RC; команды из $UFW_FAIL
 # не проходят), всё, что скрипт у неё просит, — построчно в $WORK/ufw.calls; правила ufw — файл $UFW_RULES.
 fw_env() {
-	eval "$(awk '/^(fw_step|fw_kept_ports|fw_close|xui_inbound_ports|ufw_active|ufw_state|ufw_allows_tcp)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(fw_step|fw_close|listens_outside|xui_inbound_ports|ufw_state|ufw_allows|ip_cert_port80)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	say() { :; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1791,11 +1776,16 @@ fw_env() {
 		while IFS= read -r f; do [ "$f" != "$*" ] || return 1; done <<< "$UFW_FAIL"
 		[ "$*" != "--force enable" ] || UFW_SAYS="Status: active"
 	}
-	ss() { cat "$WORK/ss.out" 2> /dev/null || true; }
+	ss() {  # $WORK/ss.out — как у «ss -Htuln» (первый столбец — tcp или udp); без «u» в ключах — только TCP и без этого столбца
+		case ${1:-} in
+			-*u*) cat "$WORK/ss.out" 2> /dev/null || true ;;
+			*) { grep '^tcp' "$WORK/ss.out" 2> /dev/null || true; } | sed 's/^tcp *//' ;;
+		esac
+	}
 	port_users() { :; }
 	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env UFW_RULES=$WORK/user.rules
 	MODE=nodomain PANEL_PUBLIC=0 SUB_TLS=0 SUB_PORT=2096 WEB_PORT=54321 REALITY_PORT=2083 SSH_PORTS=22
-	OTHER_VPN='' OTHER_VPN_PORTS='' MOVED_FROM='' FAILS=0
+	OTHER_VPN='' OTHER_VPN_PORTS='' MOVED_FROM='' FAILS=0 SSH_NOW_PORT='' DO_UFW=1
 	UFW_SAYS="Status: inactive" UFW_STATUS_RC='' UFW_FAIL=''
 	unset SSH_CONNECTION   # тесты идут и по SSH: порты SSH шагу задаёт только $SSH_PORTS
 	: > "$WORK/out"; : > "$WORK/ufw.calls"; : > "$UFW_RULES"; rm -f "$DB"
@@ -1842,6 +1832,76 @@ test_fw_off_keeps_inbound_ports_and_enables() {  # ufw был выключен: 
 	t_has "OK включён, открыто: 22/tcp 80/tcp 2083/tcp 8443/tcp" "$(cat "$WORK/out")" "итог"
 }
 
+test_fw_long_active_ufw_output_is_active() {  # длинный вывод включённого ufw: «| grep -q» под pipefail читал его как «выключен»
+	fw_env
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	ufw() {
+		if [ "$1" = status ]; then echo "Status: active"; seq 1 200000 | sed 's/^/22\/tcp ALLOW IN Anywhere # /'; return 0; fi
+		echo "$*" >> "$WORK/ufw.calls"
+	}
+	fw_step
+	! fw_called "allow 8443/tcp" || t_fail "включённый ufw принят за выключенный: открыт порт чужого подключения: $(fw_calls)"
+}
+test_fw_inbound_ports_opened_only_when_ufw_was_off() {  # фаервол уже включён — его правила остаются как есть, лишнего не открываем
+	fw_env
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	fw_step
+	fw_called "allow 8443/tcp" || t_fail "ufw выключен — порт подключения панели должен остаться открытым: $(fw_calls)"
+	fw_env; UFW_SAYS=$ACTIVE
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	fw_step
+	! fw_called "allow 8443/tcp" || t_fail "ufw включён — чужой порт не трогаем: $(fw_calls)"
+}
+test_fw_reads_ufw_state_once() {  # состояние ufw спрашивается один раз на весь шаг. Спрашивалось дважды: первый ответ «выключен», второй не
+	# пришёл — и ufw включался без разрешений для портов подключений панели
+	fw_env
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	ufw() {  # на «status» отвечает только в первый раз
+		if [ "$1" = status ]; then
+			echo x >> "$WORK/status.calls"
+			[ "$(wc -l < "$WORK/status.calls")" = 1 ] || return 1
+			echo "Status: inactive"
+			return 0
+		fi
+		echo "$*" >> "$WORK/ufw.calls"
+	}
+	fw_step
+	fw_called "--force enable" || t_fail "ufw сказал «выключен» — его надо включить: $(fw_calls)"
+	fw_called "allow 8443/tcp" || t_fail "ufw включён без порта подключения панели 8443: $(fw_calls)"
+}
+test_fw_unreadable_panel_db() {  # база панели есть, а прочитать её не вышло — на каких портах её подключения, неизвестно:
+	# выключенный ufw не включать (он мог бы их закрыть), во включённом — ничего не удалять
+	fw_env; echo "это не база SQLite" > "$DB"
+	fw_step
+	! fw_called "--force enable" || t_fail "ufw включён, хотя порты подключений панели неизвестны: $(fw_calls)"
+	grep -q '^BAD ufw не включал.*базу панели' "$WORK/out" || t_fail "не сказано, почему ufw не включён: $(cat "$WORK/out")"
+	! grep -q '^delete ' "$WORK/ufw.calls" || t_fail "удалено правило, хотя порты подключений неизвестны: $(fw_calls)"
+	fw_called "allow 22/tcp" && fw_called "allow 2083/tcp" || t_fail "свои порты всё равно разрешаются: $(fw_calls)"
+	! grep -q 'включён, открыто' "$WORK/out" || t_fail "сказано «включён»: $(cat "$WORK/out")"
+	fw_env; UFW_SAYS=$ACTIVE; echo "это не база SQLite" > "$DB"
+	fw_step
+	! grep -q '^delete ' "$WORK/ufw.calls" || t_fail "ufw включён, база не читается — удалено правило: $(fw_calls)"
+	grep -q '^WARN .*базу панели' "$WORK/out" || t_fail "не сказано, что правила не убирались: $(cat "$WORK/out")"
+	fw_called "allow 2083/tcp" || t_fail "свой порт не разрешён: $(fw_calls)"
+	fw_env   # панели нет вовсе — читать нечего, это не сбой
+	fw_step
+	fw_called "--force enable" || t_fail "без базы панели ufw включается как обычно: $(fw_calls)"
+	fw_called "delete allow 54321/tcp" || t_fail "и лишнее убирается как обычно: $(fw_calls)"
+}
+test_inbound_ports_says_when_db_unreadable() {  # «подключений нет» и «базу не прочитать» — разные ответы: по первому ufw включать можно, по второму нет
+	xui_fns
+	xui_inbound_ports > /dev/null || t_fail "базы нет — это не сбой"
+	mkdb '2083||vless|{}|{}|1'
+	xui_inbound_ports > /dev/null || t_fail "обычная база — не сбой"
+	echo "это не база SQLite" > "$DB"
+	! xui_inbound_ports > /dev/null || t_fail "база не читается, а функция ответила «подключений нет»"
+	# Сверка служебных портов на такой базе идёт дальше, а не обрывает скрипт. Не «( … ) || t_fail»: в условии bash выключает
+	# set -e и внутри, а обрыв был бы именно из-за него (присваивание с ненулевым кодом).
+	set +e
+	( set -e; service_port_check domain; : > "$WORK/reached" )
+	set -e
+	[ -e "$WORK/reached" ] || t_fail "сверка служебных портов на нечитаемой базе оборвала скрипт: $(cat "$WORK/out")"
+}
 test_ufw_state_needs_a_clear_answer() {  # пункт 5: «выключен» — только когда ufw так и сказал; молчание и чужой язык — «не понять»
 	fw_env
 	t_eq inactive "$(ufw_state)" "Status: inactive"
@@ -1881,7 +1941,7 @@ RULES_FIXTURE='### tuple ### allow tcp 2222 0.0.0.0/0 any 203.0.113.5 in
 ### tuple ### allow tcp 2083 0.0.0.0/0 any 0.0.0.0/0 in comment=76706e20706f7274
 ### tuple ### allow tcp 3000:3010 0.0.0.0/0 any 203.0.113.0/24 in
 ### tuple ### allow tcp 4000,4001 0.0.0.0/0 any 203.0.113.9 in'
-test_ufw_allows_tcp_reads_real_rules() {  # пункт 9а: есть ли для порта разрешающее входящее правило — любое, и только с одного адреса тоже
+test_ufw_allows_reads_real_rules() {  # пункт 9а: есть ли для порта разрешающее входящее правило — любое, и только с одного адреса тоже
 	local p
 	fw_env
 	printf '%s\n' "$RULES_FIXTURE" > "$UFW_RULES"
@@ -1897,15 +1957,25 @@ test_ufw_allows_tcp_reads_real_rules() {  # пункт 9а: есть ли для
 EOF
 	sed -i '/203.0.113.7 in$/d' "$UFW_RULES"   # правило «с этого адреса — на любой порт» проверяется отдельно, ниже
 	for p in 2222 2200 2022 80 443 6000 6003 6007 8080 9000 9001 7001 2083 3000 3010 4000 4001; do
-		ufw_allows_tcp "$p" || t_fail "порт $p: разрешающее правило есть, а функция его не видит"
+		ufw_allows "$p" tcp || t_fail "порт $p: разрешающее правило есть, а функция его не видит"
 	done
 	for p in 22 25 26 53 5000 60500 7000 9100 9200 6008 5999 44 3011 20 220 22222; do
-		! ufw_allows_tcp "$p" || t_fail "порт $p: разрешающего входящего правила TCP нет, а функция его нашла"
+		! ufw_allows "$p" tcp || t_fail "порт $p: разрешающего входящего правила TCP нет, а функция его нашла"
 	done
+	# То же для UDP (порты соседнего VPN): правило для TCP UDP-порт не разрешает, и наоборот; без протокола — TCP.
+	for p in 5000 60000 60500 61000 8080; do
+		ufw_allows "$p" udp || t_fail "порт $p/udp: разрешающее правило есть, а функция его не видит"
+	done
+	for p in 2222 80 6003 9001 26 53 59999 61001; do
+		! ufw_allows "$p" udp || t_fail "порт $p/udp: разрешающего входящего правила UDP нет, а функция его нашла"
+	done
+	! ufw_allows 5000 tcp || t_fail "правило для 5000/udp принято за разрешение TCP"
+	ufw_allows 2222 || t_fail "без протокола — TCP"
+	! ufw_allows 5000 || t_fail "без протокола — TCP, а не UDP"
 	echo '### tuple ### allow any any 0.0.0.0/0 any 203.0.113.7 in' >> "$UFW_RULES"
-	ufw_allows_tcp 22 || t_fail "правило «с адреса 203.0.113.7 на любой порт» разрешает и порт 22"
+	ufw_allows 22 tcp && ufw_allows 22 udp || t_fail "правило «с адреса 203.0.113.7 на любой порт» разрешает и порт 22"
 	UFW_RULES="$WORK/нет-такого $WORK/и-такого"
-	! ufw_allows_tcp 22 || t_fail "файлов правил нет — правил нет"
+	! ufw_allows 22 tcp || t_fail "файлов правил нет — правил нет"
 }
 test_fw_ssh_limited_by_source_is_not_reopened_to_all() {  # пункт 9а: ufw включён, SSH разрешён только с адреса админа — общее разрешение не добавлять
 	local rule
@@ -1913,7 +1983,7 @@ test_fw_ssh_limited_by_source_is_not_reopened_to_all() {  # пункт 9а: ufw 
 		'### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 OpenSSH - in' \
 		'### tuple ### limit tcp 22 0.0.0.0/0 any 0.0.0.0/0 in' \
 		'### tuple ### allow any any 0.0.0.0/0 any 203.0.113.5 in'; do
-		fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222"
+		fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222" SSH_NOW_PORT=2222
 		echo "$rule" > "$UFW_RULES"
 		fw_step
 		! fw_called "allow 22/tcp" || t_fail "SSH открыт всем поверх правила «$rule»: $(fw_calls)"
@@ -1921,12 +1991,55 @@ test_fw_ssh_limited_by_source_is_not_reopened_to_all() {  # пункт 9а: ufw 
 			*"any any"*)
 				! fw_called "allow 2222/tcp" || t_fail "правило на любой порт покрывает и 2222: $(fw_calls)"
 				grep -q '^OK SSH :22,2222 уже разрешён' "$WORK/out" || t_fail "оба порта SSH названы оставленными: $(cat "$WORK/out")" ;;
-			*) fw_called "allow 2222/tcp" || t_fail "для порта SSH 2222 правила нет — его надо разрешить: $(fw_calls)" ;;
+			*) fw_called "allow 2222/tcp" || t_fail "через порт 2222 вошли сейчас, правила для него нет — его надо разрешить: $(fw_calls)" ;;
 		esac
 		fw_called "allow 2083/tcp" || t_fail "порт VPN не разрешён: $(fw_calls)"
 		grep -q '^OK SSH :22.* уже разрешён правилами ufw' "$WORK/out" || t_fail "не сказано, что правила SSH оставлены: $(cat "$WORK/out")"
 		! grep -q 'открыто:.* 22/tcp' "$WORK/out" || t_fail "порт 22 назван открытым скриптом: $(cat "$WORK/out")"
 	done
+}
+test_fw_ssh_port_without_rule_stays_closed_when_ssh_is_allowed_elsewhere() {  # ufw включён, вход по SSH разрешён через 2222, а для 22 правила нет
+	# или стоит явный deny. Скрипт добавлял общее «allow 22/tcp» — настоящий ufw заменяет им и deny: порт, который хозяин
+	# сервера закрыл, открывался всем.
+	local rules now
+	for rules in '### tuple ### allow tcp 2222 0.0.0.0/0 any 0.0.0.0/0 in' \
+		$'### tuple ### deny tcp 22 0.0.0.0/0 any 0.0.0.0/0 in\n### tuple ### allow tcp 2222 0.0.0.0/0 any 203.0.113.5 in'; do
+		for now in 2222 ''; do   # вошли через разрешённый порт; вошли не по SSH (консоль хостера)
+			fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222" SSH_NOW_PORT=$now
+			echo "$rules" > "$UFW_RULES"
+			fw_step
+			! fw_called "allow 22/tcp" || t_fail "порт 22 открыт всем, хотя вход разрешён через 2222 (вошли через «$now»): $(fw_calls)"
+			! fw_called "allow 2222/tcp" || t_fail "порту с правилом добавлено общее разрешение: $(fw_calls)"
+			grep -q '^OK SSH :22 в ufw не разрешён.*как есть' "$WORK/out" || t_fail "не сказано, что порт 22 оставлен закрытым: $(cat "$WORK/out")"
+			! grep -q 'открыто:.* 22/tcp' "$WORK/out" || t_fail "порт 22 назван открытым: $(cat "$WORK/out")"
+			fw_called "allow 2083/tcp" || t_fail "порт VPN не разрешён: $(fw_calls)"
+		done
+	done
+}
+test_fw_ssh_port_of_this_login_gets_rule() {  # порт, через который вошли сейчас, без разрешения не остаётся — даже когда у другого порта SSH правило есть
+	fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222" SSH_NOW_PORT=22
+	echo '### tuple ### allow tcp 2222 0.0.0.0/0 any 203.0.113.5 in' > "$UFW_RULES"
+	fw_step
+	fw_called "allow 22/tcp" || t_fail "порт нынешнего входа (22) не разрешён: $(fw_calls)"
+	! fw_called "allow 2222/tcp" || t_fail "порту с правилом добавлено общее разрешение: $(fw_calls)"
+}
+test_fw_ssh_no_rule_for_any_port_allows_them_all() {  # ни у одного порта SSH разрешающего правила нет — разрешаются все, как раньше
+	local now
+	for now in '' 2222; do
+		fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222" SSH_NOW_PORT=$now
+		echo '### tuple ### allow tcp 443 0.0.0.0/0 any 0.0.0.0/0 in' > "$UFW_RULES"
+		fw_step
+		fw_called "allow 22/tcp" && fw_called "allow 2222/tcp" || t_fail "правил для SSH нет вовсе — нужны оба порта (вошли через «$now»): $(fw_calls)"
+	done
+}
+test_fw_unknown_state_keeps_ssh_rules_too() {  # состояние ufw не понять, а SSH в его правилах разрешён только с одного адреса —
+	# общее разрешение не добавляется и тут (ufw может оказаться включённым)
+	fw_env; UFW_STATUS_RC=1 SSH_PORTS="22 2222" SSH_NOW_PORT=22
+	printf '%s\n' '### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 in' > "$UFW_RULES"
+	fw_step
+	! fw_called "allow 22/tcp" || t_fail "состояние ufw не понять — SSH открыт всем поверх правила «только с адреса»: $(fw_calls)"
+	! fw_called "allow 2222/tcp" || t_fail "порт без правила открыт, хотя вход разрешён через 22: $(fw_calls)"
+	fw_called "allow 2083/tcp" || t_fail "порт VPN не разрешён: $(fw_calls)"
 }
 test_fw_ssh_always_allowed_when_script_enables_ufw() {  # пункт 9а: ufw выключен и включаем его мы — SSH разрешается обязательно, какие бы правила ни лежали в файлах
 	fw_env; SSH_PORTS="22 2222"
@@ -1959,6 +2072,106 @@ test_fw_failed_port_is_not_reported_open() {  # пункт 9б: порт, кот
 	fw_step
 	fw_called "--force enable" || t_fail "ufw не включён из-за порта панели: $(fw_calls)"
 	grep -q '^OK включён, открыто: 22/tcp 2083/tcp$' "$WORK/out" || t_fail "итог: $(cat "$WORK/out")"
+}
+
+test_fw_keeps_rule_of_port_someone_listens_on() {  # правило ufw не убирается, если на порту снаружи кто-то слушает (не только панель).
+	# Без домена и без сертификата на IP порт 80 скрипту не нужен — и сайт хозяина сервера на :80 терял разрешение молча
+	local addr
+	for addr in '0.0.0.0:80' '[::]:80' '*:80' '203.0.113.7:80'; do
+		fw_env; UFW_SAYS=$ACTIVE
+		printf '%s\n' "tcp   LISTEN 0      511    $addr       0.0.0.0:*" \
+			'tcp   LISTEN 0      4096       127.0.0.1:2096      0.0.0.0:*' \
+			'tcp   LISTEN 0      4096       127.0.0.1:54321     0.0.0.0:*' \
+			'udp   UNCONN 0      0            0.0.0.0:68        0.0.0.0:*' > "$WORK/ss.out"
+		fw_step
+		! fw_called "delete allow 80/tcp" || t_fail "убрано разрешение порта 80, на котором слушают ($addr): $(fw_calls)"
+		fw_called "delete allow 2096/tcp" || t_fail "подписка слушает только localhost — её порт снаружи не нужен: $(fw_calls)"
+		fw_called "delete allow 54321/tcp" || t_fail "панель слушает только localhost (--panel-local) — её порт снаружи не нужен: $(fw_calls)"
+	done
+	for addr in '127.0.0.1:80' '[::1]:80' '0.0.0.0:8080' '0.0.0.0:180' '0.0.0.0:8'; do   # только localhost или другой порт — не причина оставлять
+		fw_env; UFW_SAYS=$ACTIVE
+		printf '%s\n' "tcp   LISTEN 0      511    $addr       0.0.0.0:*" 'udp   UNCONN 0      0            0.0.0.0:80        0.0.0.0:*' > "$WORK/ss.out"
+		fw_step
+		fw_called "delete allow 80/tcp" || t_fail "на 80/tcp снаружи никто не слушает ($addr) — правило убирается как раньше: $(fw_calls)"
+	done
+}
+test_fw_failed_enable_is_rolled_back() {  # «ufw --force enable» не удался, а до запуска ufw был выключен. После ошибки ufw оставляет политику
+	# «всё закрыто», а правила мог не загрузить (на настоящем ufw 0.36.1 с негодным правилом: INPUT DROP, правила для SSH
+	# нет, «ufw --force disable» возвращает ACCEPT) — вернуть выключенное состояние и сказать об этом
+	fw_env; UFW_FAIL="--force enable"
+	fw_step
+	t_eq "--force enable;--force disable;" "$(grep -- '^--force' "$WORK/ufw.calls" | tr '\n' ';')" "после неудачного включения — возврат в выключенное состояние"
+	grep -q '^BAD ufw не включился.*выключенное состояние' "$WORK/out" || t_fail "не сказано, что ufw возвращён в выключенное состояние: $(cat "$WORK/out")"
+	! grep -q 'включён, открыто' "$WORK/out" || t_fail "сказано «включён»: $(cat "$WORK/out")"
+	fw_env; UFW_FAIL=$'--force enable\n--force disable'
+	fw_step
+	grep -q '^BAD ufw не включился, и выключить его обратно не удалось' "$WORK/out" || t_fail "не сказано, что и выключить не вышло: $(cat "$WORK/out")"
+	grep -q 'SSH' "$WORK/out" || t_fail "не сказано проверить вход по SSH: $(cat "$WORK/out")"
+	fw_env; UFW_SAYS=$ACTIVE UFW_FAIL="--force enable"   # ufw был включён и до запуска: выключать его — не скрипту
+	fw_step
+	! fw_called "--force disable" || t_fail "ufw был включён до запуска, а скрипт его выключил: $(fw_calls)"
+	grep -q '^BAD ufw не включился' "$WORK/out" || t_fail "о сбое не сказано: $(cat "$WORK/out")"
+}
+test_ip_cert_no_ufw_adds_no_rule() {  # --no-ufw: перед выпуском сертификата на IP скрипт всё равно добавлял «ufw allow 80/tcp» и при успехе
+	# оставлял его. Теперь с --no-ufw правил не добавляет, а если порт 80 из-за этого закрыт — говорит открыть его самому
+	fw_env; UFW_SAYS=$ACTIVE DO_UFW=0
+	ip_cert_port80
+	t_eq "" "$(fw_calls)" "--no-ufw: правил ufw скрипт не добавляет"
+	grep -q '^WARN .*порт 80 .*ufw allow 80/tcp' "$WORK/out" || t_fail "не сказано, что порт 80 закрыт и открыть его нужно самому: $(cat "$WORK/out")"
+	t_eq 0 "$OPENED80" "правило не добавлено — убирать потом нечего"
+	fw_env; UFW_SAYS=$ACTIVE DO_UFW=0
+	echo '### tuple ### allow tcp 80,443 0.0.0.0/0 any 0.0.0.0/0 in' > "$UFW_RULES"
+	ip_cert_port80
+	t_eq "" "$(fw_calls)$(cat "$WORK/out")" "--no-ufw, порт 80 уже разрешён — ни правил, ни предупреждений"
+	fw_env; DO_UFW=0
+	ip_cert_port80
+	t_eq "" "$(fw_calls)$(cat "$WORK/out")" "--no-ufw, ufw выключен — порт 80 он не закрывает, предупреждать не о чем"
+	fw_env; UFW_SAYS=$ACTIVE
+	ip_cert_port80
+	t_eq "allow 80/tcp;|1" "$(fw_calls)|$OPENED80" "без --no-ufw — как раньше: порт 80 открывается на время проверки"
+	fw_env; UFW_SAYS=$ACTIVE
+	echo '### tuple ### allow tcp 80 0.0.0.0/0 any 0.0.0.0/0 in' > "$UFW_RULES"
+	ip_cert_port80
+	t_eq "|0" "$(fw_calls)|$OPENED80" "порт 80 уже разрешён — правило не добавляется (и потом не удаляется)"
+	fw_env; UFW_STATUS_RC=1
+	ip_cert_port80
+	t_eq "|0" "$(fw_calls)|$OPENED80" "состояние ufw не понять — не трогаем, как раньше"
+	fw_env; UFW_SAYS=$ACTIVE UFW_FAIL="allow 80/tcp"
+	ip_cert_port80
+	t_eq 0 "$OPENED80" "правило не добавилось — удалять потом нечего"
+}
+# Порты соседнего VPN (WireGuard, Amnezia в Docker — detect_other_vpn): пункт 6 второй порции.
+test_fw_other_vpn_port_failure_leaves_ufw_off() {  # ufw выключен, порт соседнего VPN в нём не разрешился: включённый фаервол отрубил бы тот VPN.
+	# Раньше ufw включался, а сообщение говорило «открыл его порты»
+	fw_env; OTHER_VPN="WireGuard(wg0)" OTHER_VPN_PORTS="51820/udp" UFW_FAIL="allow 51820/udp"
+	fw_step
+	! fw_called "--force enable" || t_fail "ufw включён, хотя порт соседнего VPN в нём не разрешён: $(fw_calls)"
+	grep -q '^BAD ufw не включал.*51820/udp' "$WORK/out" || t_fail "не сказано, почему ufw не включён: $(cat "$WORK/out")"
+	! grep -q 'открыл его порты' "$WORK/out" || t_fail "сказано «открыл его порты», хотя порт не открылся: $(cat "$WORK/out")"
+}
+test_fw_other_vpn_ports_opened_and_named() {  # обычный случай: ufw выключен, порты соседнего VPN разрешаются до включения и названы
+	fw_env; OTHER_VPN="WireGuard(wg0), Docker:amnezia-awg" OTHER_VPN_PORTS="1194/tcp 51820/udp"
+	fw_step
+	fw_called "allow 1194/tcp" && fw_called "allow 51820/udp" && fw_called "--force enable" || t_fail "порты соседнего VPN или включение: $(fw_calls)"
+	grep -q '^WARN рядом работает WireGuard(wg0), Docker:amnezia-awg — открыл его порты в ufw (1194/tcp 51820/udp)' "$WORK/out" || t_fail "сообщение: $(cat "$WORK/out")"
+}
+test_fw_other_vpn_restricted_rule_not_widened() {  # ufw включён, порт соседнего VPN разрешён только с одной подсети — общее разрешение
+	# открыло бы его всем; «открыл его порты» — только про то, что открыл сам скрипт
+	fw_env; UFW_SAYS=$ACTIVE OTHER_VPN="WireGuard(wg0)" OTHER_VPN_PORTS="1194/tcp 51820/udp"
+	echo '### tuple ### allow udp 51820 0.0.0.0/0 any 198.51.100.0/24 in' > "$UFW_RULES"
+	fw_step
+	! fw_called "allow 51820/udp" || t_fail "правило «только с подсети» расширено общим: $(fw_calls)"
+	fw_called "allow 1194/tcp" || t_fail "для порта без правила — как раньше, разрешить: $(fw_calls)"
+	grep -q 'открыл его порты в ufw (1194/tcp)' "$WORK/out" || t_fail "в «открыл» не только то, что открыто: $(cat "$WORK/out")"
+	grep -q '^OK .*51820/udp.* уже разрешен' "$WORK/out" || t_fail "не сказано, что правило для 51820/udp оставлено: $(cat "$WORK/out")"
+	fw_env; UFW_SAYS=$ACTIVE OTHER_VPN="WireGuard(wg0)" OTHER_VPN_PORTS="51820/udp"
+	echo '### tuple ### allow tcp 51820 0.0.0.0/0 any 198.51.100.0/24 in' > "$UFW_RULES"
+	fw_step
+	fw_called "allow 51820/udp" || t_fail "правило для TCP на том же номере UDP-порт не разрешает — его надо открыть: $(fw_calls)"
+	fw_env; OTHER_VPN="WireGuard(wg0)" OTHER_VPN_PORTS="51820/udp"   # ufw выключен: включаем мы — разрешение обязательно
+	echo '### tuple ### allow udp 51820 0.0.0.0/0 any 198.51.100.0/24 in' > "$UFW_RULES"
+	fw_step
+	fw_called "allow 51820/udp" || t_fail "ufw включает скрипт — порт соседнего VPN должен быть разрешён: $(fw_calls)"
 }
 
 test_language_env_is_dropped_at_start() {  # пункт 5: LANGUAGE из окружения (sudo её сохраняет) переводит ответы ufw — в начале скрипта она снимается
@@ -2081,9 +2294,9 @@ test_ssh_port_of_this_login_survives_sudo() {  # пункт 9в: sudo стира
 	out=$(SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222' bash -c 'SSH_CONNECTION="203.0.113.9 50001 198.51.100.1 2200" bash "$0"; :' "$WORK/ports.sh")
 	t_eq "22 2200" "$out" "своя SSH_CONNECTION главнее родительской"
 }
-test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» слушает от имени sshd сеанса — это не порт SSH; у сеанса родитель тоже sshd
+sshd_session_fixture() {  # настоящие процессы с именем sshd: слушающий (порт 2233) и его сеанс с пробросами (8080, 8081) —
+	# в $WORK/ss.out, как их показал бы ss; после проверки: kill $SSHD_FIXTURE_PIDS
 	local parent child n=0
-	ssh_fns
 	cp "$(command -v bash)" "$WORK/sshd"   # имя процесса — по имени файла: это и есть «sshd» для /proc
 	mkfifo "$WORK/hold"
 	cat > "$WORK/session.sh" <<'EOF'
@@ -2107,8 +2320,15 @@ LISTEN 0      128          0.0.0.0:2233      0.0.0.0:*    users:(("sshd",pid=$pa
 LISTEN 0      128          0.0.0.0:8080      0.0.0.0:*    users:(("sshd",pid=$child,fd=9))
 LISTEN 0      128                *:8081            *:*    users:(("sshd",pid=$child,fd=10))
 EOF
+	SSHD_FIXTURE_PIDS="$child $parent"
+}
+test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» слушает от имени sshd сеанса — это не порт SSH; у сеанса родитель тоже sshd
+	local n
+	ssh_fns
+	sshd_session_fixture
 	n=$(sshd_listen_ports | tr '\n' ' ')
-	kill "$child" "$parent" 2> /dev/null || true
+	# shellcheck disable=SC2086  # два pid — по словам
+	kill $SSHD_FIXTURE_PIDS 2> /dev/null || true
 	t_eq "2233 " "$n" "только порт самого sshd, без портов, проброшенных его сеансом"
 }
 
@@ -2116,13 +2336,25 @@ EOF
 REALITY='{"network":"tcp","security":"reality"}'
 own_fns() {
 	eval "$(grep -m1 '^state_val() {' "$ROOT/src/install-vpn.sh.in")"
-	eval "$(awk '/^(own_inbound|find_own_inbound|foreign_on_port|port_taken_check|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(own_inbound|find_own_inbound|own_inbound_late|own_to_settings|forget_failed_state|foreign_on_port|port_taken_check|service_ports|service_port_check|xui_inbound_ports|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
-	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
-	S_INBOUND_ID='' OWN_INBOUND_ID='' OLD_REALITY_PORT='' REALITY_PORT=2083
+	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG='' MODE=nodomain DOMAIN='' NO_DOMAIN=0 SUB_PORT=2096
+	S_INBOUND_ID='' OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_KNOWN=1 REALITY_PORT=2083
 	: > "$WORK/out"; rm -f "$DB" "$STATE" "$STATE".failed-*
+}
+# Ключи Reality в тестах — выдуманные строки: «наш» (из настроек установки) и чужой (подключение хозяина панели).
+KEY_OWN=OURkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+KEY_ALIEN=ALIENkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+reality() {  # reality КЛЮЧ → stream_settings подключения с Reality и этим ключом
+	printf '{"network":"xhttp","security":"reality","realitySettings":{"privateKey":"%s","shortIds":["ab12"]}}' "$1"
+}
+state_put() {  # state_put "ИМЯ='значение'" … → настройки установки ($STATE) из этих строк
+	printf '%s\n' "$@" > "$STATE"
+}
+add_inbound() {  # add_inbound ПОРТ КЛЮЧ — подключение VLESS + Reality с этим ключом; номер панель (SQLite) даёт сама
+	sql "insert into inbounds (port, listen, protocol, settings, stream_settings, enable, tag) values ($1, '', 'vless', '{}', '$(reality "$2")', 1, 'in-$1-tcp')"
 }
 mkdb_tags() {  # mkdb + столбец tag: «in-ПОРТ-tcp»
 	mkdb "$@"
@@ -2138,33 +2370,110 @@ sql() { python3 -I -c 'import sqlite3, sys
 db = sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()' "$DB" "$1"; }
 own() { find_own_inbound; echo "id=$S_INBOUND_ID свой=$OWN_INBOUND_ID порт=$OLD_REALITY_PORT"; }
 
-test_own_inbound_never_a_foreign_one() {  # чужой 3x-ui с VLESS + Reality: его подключение — не своё, ни на первом запуске, ни после
+test_own_inbound_is_the_one_with_our_key() {  # своё — подключение с ключом Reality из настроек установки; чужое VLESS + Reality своим не становится
 	own_fns
-	mkdb_tags "443||vless|{}|$REALITY|1" '8443||vmess|{}|{}|1'
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" '8443||vmess|{}|{}|1'
 	t_eq "id=0 свой= порт=" "$(own)" "первый запуск поверх чужого 3x-ui (настроек установки нет)"
 	: > "$STATE.failed-20261112-000000"
 	t_eq "id=0 свой= порт=" "$(own)" "после сброшенной неудачной попытки (остался только след)"
 	rm -f "$STATE".failed-*
-	echo "S_INBOUND_ID='0'" > "$STATE"
-	t_eq "id=0 свой= порт=" "$(own)" "прошлая попытка до создания подключения не дошла"
-	sql "insert into inbounds (port, listen, protocol, settings, stream_settings, enable, tag) values (2083, '', 'vless', '{}', '$REALITY', 1, 'in-2083-tcp')"
-	echo "S_INBOUND_ID='3'" > "$STATE"
-	t_eq "id=3 свой=3 порт=2083" "$(own)" "своё — то, чей id записан при создании, а не первое VLESS + Reality в базе"
+	state_put "REALITY_PRIV=''" "S_INBOUND_ID='0'"
+	t_eq "id=0 свой= порт=" "$(own)" "прошлая попытка не дошла ни до ключей, ни до подключения"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='0'"
+	t_eq "id=0 свой= порт=" "$(own)" "ключи уже сгенерированы, подключение ещё не создано"
+	add_inbound 2083 "$KEY_OWN"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "подключение создано, а номер записать не успели — оно своё: в нём ключ из настроек"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "обычный повторный запуск"
+	state_put "REALITY_PRIV='$KEY_OWN'"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "настройки прежней версии (номера в них нет) — по ключу"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='1'"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "под записанным номером чужое подключение — своё то, где ключ"
 	sql "update inbounds set port=9443 where id=2; update inbounds set port=8443 where id=3"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'"
 	t_eq "id=3 свой=3 порт=8443" "$(own)" "порт своего подключения поменяли в панели — берётся нынешний"
+	sql "insert into inbounds (port, protocol, stream_settings, enable) values (7001, 'vless', 'null', 1), (7002, 'vless', '[]', 1), (7003, 'vless', '{не json', 1), (7004, 'vless', '{\"security\":\"reality\",\"realitySettings\":[]}', 1)"
+	t_eq "id=3 свой=3 порт=8443" "$(own)" "строки со странным содержимым поиску не мешают"
+	sql "update inbounds set stream_settings='$(reality "$KEY_ALIEN")' where id=3"
+	t_eq "id=0 свой= порт=" "$(own)" "под своим номером — подключение с другим ключом: оно не своё, номер сброшен"
 	sql "delete from inbounds where id=3"
-	t_eq "id=3 свой= порт=" "$(own)" "своё подключение удалили в панели — чужое вместо него своим не становится"
+	t_eq "id=0 свой= порт=" "$(own)" "своё подключение удалили в панели — чужое вместо него своим не становится"
 }
-test_own_inbound_old_install_as_before() {  # настройки прежней версии (id подключения в них нет): своё — первое VLESS + Reality, как раньше
+test_own_inbound_after_db_rollback_same_number_is_foreign() {  # первый запуск поверх чужой панели оборвался: база возвращена из снимка, а номер
+	# созданного подключения остался в настройках. Потом хозяин панели добавил своё подключение — оно получило тот же номер.
+	# Раньше оно становилось «своим»: скрипт не создавал своего, а с --port переносил чужое и закрывал его порт.
 	own_fns
-	mkdb_tags '8443||vmess|{}|{}|1' "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1"
-	printf "%s\n" "S_MODE='nodomain'" "S_DONE='1'" > "$STATE"
-	t_eq "id= свой=2 порт=443" "$(own)" "прежняя версия без домена ставила 443 — второго подключения не будет"
-	printf "%s\n" "S_MODE='nodomain'" "S_INBOUND_ID='мусор'" > "$STATE"
-	t_eq "id= свой=2 порт=443" "$(own)" "нечисловой id в настройках — как будто его нет"
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" '8443||vmess|{}|{}|1' '9000||trojan|{}|{}|1'
+	cp "$DB" "$WORK/db.before"   # снимок базы до первых изменений (xui_stop)
+	add_inbound 2083 "$KEY_OWN"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='4'" "S_REALITY_PORT='2083'"
+	t_eq "id=4 свой=4 порт=2083" "$(own)" "пока база не возвращена — подключение своё"
+	cp -f "$WORK/db.before" "$DB"   # обрыв: on_exit вернул базу, настройки остались
+	t_eq "id=0 свой= порт=" "$(own)" "после возврата базы своего подключения нет"
+	add_inbound 2083 "$KEY_ALIEN"   # хозяин панели
+	t_eq "1:443:in-443-tcp 2:8443:in-8443-tcp 3:9000:in-9000-tcp 4:2083:in-2083-tcp" "$(inbounds)" "подключение хозяина получило тот же номер 4"
+	t_eq "id=0 свой= порт=" "$(own)" "чужое подключение с «нашим» номером — не своё"
+	find_own_inbound
+	REALITY_PORT=2083
+	! ( port_taken_check ) || t_fail "порт занят чужим подключением с «нашим» номером — должен остановиться"
+	t_has "2083" "$(cat "$WORK/out")" "какой порт занят"
+	REALITY_PORT=3000
+	( port_taken_check ) || t_fail "свободный порт из --port: $(cat "$WORK/out")"
+	t_eq "" "$OWN_INBOUND_ID$OLD_REALITY_PORT" "переносить на новый порт нечего: своего подключения нет"
+}
+test_own_inbound_settings_without_key_as_before() {  # в настройках нет ни ключа, ни номера (самые первые версии): своё — первое VLESS + Reality,
+	# как раньше; его ключ становится ключом установки — иначе скрипт сгенерировал бы новый и на следующем запуске своё потерял
+	own_fns
+	mkdb_tags '8443||vmess|{}|{}|1' "443||vless|{}|$(reality "$KEY_OWN")|1" "2083||vless|{}|$(reality "$KEY_ALIEN")|1"
+	state_put "S_MODE='nodomain'" "S_DONE='1'"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "прежняя версия без домена ставила 443 — второго подключения не будет"
+	state_put "S_MODE='nodomain'" "S_INBOUND_ID='мусор'"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "нечисловой номер в настройках — как будто его нет"
+	find_own_inbound
+	unset REALITY_PRIV S_INBOUND_ID   # как после «. $STATE», в котором этих строк нет
+	own_to_settings
+	t_eq "2|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "номер и ключ установки — найденного подключения"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV='$REALITY_PRIV'" "S_INBOUND_ID='$S_INBOUND_ID'"   # так их запишет save_state
+	sql "delete from inbounds where id=1; insert into inbounds (id, port, protocol, stream_settings, enable, tag) values (1, 7000, 'vless', '$(reality "$KEY_ALIEN")', 1, 'in-7000-tcp')"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "следующий запуск узнаёт его уже по ключу, а не как «первое VLESS + Reality» (первое теперь — чужое #1)"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV=''" "S_INBOUND_ID='2'"
+	t_eq "id=0 свой= порт=" "$(own)" "номер без ключа проверить нечем — своим подключение не считается"
 	rm -f "$DB"; mkdb_tags '8443||vmess|{}|{}|1'
-	printf "%s\n" "S_MODE='nodomain'" > "$STATE"
+	state_put "S_MODE='nodomain'"
 	t_eq "id= свой= порт=" "$(own)" "VLESS + Reality в базе нет — своего нет"
+}
+test_own_to_settings_takes_found_not_written() {  # после чтения настроек номер своего подключения — найденного по ключу, а не записанный
+	own_fns
+	S_INBOUND_ID=4 OWN_INBOUND_ID='' OWN_KEY='' REALITY_PRIV=$KEY_OWN; own_to_settings
+	t_eq "0|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "записанный номер не подтвердился — сброшен; ключ установки прежний"
+	S_INBOUND_ID=4 OWN_INBOUND_ID=6 OWN_KEY=$KEY_OWN REALITY_PRIV=$KEY_OWN; own_to_settings
+	t_eq "6|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "номер — того подключения, в котором ключ"
+	S_INBOUND_ID='' OWN_INBOUND_ID='' OWN_KEY='' REALITY_PRIV=''; own_to_settings
+	t_eq "|" "$S_INBOUND_ID|$REALITY_PRIV" "ни номера, ни ключа, ни своего подключения — так и остаётся: ключ сгенерируется дальше"
+	S_INBOUND_ID=3 OWN_INBOUND_ID=3 OWN_KEY=$KEY_ALIEN REALITY_PRIV=$KEY_OWN; own_to_settings
+	t_eq "$KEY_OWN" "$REALITY_PRIV" "ключ из настроек найденным не подменяется"
+}
+test_own_inbound_read_once_python_is_there() {  # в начале запуска python3 может не быть — базу панели прочитать нечем. После его установки своё
+	# подключение читается заново: иначе оно сошло бы за чужое («порт занят») или переехало бы на порт из настроек
+	own_fns
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" "8444||vless|{}|$(reality "$KEY_OWN")|1"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='2'" "S_REALITY_PORT='2083'"
+	(
+		command() { [ "${2:-}" != python3 ] || return 1; builtin command "$@"; }   # python3 «не установлен»
+		find_own_inbound
+		echo "$OWN_KNOWN|$S_INBOUND_ID|$OWN_INBOUND_ID|$OLD_REALITY_PORT"
+	) > "$WORK/early"
+	t_eq "0|2||" "$(cat "$WORK/early")" "прочитать нечем: своё не найдено, но и чужим не объявлено — номер не сброшен"
+	OWN_KNOWN=0 OWN_INBOUND_ID='' OLD_REALITY_PORT='' S_INBOUND_ID=2 PORT_ARG='' REALITY_PORT=2083   # порт — из настроек
+	own_inbound_late
+	t_eq "1|2|8444|8444" "$OWN_KNOWN|$OWN_INBOUND_ID|$OLD_REALITY_PORT|$REALITY_PORT" "python3 появился: своё найдено, порт — его нынешний, а не из настроек"
+	( port_taken_check ) || t_fail "своё подключение на своём порту принято за чужое: $(cat "$WORK/out")"
+	OWN_KNOWN=0 OWN_INBOUND_ID='' OLD_REALITY_PORT='' PORT_ARG=3000 REALITY_PORT=3000
+	own_inbound_late
+	t_eq "2|8444|3000" "$OWN_INBOUND_ID|$OLD_REALITY_PORT|$REALITY_PORT" "с --port порт остаётся заданным, перенос — с нынешнего"
+	sql "delete from inbounds where id=2"
+	own_inbound_late
+	t_eq "2|8444" "$OWN_INBOUND_ID|$OLD_REALITY_PORT" "прочитано — второй раз не читается"
 }
 test_foreign_xui_port_taken_stops_before_question() {  # порт своего подключения занят чужим — стоп до вопросов и изменений
 	local out
@@ -2182,27 +2491,105 @@ test_foreign_xui_port_taken_stops_before_question() {  # порт своего �
 	t_eq 1 "$FOREIGN_XUI" "свободный --port — обычный вопрос и согласие"
 	! grep -q '^DIE' "$WORK/out" || t_fail "остановился на свободном порту: $(cat "$WORK/out")"
 }
-test_port_taken_check_by_state() {  # та же проверка перед изменениями — когда база не читалась в самом начале и на повторных запусках
+test_port_taken_check_own_and_foreign() {  # порт своего подключения занят в панели другим — стоп, пока ничего не изменено; своё — не помеха
 	own_fns
-	mkdb_tags "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1" '3000||vmess|{}|{}|0'
-	S_INBOUND_ID=0 OWN_INBOUND_ID='' REALITY_PORT=2083
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" "2083||vless|{}|$(reality "$KEY_OWN")|1" '3000||vmess|{}|{}|0'
+	OWN_INBOUND_ID='' REALITY_PORT=2083
 	! ( port_taken_check ) || t_fail "своего ещё нет, порт 2083 занят чужим — должен остановиться"
 	t_has "2083" "$(cat "$WORK/out")" "какой порт"; t_has "--port" "$(cat "$WORK/out")" "что делать"
-	S_INBOUND_ID=0 OWN_INBOUND_ID='' REALITY_PORT=2084
+	case $(cat "$WORK/out") in *"по ключу"*) t_fail "первый запуск (настроек нет), а сказано про ключ из настроек" ;; esac
+	OWN_INBOUND_ID='' REALITY_PORT=2084
 	( port_taken_check ) || t_fail "порт 2084 свободен: $(cat "$WORK/out")"
-	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=2083
+	OWN_INBOUND_ID=2 REALITY_PORT=2083
 	( port_taken_check ) || t_fail "на порту своё подключение: $(cat "$WORK/out")"
-	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=443
+	OWN_INBOUND_ID=2 REALITY_PORT=443
 	! ( port_taken_check ) || t_fail "--port 443 на повторном запуске, а там чужое — должен остановиться"
-	S_INBOUND_ID=2 OWN_INBOUND_ID=2 REALITY_PORT=3000
+	OWN_INBOUND_ID=2 REALITY_PORT=3000
 	! ( port_taken_check ) || t_fail "выключенное чужое подключение тоже занимает порт в панели"
-	S_INBOUND_ID=7 OWN_INBOUND_ID='' REALITY_PORT=2083
-	! ( port_taken_check ) || t_fail "своё подключение удалено, на его порту другое — оно не своё"
+	# Записанный номер сам по себе ничего не значит: своё — только найденное по ключу.
+	: > "$WORK/out"; state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='2'"
 	S_INBOUND_ID=2 OWN_INBOUND_ID='' REALITY_PORT=2083
-	( port_taken_check ) || t_fail "своё подключение в начале запуска было нечем прочитать (нет python3) — оно всё равно своё: $(cat "$WORK/out")"
-	S_INBOUND_ID='' OWN_INBOUND_ID=1 REALITY_PORT=2083
-	( port_taken_check ) || t_fail "настройки прежней версии — как раньше, без этой проверки: $(cat "$WORK/out")"
+	! ( port_taken_check ) || t_fail "номер из настроек без найденного своего подключения — не повод считать подключение своим"
+	t_has "по ключу Reality" "$(cat "$WORK/out")" "повторный запуск: сказано, по чему скрипт узнаёт своё"
+	# Настройки прежних версий (номера в них нет): раньше проверка для них пропускалась, и подключение на своём порту усыновлялось.
+	S_INBOUND_ID='' OWN_INBOUND_ID='' REALITY_PORT=2083
+	! ( port_taken_check ) || t_fail "настройки без номера, на своём порту чужое — должен остановиться"
+	S_INBOUND_ID='' OWN_INBOUND_ID=2 REALITY_PORT=2083
+	( port_taken_check ) || t_fail "настройки без номера, своё найдено — не помеха: $(cat "$WORK/out")"
 }
+# Порты, которые скрипт занимает сам (пункт 1 второй порции): подписка — 2096; с доменом — ещё 80, 443 и 8443 под nginx.
+# На настоящих x-ui 3.3.1 и Xray проверено: чужое подключение на 2096 — и Xray не стартует («failed to listen TCP on 2096»,
+# не работает ни одно подключение) либо, если порт успел занять он, падает сама панель («Error starting sub server»).
+svc_check() {  # svc_check РЕЖИМ → «ok» или текст остановки
+	: > "$WORK/out"
+	if ( service_port_check "$1" ); then echo ok; else cat "$WORK/out"; fi
+}
+test_service_ports_checked_against_panel() {  # на порту, который скрипт займёт сам, у панели включённое подключение — стоп до изменений
+	local out
+	own_fns
+	mkdb '443||vless|{}|{}|1' '8443||vmess|{}|{}|1' '80||trojan|{}|{}|1' '2096||vless|{}|{}|0' '9000||vless|{}|{}|1'
+	t_eq ok "$(svc_check nodomain)" "без домена 80, 443 и 8443 скрипту не нужны, а на 2096 подключение выключено"
+	out=$(svc_check domain)
+	t_has "DIE " "$out" "с доменом — стоп"
+	t_has " 80" "$out" "первым назван порт 80"; t_has "nginx" "$out" "зачем порт скрипту"
+	t_has "еренесите" "$out" "что сделать: перенести подключение"; t_has "чистый сервер" "$out" "или чистый сервер"
+	rm -f "$DB"; mkdb '8443||vmess|{}|{}|1'
+	out=$(svc_check domain); t_has "8443" "$out" "8443 занят подключением"; t_has "nginx" "$out" "зачем он скрипту"
+	rm -f "$DB"; mkdb '443|203.0.113.7|vless|{}|{}|1'
+	t_has " 443" "$(svc_check domain)" "443 занят подключением на своём адресе"
+	rm -f "$DB"; mkdb '2096||vmess|{}|{}|1'
+	out=$(svc_check nodomain); t_has "2096" "$out" "порт подписки занят"; t_has "подписк" "$out" "зачем он скрипту"
+	t_has "2096" "$(svc_check domain)" "и с доменом тоже"
+	rm -f "$DB"; mkdb '2096|127.0.0.1|vless|{}|{}|1'
+	t_has "2096" "$(svc_check nodomain)" "подключение только на localhost — тот же порт, что у подписки на 127.0.0.1"
+	rm -f "$DB"; mkdb '443||wireguard|{}|{}|1' '2096|/run/xray.sock|vless|{}|{}|1' '8443||vless|{}|{"network":"kcp"}|1'
+	t_eq ok "$(svc_check domain)" "UDP на тех же номерах и unix-сокет TCP-порт не занимают"
+	rm -f "$DB"; echo "это не база" > "$DB"
+	t_eq ok "$(svc_check domain)" "базу не прочитать — проверить нечем, не останавливаться"
+	rm -f "$DB"
+	t_eq ok "$(svc_check domain)" "панели нет"
+}
+test_foreign_xui_service_port_stops_before_question() {  # чужой 3x-ui, его подключение — на порту подписки: стоп до вопроса и изменений.
+	# Раньше скрипт получал «да», ставил подписку на тот же порт, и Xray не поднимался: не работало ни одно подключение.
+	local out
+	own_fns; answers y y y
+	mkdb_tags '443||vless|{}|{}|1' '2096||vmess|{}|{}|1'
+	! ( foreign_xui_check ) || t_fail "пошёл дальше, хотя порт подписки занят чужим подключением"
+	out=$(cat "$WORK/out")
+	t_has "DIE " "$out" "остановка"; t_has "2096" "$out" "какой порт"; t_has "подписк" "$out" "зачем он скрипту"
+	t_has "Ничего не менял" "$out" "сказано, что ничего не изменено"
+	! grep -q 'Продолжить?' "$WORK/tty.out" 2> /dev/null || t_fail "вопрос задан, хотя ставить некуда"
+	rm -f "$DB"; mkdb_tags '443||vless|{}|{}|1' '8443||vmess|{}|{}|1'
+	: > "$WORK/out"; DOMAIN=vpn.example.com
+	! ( foreign_xui_check ) || t_fail "--domain, а 443 и 8443 заняты чужими подключениями — должен остановиться"
+	t_has " 443" "$(cat "$WORK/out")" "какой порт (с доменом)"
+	! grep -q 'Продолжить?' "$WORK/tty.out" 2> /dev/null || t_fail "вопрос задан, хотя ставить некуда"
+	: > "$WORK/out"; DOMAIN=''   # вариант ещё не выбран (спросят позже) — пока известен только порт подписки
+	foreign_xui_check
+	t_eq 1 "$FOREIGN_XUI" "без --domain порты nginx ещё не нужны — обычный вопрос и согласие"
+	: > "$WORK/out"; FOREIGN_XUI=0 DOMAIN=vpn.example.com NO_DOMAIN=1   # противоречие опций разберут дальше
+	foreign_xui_check
+	t_eq 1 "$FOREIGN_XUI" "--no-domain: порты nginx не нужны"
+}
+test_port_taken_check_covers_service_ports() {  # та же сверка — перед изменениями на любом запуске: вариант (с доменом или без) уже известен
+	own_fns
+	mkdb_tags "2083||vless|{}|$(reality "$KEY_OWN")|1" '8443||vmess|{}|{}|1'
+	OWN_INBOUND_ID=1 REALITY_PORT=2083 MODE=nodomain
+	( port_taken_check ) || t_fail "без домена 8443 скрипту не нужен: $(cat "$WORK/out")"
+	MODE=domain
+	! ( port_taken_check ) || t_fail "с доменом 8443 нужен nginx, а на нём подключение панели — должен остановиться"
+	t_has "8443" "$(cat "$WORK/out")" "какой порт"
+	sql "update inbounds set port=2096 where id=2"; : > "$WORK/out"; MODE=nodomain
+	! ( port_taken_check ) || t_fail "порт подписки занят подключением панели — должен остановиться"
+	t_has "2096" "$(cat "$WORK/out")" "какой порт"
+}
+test_inbound_ports_local_mode() {  # для сверки портов нужны и подключения, слушающие только localhost; для фаервола — нет
+	xui_fns
+	mkdb '2083||vless|{}|{}|1' '8443|127.0.0.1|vless|{}|{}|1' '9000|::1|trojan|{}|{}|1' '9001|/run/x.sock|vless|{}|{}|1' '9002||vless|{}|{}|0'
+	t_eq "2083/tcp" "$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "фаерволу — только то, что слушает снаружи"
+	t_eq "2083/tcp 8443/tcp 9000/tcp" "$(xui_inbound_ports local | tr '\n' ' ' | sed 's/ $//')" "для сверки — и localhost; сокет и выключенное — нет"
+}
+
 test_inbound_move_touches_only_own() {  # --port переносит своё подключение — и только его
 	own_fns
 	mkdb_tags "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1" "2083|203.0.113.7|vless|{}|$REALITY|1"
@@ -2227,12 +2614,12 @@ test_tunnel_check_takes_own_client() {  # проверка туннеля — п
 		create table client_inbounds (client_id integer, inbound_id integer);
 		insert into clients (email, sub_id, enable) values ('чужой', 'subforeign', 1), ('свой-выключен', 'suboff', 0), ('свой', 'subown', 1), ('свой2', 'subown2', 1);
 		insert into client_inbounds values (1, 1), (2, 3), (3, 3), (4, 3);"
-	S_INBOUND_ID=3; t_eq subown "$(check_sub_id)" "первый включённый клиент своего подключения (#3)"
-	S_INBOUND_ID=''; t_eq subforeign "$(check_sub_id)" "настройки прежней версии — первый клиент панели, как раньше"
-	S_INBOUND_ID=0; t_eq subforeign "$(check_sub_id)" "своё подключение ещё не создано — как раньше"
-	S_INBOUND_ID=9; t_eq subforeign "$(check_sub_id)" "у своего подключения нет клиентов — как раньше"
+	OWN_INBOUND_ID=3; t_eq subown "$(check_sub_id)" "первый включённый клиент своего подключения (#3)"
+	OWN_INBOUND_ID=''; t_eq subforeign "$(check_sub_id)" "своего подключения нет — первый клиент панели, как раньше"
+	OWN_INBOUND_ID='' S_INBOUND_ID=3; t_eq subforeign "$(check_sub_id)" "записанный номер без найденного своего — не в счёт (под ним может быть чужое)"
+	OWN_INBOUND_ID=9; t_eq subforeign "$(check_sub_id)" "у своего подключения нет клиентов — как раньше"
 	sql "drop table client_inbounds"
-	S_INBOUND_ID=3; t_eq subforeign "$(check_sub_id)" "база без таблицы связей — как раньше"
+	OWN_INBOUND_ID=3; t_eq subforeign "$(check_sub_id)" "база без таблицы связей — как раньше"
 }
 
 # Копия базы чужого 3x-ui (пункт 7).
@@ -2342,10 +2729,10 @@ test_foreign_question_on_real_terminal() {  # настоящий термина�
 set -euo pipefail
 WORK=$WORK
 . "$ROOT/src/bot.sh"
-eval "\$(awk '/^(foreign_xui_check|foreign_on_port)\\(\\) \\{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+eval "\$(awk '/^(foreign_xui_check|foreign_on_port|service_ports|service_port_check|xui_inbound_ports)\\(\\) \\{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 warn() { printf '  ВНИМ. %s\\n' "\$*"; }
 die() { printf 'Остановлено: %s\\n' "\$*" >&2; exit 1; }
-DB=\$WORK/x-ui.db STATE=\$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
+DB=\$WORK/x-ui.db STATE=\$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG='' DOMAIN='' NO_DOMAIN=0 SUB_PORT=2096
 foreign_xui_check
 EOF
 	DB=$WORK/x-ui.db; mkdb '443||vless|{}|{}|1'
@@ -2379,6 +2766,107 @@ restore_ssh() {
 test_restore_ssh_header_only_with_content() {  # заголовок «SSH» без единой строки под ним — когда в бэкапе нет ни ключей, ни настроек SSH
 	t_eq "" "$(restore_ssh есть)" "печатать нечего — нет и заголовка"
 	t_eq $'== SSH\nWARN sshd не установлен — настройки SSH пропущены' "$(restore_ssh нет)" "есть что сказать — заголовок один раз, перед сообщением"
+}
+
+# Привязки к основному потоку установщика (пункт 3 второй порции). Функции проверены выше — эти тесты держат их вызовы:
+# без них «функцию забыли позвать» или «позвали не там» не видел ни один тест. Способ — номера строк шаблона, как в
+# test_decline_survives_state_reload. tl 'РЕГВЫР' [ПОСЛЕ] → номер первой подходящей строки шаблона после названной.
+tl() {
+	RE=$1 awk -v after="${2:-0}" 'NR > after && $0 ~ ENVIRON["RE"] {print NR; exit}' "$ROOT/src/install-vpn.sh.in"
+}
+in_order() {  # in_order 'что проверяется' N… — все номера строк нашлись и идут по возрастанию
+	local what=$1 prev=0 n
+	shift
+	for n; do
+		[[ $n =~ ^[0-9]+$ ]] && [ "$n" -gt "$prev" ] || t_fail "$what — строки шаблона не на месте: $*"
+		prev=$n
+	done
+}
+test_flow_firewall_step_is_called() {  # шаг фаервола: функция зовётся под своим заголовком, не при --no-ufw, и порты SSH к этому времени известны
+	local a b c d
+	a=$(tl '^say "Фаервол ufw"$'); d=$(tl '^if \[ "\$DO_UFW" = 1 \]; then$' "$a"); b=$(tl '^\tfw_step$' "$a"); c=$(tl '^say "' "$a")
+	in_order "fw_step — между заголовком «Фаервол ufw» и следующим шагом, под условием DO_UFW" "$a" "$d" "$b" "$c"
+	in_order "порты SSH и порт нынешнего входа известны до шага фаервола" "$(tl '^SSH_PORTS=\$\(ssh_ports\)$')" "$(tl '^SSH_NOW_PORT=\$\(ssh_conn_port\)')" "$a"
+}
+test_flow_port_checks_before_changes() {  # сверка портов с подключениями панели: до первых изменений и ещё раз — перед созданием подключения
+	local srv py late chk users pk api chk2 add find
+	srv=$(tl '^say "Проверка сервера"$'); py=$(tl 'install iproute2 curl ca-certificates python3 ' "$srv")
+	late=$(tl '^own_inbound_late$' "$py"); chk=$(tl '^port_taken_check( |$)' "$late"); users=$(tl 'port_users ' "$py"); pk=$(tl '^say "Пакеты"$' "$srv")
+	in_order "в «Проверке сервера»: python3 → своё подключение → сверка с панелью → кто слушает порт → дальше" "$srv" "$py" "$late" "$chk" "$users" "$pk"
+	api=$(tl '^api_open$' "$pk"); chk2=$(tl '^port_taken_check( |$)' "$api"); add=$(tl 'api POST inbounds/add ' "$api")
+	in_order "перед созданием подключения — ещё раз" "$api" "$chk2" "$add"
+	find=$(tl '^find_own_inbound$')
+	in_order "первый поиск своего подключения — в начале, до сброса неудачной попытки и выбора порта" \
+		"$find" "$(tl '^if \[ "\$\{MODE_CHANGED:-0\}" = 1 \]; then$' "$find")" "$(tl 'REALITY_PORT=\$\{OLD_REALITY_PORT:-' "$find")" "$srv"
+}
+test_flow_created_inbound_known_by_key_and_saved() {  # своё подключение — найденное по ключу; «то, что стоит на порту» своим не становится;
+	# номер созданного — сразу в настройки
+	local f=$ROOT/src/install-vpn.sh.in api chk have add okl find sid
+	api=$(tl '^api_open$' "$(tl '^say "3x-ui: подписка')"); chk=$(tl '^port_taken_check( |$)' "$api")
+	have=$(tl '^if \[ -n "\$OWN_INBOUND_ID" \]; then$' "$chk"); add=$(tl 'api POST inbounds/add ' "$have")
+	okl=$(tl 'api_ok <<<"\$RESP" \|\| die ' "$add"); find=$(tl '^\tfind_own_inbound( |$)' "$okl"); sid=$(tl '^S_INBOUND_ID=\$OWN_INBOUND_ID$' "$find")
+	in_order "создавать ли подключение, решает найденное своё; номер созданного — поиском по ключу" "$api" "$chk" "$have" "$add" "$okl" "$find" "$sid"
+	t_eq "save_state" "$(sed -n "$((sid + 1))p" "$f")" "номер записывается в настройки сразу"
+	! grep -nE 'INBOUND_ID=.*select id from inbounds where port' "$f" || t_fail "номер подключения берётся запросом по порту — так своим становилось чужое"
+}
+test_flow_foreign_db_copy_before_changes() {  # копия базы чужого 3x-ui — средствами SQLite (foreign_db_copy), сразу после чтения настроек, до изменений
+	local f=$ROOT/src/install-vpn.sh.in st el cp save stop a b
+	st=$(tl '^\t\. "\$STATE"$' "$(tl '^say "Пакеты"$')"); el=$(tl '^elif \[ "\$FOREIGN_XUI" = 1 \]; then' "$st"); cp=$(tl '^\tforeign_db_copy$' "$el")
+	save=$(tl '^save_state$' "$st"); stop=$(tl '^xui_stop$' "$st")
+	in_order "foreign_db_copy — в ветке чужого 3x-ui, до первой записи настроек и до остановки панели" "$st" "$el" "$cp" "$save" "$stop"
+	a=$(tl '^foreign_db_copy\(\) \{'); b=$(tl '^}$' "$a")
+	# Имя копии («…before-install-…») встречается только внутри foreign_db_copy: мимо неё (cp -a) копию никто не делает.
+	t_eq "" "$(grep -n 'before-install-' "$f" | awk -F: -v a="$a" -v b="$b" '$1 < a || $1 > b' | head -3)" "копия базы делается в обход foreign_db_copy"
+	grep -q '^	db_copy "\$DB" ' <(sed -n "${a},${b}p" "$f") || t_fail "foreign_db_copy копирует базу не через db_copy"
+}
+test_flow_port_move_only_own_inbound() {  # --port переносит подключение по номеру своего, найденного по ключу, — и только если оно найдено
+	local f=$ROOT/src/install-vpn.sh.in m cond mv
+	m=$(tl '^MOVED_FROM=$'); cond=$(tl '^if \[ -n "\$OLD_REALITY_PORT" \] && \[ "\$OLD_REALITY_PORT" != "\$REALITY_PORT" \]; then$' "$m"); mv=$(tl 'inbound_move ' "$m")
+	in_order "перенос — под условием «своё подключение есть и стоит на другом порту»" "$m" "$cond" "$mv" "$(tl '^fi$' "$cond")"
+	case $(sed -n "${mv}p" "$f") in
+		*'inbound_move "$OWN_INBOUND_ID" "$OLD_REALITY_PORT" "$REALITY_PORT" '*) ;;
+		*) t_fail "перенос подключения — не по номеру своего: $(sed -n "${mv}p" "$f")" ;;
+	esac
+	t_eq 1 "$(grep -c '^[^#]*inbound_move "' "$f")" "вызов inbound_move один"
+}
+test_failed_attempt_is_forgotten() {  # смена варианта после неудачной первой установки: от прошлой попытки в памяти не остаётся ничего —
+	# в том числе номера подключения (он попал бы в новые настройки, хотя своего подключения ещё нет)
+	local a
+	own_fns
+	state_put "S_MODE='domain'" "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='4'"
+	S_MODE=domain S_DOMAIN_OLD=old.example.com S_EXIT=warp S_REALITY_PORT=2084 S_INBOUND_ID=4 CHAIN_IP=203.0.113.9 CHAIN_SSH_PORT=2222
+	OWN_INBOUND_ID=4 OLD_REALITY_PORT=2084 OWN_KEY=$KEY_OWN
+	forget_failed_state
+	[ ! -e "$STATE" ] || t_fail "настройки неудачной попытки остались на месте"
+	compgen -G "$STATE.failed-*" > /dev/null || t_fail "от неудачной попытки не осталось следа — свой 3x-ui потом сойдёт за чужой"
+	t_eq "|||0||" "$S_MODE|$S_DOMAIN_OLD|$S_REALITY_PORT|$S_INBOUND_ID|$CHAIN_IP|$CHAIN_SSH_PORT" "прошлые настройки забыты, номер подключения — «ещё не создано»"
+	t_eq "||" "$OWN_INBOUND_ID|$OLD_REALITY_PORT|$OWN_KEY" "и своего подключения больше нет"
+	MODE=nodomain DOMAIN='' PANEL_USER=u PANEL_PASS=p WEB_PORT=54321 WEB_PATH=/w/ SUB_PATH=/s/ CLASH_PATH=/c/ JSON_PATH=/j/ EXIT_MODE=direct
+	save_state
+	t_eq 0 "$(state_val S_INBOUND_ID)" "в новые настройки номер прошлой попытки не попал"
+	a=$(tl '^reset_failed_attempt\(\) \{')
+	in_order "reset_failed_attempt зовёт forget_failed_state, а её саму зовут при смене варианта" \
+		"$a" "$(tl '^\tforget_failed_state$' "$a")" "$(tl '^}$' "$a")" "$(tl '^if \[ "\$\{MODE_CHANGED:-0\}" = 1 \]; then$' "$a")" "$(tl '^\treset_failed_attempt$' "$a")"
+}
+test_flow_own_inbound_settled_after_state_read() {  # номер и ключ своего подключения выставляются сразу после чтения настроек — до их первой записи
+	local st own
+	st=$(tl '^\t\. "\$STATE"$' "$(tl '^say "Пакеты"$')"); own=$(tl '^own_to_settings( |$)' "$st")
+	in_order "own_to_settings — между чтением настроек и их первой записью, раньше генерации ключей" \
+		"$st" "$own" "$(tl '^save_state$' "$st")" "$(tl '^if \[ -z "\$\{REALITY_PRIV:-\}" \]; then$' "$st")"
+}
+test_flow_ip_cert_port80_before_issue() {  # сертификат на IP: порт 80 в ufw проверяется перед выпуском; что открыл скрипт — он же убирает при неудаче
+	local a b c d
+	a=$(tl '^issue_ip_cert\(\) \{'); b=$(tl '^\tip_cert_port80$' "$a"); c=$(tl '"\$ACME" --issue ' "$a"); d=$(tl '\[ "\$OPENED80" = 0 \] \|\| ufw delete allow 80/tcp' "$c")
+	in_order "ip_cert_port80 — в issue_ip_cert, до выпуска; при неудаче правило убирается" "$a" "$b" "$c" "$d" "$(tl '^}$' "$a")"
+}
+test_every_ufw_status_is_asked_in_english() {  # «ufw status» читается по-английски, а ufw (Python, gettext) переводит ответ по LANGUAGE даже при
+	# LC_ALL=C: каждый вызов в шаблоне — с «LANGUAGE=C LC_ALL=C». Упоминания в сообщениях (после ok/warn/bad/die/echo) — не вызовы.
+	local f=$ROOT/src/install-vpn.sh.in bad calls
+	bad=$(grep -n 'ufw status' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' | sed 's/LANGUAGE=C LC_ALL=C ufw status//g' |
+		{ grep 'ufw status' || true; } | { grep -vE '(^|[^[:alnum:]_])(ok|warn|bad|die|echo|printf) +["'"'"'][^"'"'"']*ufw status' || true; })
+	t_eq "" "$bad" "вызов «ufw status» без LANGUAGE=C LC_ALL=C"
+	calls=$(grep -c 'LANGUAGE=C LC_ALL=C ufw status' "$f")
+	[ "$calls" -ge 2 ] || t_fail "вызовов «LANGUAGE=C LC_ALL=C ufw status» в шаблоне: $calls — страж ничего не сторожит"
 }
 
 # ——— запуск под sudo: SSH_CONNECTION стёрта, а знать о своём входе скрипту нужно ———
@@ -2421,6 +2909,9 @@ restore_fw() {  # restore_fw 'ПОРТЫ' — шаг «Фаервол ufw» из
 	[ -n "$code" ] || t_fail "шаг «Фаервол ufw» в restore.sh не найден"
 	: > "$WORK/ufw.calls"
 	(
+		set -euo pipefail   # как сам restore.sh: шаг не должен обрываться молча
+		eval "$(awk '/^sshd_listen_ports\(\) \{/,/^}/' "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh")"
+		ss() { cat "$WORK/ss.out" 2> /dev/null || true; }
 		say() { :; }
 		ok() { echo "OK $*"; }
 		warn() { echo "WARN $*"; }
@@ -2435,7 +2926,9 @@ restore_fw() {  # restore_fw 'ПОРТЫ' — шаг «Фаервол ufw» из
 		inbound_ports() { echo 2083/tcp; }
 		DO_UFW=1 HAS_NGINX=0 DOMAIN=vpn.example.com DB=$WORK/x.db FAIL_ALLOW=$1
 		export SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222'
+		[ "${NO_SSH_CONNECTION:-0}" != 1 ] || unset SSH_CONNECTION
 		eval "$code"
+		echo "ШАГ ДОШЁЛ ДО КОНЦА"
 	)
 }
 test_restore_fw_ssh_allow_failure_leaves_ufw_off() {  # не разрешился порт SSH — ufw не включать: на новый сервер после переезда было бы не войти
@@ -2453,6 +2946,62 @@ test_restore_fw_ssh_allow_failure_leaves_ufw_off() {  # не разрешилс�
 	out=$(restore_fw "2083/tcp")   # не SSH — как раньше: сказать и включить (без VPN-порта перенос и так считается неудачным)
 	grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "сбой не на порту SSH не должен мешать включению"
 	t_has "BAD ufw allow 2083/tcp" "$out" "сбой назван"
+}
+
+# ——— ревью 12.11, вторая порция: ядро установщика ———
+# restore.sh (пункт 11): разбор подключений панели — тот же, что в установщике; порты SSH — и те, что sshd слушает на деле.
+ODD_ROWS=('2083||vless|{}|{"network":"xhttp","security":"reality"}|1'
+	'8443||vmess|null|null|1' '8444||trojan|[]|[]|1' '8445||vless|"x"|"y"|1'
+	'8446||vless|{}|{"network":"ws","tlsSettings":"не объект"}|1' '8447||shadowsocks|[1]|{}|1'
+	'8448||vless|{}|{"network":"xhttp","tlsSettings":{"alpn":["h3"]}}|1' '8449||vless|{не json|{и это тоже|1'
+	'51820||wireguard|null|null|1' '1080||shadowsocks|{"network":"tcp,udp"}|{}|1' '1081||mixed|{"udp":true}|{}|1'
+	'4443||vless|{}|{"network":"kcp"}|1' '9000|127.0.0.1|vless|{}|{"network":"ws"}|1' '9001||trojan|{}|{}|0' '9002|::1|vless|{}|{}|1')
+test_restore_inbound_ports_same_as_installer() {  # в restore.sh был свой разбор со старой слабостью: строка с null роняла его, и restore обрывался на шаге фаервола
+	local want got
+	xui_fns
+	mkdb "${ODD_ROWS[@]}"
+	want=$(xui_inbound_ports)
+	t_has "8443/tcp" "$want" "образец — разбор установщика"
+	eval "$(awk '/^inbound_ports\(\) \{/,/^}/' "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh")"
+	got=$(inbound_ports "$DB") || t_fail "inbound_ports из restore.sh упал на странной строке базы"
+	t_eq "$want" "$got" "restore.sh и установщик называют одни и те же порты"
+}
+test_restore_fw_opens_port_sshd_listens_on() {  # порт, заданный не в sshd_config (ssh.socket), restore узнаёт по тому, что sshd слушает на деле
+	local out
+	cat > "$WORK/ss.out" <<'EOF'
+LISTEN 0      128          0.0.0.0:2200      0.0.0.0:*    users:(("sshd",pid=999999901,fd=3))
+LISTEN 0      128        127.0.0.1:6010      0.0.0.0:*    users:(("sshd",pid=999999902,fd=9))
+LISTEN 0      511          0.0.0.0:443       0.0.0.0:*    users:(("nginx",pid=999999903,fd=6))
+EOF
+	out=$(restore_fw "")
+	grep -qx 'allow 2200/tcp' "$WORK/ufw.calls" || t_fail "порт, который слушает sshd, не разрешён: $(tr '\n' ';' < "$WORK/ufw.calls")"
+	! grep -qx 'allow 6010/tcp' "$WORK/ufw.calls" || t_fail "порт на localhost (проброс X11) разрешён как порт SSH"
+	grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "ufw не включён"
+	out=$(restore_fw "2200/tcp")
+	! grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "ufw включён, хотя порт 2200, который слушает sshd, не разрешился"
+	t_has "2200" "$out" "порт назван"
+}
+test_restore_sshd_listen_ports_skips_session_forwards() {  # копия функции в restore.sh: проброс сеанса («ssh -R») — не порт SSH, открывать его незачем
+	local n
+	eval "$(awk '/^sshd_listen_ports\(\) \{/,/^}/' "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh")"
+	declare -F sshd_listen_ports > /dev/null || t_fail "в restore.sh нет sshd_listen_ports"
+	ss() { cat "$WORK/ss.out"; }
+	sshd_session_fixture
+	n=$(sshd_listen_ports | tr '\n' ' ')
+	# shellcheck disable=SC2086  # два pid — по словам
+	kill $SSHD_FIXTURE_PIDS 2> /dev/null || true
+	t_eq "2233 " "$n" "только порт самого sshd, без портов, проброшенных его сеансом"
+}
+test_restore_fw_runs_outside_ssh_session() {  # restore запущен не из сеанса SSH (консоль хостера, sudo): шаг не должен обрываться
+	local out rc
+	set +e   # не «… || t_fail»: в условии bash выключает set -e и внутри шага, и обрыв не был бы виден
+	out=$(NO_SSH_CONNECTION=1 restore_fw "")
+	rc=$?
+	set -e
+	[ "$rc" = 0 ] || t_fail "шаг фаервола оборвался без SSH_CONNECTION (под set -e — молча, на полпути restore): код $rc"
+	t_has "ШАГ ДОШЁЛ ДО КОНЦА" "$out" "шаг выполнен целиком"
+	grep -qx 'allow 22/tcp' "$WORK/ufw.calls" || t_fail "порт SSH из sshd -T не разрешён"
+	grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "ufw не включён"
 }
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———

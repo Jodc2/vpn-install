@@ -242,6 +242,80 @@ r = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute(
 print(r[0] if r else "")' "$DB" "$1" "${2:-0}" 2> /dev/null ||
 		sqlite3 -readonly "$DB" "select id from inbounds where port=$((10#$1)) and id<>$((10#${2:-0})) order by id limit 1;" 2> /dev/null || true
 }
+xui_inbound_ports() {  # xui_inbound_ports [local] → «порт/протокол» включённых подключений панели, которые слушают не только
+	# localhost (это нужно фаерволу); с «local» — и тех, что слушают только localhost (это нужно сверке портов).
+	# Код 1 — база есть, а прочитать её не вышло: «подключений нет» и «не знаю» — разные ответы.
+	[ -f "$DB" ] || return 0
+	python3 -I - "$DB" "${1:-}" <<'PY' 2>/dev/null
+import json, sqlite3, sys
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+local = sys.argv[2] == "local"
+
+
+def obj(text):  # JSON-объект из поля базы; всё остальное (null, список, строка, не JSON) — пустой объект
+    try:
+        v = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def kinds_of(proto, st, ss):  # что слушает подключение: tcp, udp или оба
+    proto = str(proto or "").lower()
+    net = str(ss.get("network") or "tcp").lower()
+    tls = ss.get("tlsSettings")
+    alpn = (tls.get("alpn") if isinstance(tls, dict) else None) or []
+    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
+        return {"udp"}
+    if net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
+        return {"tcp", "udp"}
+    if proto in ("shadowsocks", "dokodemo-door", "tunnel"):
+        n = str(st.get("network") or "tcp").lower()
+        return {k for k in ("tcp", "udp") if k in n} or {"tcp"}
+    if proto in ("mixed", "socks"):
+        return {"tcp", "udp"} if st.get("udp") else {"tcp"}
+    return {"tcp"}
+
+
+out = set()
+for port, listen, proto, settings, stream, enable in db.execute(
+        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
+    listen = str(listen or "").strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        continue
+    if not enable or port <= 0 or listen.startswith(("/", "@")):   # выключено; unix-сокет порта не занимает
+        continue
+    if not local and (listen.startswith("127.") or listen in ("::1", "[::1]", "localhost")):
+        continue
+    try:
+        kinds = kinds_of(proto, obj(settings), obj(stream))
+    except Exception:   # строку не разобрать — порт всё равно не терять (считаем его TCP), остальные строки читаем дальше
+        kinds = {"tcp"}
+    out.update((port, k) for k in kinds)
+for port, kind in sorted(out):
+    print("%d/%s" % (port, kind))
+PY
+}
+service_ports() {  # service_ports РЕЖИМ → «порт|зачем он скрипту»: порты, которые скрипт занимает сам (кроме порта своего подключения)
+	echo "$SUB_PORT|под подписку (её отдаёт сама панель)"
+	[ "$1" = domain ] || return 0
+	echo "80|под nginx — выпуск и продление сертификата"
+	echo "443|под nginx — сайт, панель и подписка по адресу домена"
+	echo "8443|под nginx — внутренний порт сайта, под который маскируется VPN"
+}
+service_port_check() {  # service_port_check РЕЖИМ [ХВОСТ] — на порту, который скрипт займёт сам, у панели есть включённое подключение:
+	# остановиться, пока ничего не изменено. Иначе (проверено на настоящих x-ui и Xray) не поднимается либо Xray — и не
+	# работает ни одно подключение, чужое и своё, — либо сама панель.
+	local p why busy
+	busy=$(xui_inbound_ports local) || return 0   # базу не прочитать — сверить не с чем
+	[ -n "$busy" ] || return 0
+	while IFS='|' read -r p why; do
+		! grep -qx "$p/tcp" <<<"$busy" ||
+			die "в панели есть включённое подключение на порту $p, а этот порт нужен скрипту $why. Вдвоём на одном порту они не уживутся: не поднимется либо Xray со всеми подключениями, либо сама панель. Перенесите то подключение на другой порт (в панели) и запустите скрипт ещё раз — или ставьте VPN на чистый сервер.${2:+ $2}"
+	done < <(service_ports "$1")
+}
 foreign_xui_check() {  # 3x-ui здесь ставили без этого скрипта: сказать, что будет, и спросить сразу — до любых вопросов и изменений
 	local n msg p=${PORT_ARG:-2083}
 	[ -f "$DB" ] && [ ! -f "$STATE" ] || return 0
@@ -250,6 +324,8 @@ foreign_xui_check() {  # 3x-ui здесь ставили без этого ск�
 	if [[ $p =~ ^[0-9]{1,5}$ ]] && [ -n "$(foreign_on_port "$p")" ]; then
 		die "здесь уже есть 3x-ui, поставленный не этим скриптом, и на порту $p у него есть подключение. Своё подключение скрипт создаёт на этом порту, а чужие не трогает — запустите с другим портом: bash $0 --port N. Ничего не менял"
 	fi
+	# То же — для портов, которые скрипт займёт сам: подписка, а с доменом (если он уже назван опцией) — ещё и nginx.
+	service_port_check "$([ -n "$DOMAIN" ] && [ "$NO_DOMAIN" != 1 ] && echo domain || echo nodomain)" "Ничего не менял."
 	n=$(python3 -I -c 'import sqlite3, sys; print(sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select count(*) from inbounds").fetchone()[0])' "$DB" 2> /dev/null ||
 		sqlite3 -readonly "$DB" 'select count(*) from inbounds;' 2> /dev/null || echo '?')
 	msg="здесь уже есть 3x-ui, поставленный не этим скриптом (подключений: $n). Удалять его скрипт не будет: подключения и клиенты останутся, их порты фаервол не закроет. Заменятся логин, пароль, порт и путь панели, шаблон Xray (маршрутизация), адреса подписок и сама программа — на 3x-ui $XUI_VERSION. Копия базы останется рядом с ней"
@@ -329,42 +405,85 @@ else
 	fi
 fi
 # Порт подключения Reality — как у основного сервера, 2083, с доменом и без (--port меняет).
-# Своё подключение — то, чей id скрипт записал в настройки установки, когда создал его (S_INBOUND_ID). 0 — ещё не создано:
-# первый запуск (в том числе поверх чужого 3x-ui) или прошлая попытка до него не дошла. Подключения, которые были в панели
-# до скрипта, своими не считаются никогда: он их не переносит и не трогает.
-# В настройках прежних версий id нет — там, как и раньше, своим считается первое VLESS + Reality в базе: иначе установка
-# прежней версией (без домена ставила 443) получила бы второе подключение.
-own_inbound() {  # → «id порт» своего подключения; пусто — его нет
-	[ "$S_INBOUND_ID" != 0 ] && [ -f "$DB" ] && command -v python3 >/dev/null 2>&1 || return 0
-	python3 - "$DB" "$S_INBOUND_ID" <<'PY' 2>/dev/null || true
-import json, sqlite3, sys
+# Своё подключение — то, в котором стоит ключ Reality из настроек установки (REALITY_PRIV): ключ скрипт генерирует сам и
+# хранит только там, так что подключение с этим ключом создано им. Номер подключения (S_INBOUND_ID) записывается рядом, но
+# одного номера мало: базу панели могут вернуть из копии (оборванный первый запуск), сбросить или заменить, и тот же
+# номер достанется чужому подключению. Подключение с записанным номером, но другим ключом — не своё.
+# Подключения, которые были в панели до скрипта, своими не считаются никогда: он их не переносит и не трогает.
+# В настройках самых первых версий нет ни ключа, ни номера — только там, как и раньше, своим считается первое
+# VLESS + Reality в базе (иначе та установка получила бы второе подключение), и его ключ становится ключом установки.
+own_inbound() {  # own_inbound КЛЮЧ НОМЕР → «номер порт ключ» своего подключения; «-» — его нет; пусто — базу не прочитать
+	[ -f "$DB" ] || { echo -; return 0; }
+	command -v python3 >/dev/null 2>&1 || return 0
+	# Ключ — через окружение, а не аргументом: аргументы процесса видны всем пользователям сервера (ps).
+	OWN_KEY_WANT=$1 python3 -I - "$DB" "$2" <<'PY' 2>/dev/null || true
+import json, os, sqlite3, sys
+key, want = os.environ.get("OWN_KEY_WANT", ""), sys.argv[2]
 db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-if sys.argv[2]:   # id известен: своё — только оно
-    for row in db.execute("select id, port from inbounds where id=?", (int(sys.argv[2]),)):
-        print(*row)
-    sys.exit()
-for iid, port, ss in db.execute("select id, port, stream_settings from inbounds where protocol='vless' order by id"):
+rows = []   # (номер, порт, протокол, ключ Reality) подключений с Reality
+for iid, port, proto, ss in db.execute("select id, port, protocol, stream_settings from inbounds order by id"):
     try:
-        if json.loads(ss or "{}").get("security") == "reality":
-            print(iid, port)
-            break
-    except (ValueError, AttributeError):
-        pass
+        s = json.loads(ss or "{}")
+        if s.get("security") != "reality":
+            continue
+        priv = (s.get("realitySettings") or {}).get("privateKey")
+        rows.append((int(iid), int(port), str(proto or "").lower(), priv if isinstance(priv, str) else ""))
+    except (TypeError, ValueError, AttributeError):   # не JSON, не объект, порт не число — такую строку пропустить
+        continue
+if key:           # своё — только подключение с ключом из настроек (если таких несколько — то, чей номер записан)
+    mine = sorted((r for r in rows if r[3] == key), key=lambda r: str(r[0]) != want)
+elif not want:    # в настройках нет ни ключа, ни номера (самые первые версии): первое VLESS + Reality, как раньше
+    mine = [r for r in rows if r[2] == "vless"]
+else:             # номер без ключа проверить нечем («0» — подключение ещё не создавалось)
+    mine = []
+if mine:
+    print(mine[0][0], mine[0][1], mine[0][3] or "-")
+else:
+    print("-")
 PY
 }
-find_own_inbound() {  # → S_INBOUND_ID (из настроек), OWN_INBOUND_ID и OLD_REALITY_PORT (id и нынешний порт своего подключения)
+find_own_inbound() {  # → OWN_INBOUND_ID и OLD_REALITY_PORT (номер и нынешний порт своего подключения; пусто — его нет),
+	# OWN_KEY (его ключ Reality), S_INBOUND_ID (номер для настроек: найденного подключения; 0 — записанный не подтвердился),
+	# OWN_KNOWN (0 — базу панели было нечем прочитать: своё не найдено, но и «не своим» ничего не объявлено)
+	local got
 	S_INBOUND_ID=$(state_val S_INBOUND_ID || true)
 	[[ $S_INBOUND_ID =~ ^[0-9]+$ ]] || S_INBOUND_ID=
+	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_KNOWN=1
 	# Настроек установки нет — чистый сервер, чужой 3x-ui или сброшенная неудачная попытка: своего подключения ещё нет.
-	[ -f "$STATE" ] || S_INBOUND_ID=0
-	OWN_INBOUND_ID='' OLD_REALITY_PORT=''
-	read -r OWN_INBOUND_ID OLD_REALITY_PORT <<<"$(own_inbound)" || true
+	if [ ! -f "$STATE" ]; then S_INBOUND_ID=0; return 0; fi
+	got=$(own_inbound "$(state_val REALITY_PRIV || true)" "$S_INBOUND_ID")
+	if [ -z "$got" ]; then OWN_KNOWN=0; return 0; fi
+	read -r OWN_INBOUND_ID OLD_REALITY_PORT OWN_KEY <<<"$got" || true
+	if [[ $OWN_INBOUND_ID =~ ^[1-9][0-9]*$ ]] && [[ $OLD_REALITY_PORT =~ ^[0-9]+$ ]]; then
+		S_INBOUND_ID=$OWN_INBOUND_ID
+		[ "$OWN_KEY" != - ] || OWN_KEY=''
+	else
+		OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY=''
+		S_INBOUND_ID=${S_INBOUND_ID:+0}   # записанный номер не подтвердился — он больше ничей; не было номера — так и нет
+	fi
 }
-port_taken_check() {  # порт своего подключения занят в панели другим — остановиться, пока ничего не изменено
-	local other
-	[ -n "$S_INBOUND_ID" ] || return 0   # настройки прежней версии: своё подключение там — по признакам, как раньше
-	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-$S_INBOUND_ID}")   # своё — и то, что в начале было нечем прочитать
-	[ -z "$other" ] || die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N"
+own_inbound_late() {  # python3 только что поставлен: если в начале запуска базу панели было нечем прочитать — прочитать сейчас.
+	# Иначе своё подключение сошло бы за чужое («порт занят») или переехало бы на порт из настроек.
+	[ "$OWN_KNOWN" != 1 ] || return 0
+	find_own_inbound
+	[ -n "$PORT_ARG" ] || REALITY_PORT=${OLD_REALITY_PORT:-$REALITY_PORT}
+}
+own_to_settings() {  # сразу после чтения настроек ($STATE): номер своего подключения — подтверждённый ключом (find_own_inbound),
+	# а не просто записанный. В настройках самых первых версий ключа нет — там ключ установки берётся из найденного
+	# подключения: иначе скрипт сгенерировал бы новый, и на следующем запуске своё подключение перестал бы узнавать.
+	S_INBOUND_ID=${OWN_INBOUND_ID:-${S_INBOUND_ID:+0}}
+	[ -n "${REALITY_PRIV:-}" ] || REALITY_PRIV=$OWN_KEY
+}
+port_taken_check() {  # порт своего подключения или порт, который скрипт занимает сам, занят в панели другим подключением —
+	# остановиться, пока ничего не изменено
+	local other why=""
+	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-0}")
+	if [ -n "$other" ]; then
+		# Повторный запуск: подсказать, почему подключение на своём же порту могло оказаться «другим».
+		[ ! -f "$STATE" ] || why=" Своё подключение скрипт узнаёт по ключу Reality из $STATE — в этом такого ключа нет."
+		die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N.$why"
+	fi
+	service_port_check "$MODE"   # и порты, которые скрипт занимает сам: подписка, с доменом — nginx
 }
 inbound_move() {  # inbound_move ID СТАРЫЙ_ПОРТ НОВЫЙ_ПОРТ — перенести своё подключение, и только его (x-ui остановлен)
 	# Имя подключения 3x-ui содержит порт (in-2083-tcp, в старых версиях inbound-2083) — заменить в нём номер.
@@ -380,6 +499,13 @@ PY
 }
 find_own_inbound
 S_REALITY_PORT=$(state_val S_REALITY_PORT || true)
+forget_failed_state() {  # настройки неудачной попытки — в сторону (по этому следу foreign_xui_check потом узнает свой 3x-ui),
+	# а в памяти от них не остаётся ничего: дальше установка идёт как на чистом сервере. В том числе номер подключения —
+	# иначе он попал бы в новые настройки, хотя своего подключения ещё нет.
+	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"
+	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' S_INBOUND_ID=0 CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
+	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY=''
+}
 reset_failed_attempt() {  # смена варианта после неудачной первой установки: убрать то, что успела сделать прошлая попытка
 	local d=$S_DOMAIN_OLD ip
 	ip=$(state_val S_IP_CERT_IP || true)
@@ -394,8 +520,7 @@ reset_failed_attempt() {  # смена варианта после неудач�
 		[ ! -x /root/.acme.sh/acme.sh ] || /root/.acme.sh/acme.sh --remove -d "$ip" --ecc >/dev/null 2>&1 || true
 		rm -rf "/root/.acme.sh/${ip}_ecc" /etc/x-ui/ip-cert
 	fi
-	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"   # по этому следу foreign_xui_check потом узнает свой 3x-ui
-	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' S_INBOUND_ID=0 CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
+	forget_failed_state
 	exit_ssh_defaults
 }
 if [ "${MODE_CHANGED:-0}" = 1 ]; then
@@ -579,18 +704,15 @@ ufw_state() {  # → active | inactive | unknown. «Выключен» — то�
 		*) echo unknown ;;
 	esac
 }
-ufw_active() {  # ufw включён?
-	[ "$(ufw_state)" = active ]
-}
-ufw_allows_tcp() {  # ufw_allows_tcp ПОРТ — в правилах ufw уже есть разрешение (allow или limit) входящего TCP на этот порт,
-	# пусть и только с одного адреса. Правила — из файлов ufw: «ufw status» у правила по имени приложения (OpenSSH) порт
+ufw_allows() {  # ufw_allows ПОРТ [tcp|udp] — в правилах ufw уже есть разрешение (allow или limit) входящих на этот порт по
+	# этому протоколу (не назван — TCP), пусть и только с одного адреса. Правила — из файлов ufw: «ufw status» у правила по имени приложения (OpenSSH) порт
 	# не называет, а в файле он есть всегда. Строка правила (ufw 0.36, проверено на настоящем):
 	#   ### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 in
 	# — действие, протокол, порты («22», «80,443», «6000:6007», «any»), куда, порты источника, откуда, [приложения,] направление.
 	# Файлов нет или они другого вида — «правила нет», и скрипт разрешит порт сам, как делал всегда.
 	# shellcheck disable=SC2086  # файлов два — по словам
-	{ cat $UFW_RULES 2>/dev/null || true; } | awk -v p="$1" '
-		$1 == "###" && $2 == "tuple" && $4 ~ /^(allow|limit)/ && ($5 == "tcp" || $5 == "any") {
+	{ cat $UFW_RULES 2>/dev/null || true; } | awk -v p="$1" -v proto="${2:-tcp}" '
+		$1 == "###" && $2 == "tuple" && $4 ~ /^(allow|limit)/ && ($5 == proto || $5 == "any") {
 			dir = ($NF ~ /^comment=/) ? $(NF - 1) : $NF
 			if (dir != "in" && (dir !~ /^in_/ || dir == "in_lo")) next   # исходящие, пересылка и «только на lo» — не про вход снаружи
 			n = split($6, a, ",")
@@ -1091,8 +1213,8 @@ check_sub_id() {  # subId клиента, по ссылке которого п�
 	# У чужих подключений панели свои клиенты и свои адреса в ссылках — проверка по ним была бы не о том. Своё подключение
 	# неизвестно (настройки прежних версий) или клиентов у него нет — первый включённый клиент панели, как раньше.
 	local sid=""
-	if [[ ${S_INBOUND_ID:-} =~ ^[1-9][0-9]*$ ]]; then
-		sid=$(sqlite3 -readonly "$DB" "select c.sub_id from clients c join client_inbounds ci on ci.client_id = c.id where ci.inbound_id = $S_INBOUND_ID and c.enable = 1 and c.sub_id <> '' order by c.id limit 1;" 2>/dev/null || true)
+	if [[ ${OWN_INBOUND_ID:-} =~ ^[1-9][0-9]*$ ]]; then
+		sid=$(sqlite3 -readonly "$DB" "select c.sub_id from clients c join client_inbounds ci on ci.client_id = c.id where ci.inbound_id = $OWN_INBOUND_ID and c.enable = 1 and c.sub_id <> '' order by c.id limit 1;" 2>/dev/null || true)
 	fi
 	[ -n "$sid" ] || sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;" 2>/dev/null || true)
 	echo "$sid"
@@ -2175,9 +2297,20 @@ acme_cron() {  # строка cron acme.sh: acme_cron 1 — раз в сутки
 	rm -f /root/.crontab.new
 }
 
+ip_cert_port80() {  # перед выпуском сертификата на IP: Let's Encrypt приходит на порт 80 — во включённом ufw он должен быть разрешён.
+	# → OPENED80=1, если правило добавил скрипт (сертификат не выдадут — он же его и уберёт)
+	OPENED80=0
+	[ "$(ufw_state)" = active ] || return 0
+	! ufw_allows 80 tcp || return 0   # разрешён — пусть и не отдельным правилом «80/tcp» (80,443/tcp, профиль приложения)
+	if [ "$DO_UFW" != 1 ]; then   # --no-ufw: фаервол скрипт не трогает — и здесь тоже. Сказать, чтобы открыли сами
+		warn "ufw включён, а порт 80 в нём не разрешён: по нему Let's Encrypt проверяет сервер, без него сертификат на IP не выдадут и не продлят. Фаервол скрипт не трогает (--no-ufw) — откройте порт сами: ufw allow 80/tcp"
+		return 0
+	fi
+	if ufw allow 80/tcp >/dev/null 2>&1; then OPENED80=1; fi
+}
 issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCERT_DIR; ошибка → IPCERT_ERR
 	IPCERT_ERR=
-	local rc=0 ca=letsencrypt log=$WORK/acme-ip.log opened80=0 have
+	local rc=0 ca=letsencrypt log=$WORK/acme-ip.log have
 	[ "$ACME_STAGING" = 1 ] && ca=letsencrypt_test
 	"${APT[@]}" install socat >/dev/null 2>&1 || { IPCERT_ERR="не установился socat (им acme.sh отвечает Let's Encrypt на :80)"; return 1; }
 	ensure_acme || { IPCERT_ERR="не скачался или не установился acme.sh $ACME_TAG"; return 1; }
@@ -2197,9 +2330,7 @@ issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCER
 		fi
 	fi
 	[ -z "$(port_users 80)" ] || { IPCERT_ERR="порт 80 занят ($(port_users 80)) — Let's Encrypt не сможет проверить сервер"; return 1; }
-	if ufw_active && ! grep -qE '^80/tcp +ALLOW' <<<"$(LANGUAGE=C LC_ALL=C ufw status 2>/dev/null || true)"; then
-		ufw allow 80/tcp >/dev/null 2>&1 && opened80=1
-	fi
+	ip_cert_port80
 	# Let's Encrypt проверяет сервер по http://IP/ — на время проверки acme.sh сам слушает :80 (socat).
 	# Сертификат на IP бывает только коротким (профиль shortlived, ~160 ч): продление через 2–3 дня.
 	"$ACME" --issue -d "$PUBLIC_IP" --standalone --httpport 80 --server "$ca" --cert-profile shortlived --days 3 \
@@ -2209,7 +2340,7 @@ issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCER
 		2) ok "сертификат на IP $PUBLIC_IP уже есть, продлевать рано" ;;
 		*)
 			IPCERT_ERR=$(grep -vE '^\s*$' "$log" | tail -3 | sed -E 's/^\[[^]]*\] //' | tr '\n' ' ' | cut -c1-320)
-			[ "$opened80" = 0 ] || ufw delete allow 80/tcp >/dev/null 2>&1 || true
+			[ "$OPENED80" = 0 ] || ufw delete allow 80/tcp >/dev/null 2>&1 || true
 			return 1
 			;;
 	esac
@@ -2417,6 +2548,8 @@ for try in 1 2 3 4 5 6; do
 	sleep 20
 done
 "${APT[@]}" install iproute2 curl ca-certificates python3 >/dev/null || die "не установились iproute2, curl, python3"
+own_inbound_late
+port_taken_check   # сначала — подключения панели: про них можно сказать точнее, чем «порт занят: xray»
 if [ "$MODE" = domain ]; then
 	for p in 80 443; do
 		u=$(port_users "$p")
@@ -2425,7 +2558,6 @@ if [ "$MODE" = domain ]; then
 fi
 u=$(port_users "$REALITY_PORT")
 case $u in "" | xray* | x-ui*) ;; *) die "порт $REALITY_PORT занят: $u— освободите его (на этом сервере не должно быть другого сайта)" ;; esac
-port_taken_check   # слушает xray — а чьё подключение? (python3 уже есть: базу есть чем прочитать)
 if [ "$MODE" = domain ]; then ok "порты 80, 443 и $REALITY_PORT свободны"; else ok "порт $REALITY_PORT свободен"; fi
 
 detect_ips
@@ -2470,6 +2602,7 @@ elif [ "$FOREIGN_XUI" = 1 ]; then   # чужой 3x-ui (согласие — в 
 	foreign_db_copy
 fi
 bot_keep_decision   # «нет» и --no-bot сказаны раньше, чем прочитаны прошлые настройки, — они главнее прочитанного
+own_to_settings     # номер своего подключения — подтверждённый ключом, а не просто прочитанный из настроек
 : "${PANEL_USER:=$(rnd "$LOWER$DIGITS" 10)}"
 : "${PANEL_PASS:=$(rnd "$LOWER${LOWER^^}$DIGITS" 22)}"
 : "${WEB_PORT:=$(free_port)}"
@@ -2935,9 +3068,8 @@ wait_port ":$WEB_PORT" 40 || die "панель x-ui не поднялась на
 # API панели — по одноразовому токену, после настройки токен удаляется.
 api_open
 port_taken_check   # ещё раз, перед самим созданием: панель уже работает, и база с начала запуска могла измениться
-INBOUND_ID=${OWN_INBOUND_ID:-$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")}
-if [ -n "$INBOUND_ID" ]; then
-	ok "подключение на :$REALITY_PORT уже есть (#$INBOUND_ID), клиенты прежние"
+if [ -n "$OWN_INBOUND_ID" ]; then
+	ok "подключение на :$REALITY_PORT уже есть (#$OWN_INBOUND_ID), клиенты прежние"
 else
 	if [ "$MODE" = domain ]; then TARGET=127.0.0.1:8443; SNI=$DOMAIN; else TARGET=$REALITY_SNI:443; SNI=$REALITY_SNI; fi
 	python3 - "$WORK/inbound.json" "$SNI" "$TARGET" "$SHARE_ADDR" "$REALITY_PORT" "$CLIENTS" "$REALITY_PRIV" "$REALITY_PUB" "$SHORT_IDS" <<'PY'
@@ -2968,15 +3100,17 @@ json.dump({"up": 0, "down": 0, "total": 0, "remark": "", "enable": True, "expiry
 PY
 	RESP=$(api POST inbounds/add -H 'Content-Type: application/json' --data-binary @"$WORK/inbound.json")
 	api_ok <<<"$RESP" || die "панель не приняла подключение: $RESP"
-	INBOUND_ID=$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")
+	# Созданное подключение — то, в котором ключ из настроек: его номер и записывается, а не «того, что стоит на порту».
+	find_own_inbound
+	[ -n "$OWN_INBOUND_ID" ] || die "панель приняла подключение, но в её базе его не видно — запустите скрипт ещё раз"
 	if [ "$MODE" = domain ]; then
 		ok "подключение VLESS + XHTTP + Reality на :$REALITY_PORT, клиентов: $CLIENTS"
 	else
 		ok "подключение VLESS + XHTTP + Reality на :$REALITY_PORT под $REALITY_SNI, клиентов: $CLIENTS"
 	fi
 fi
-# Своё подключение дальше узнаётся только по этому id — записать сразу, пока запуск не оборвался.
-S_INBOUND_ID=${INBOUND_ID:-$S_INBOUND_ID}
+# Номер своего подключения — в настройки сразу, пока запуск не оборвался.
+S_INBOUND_ID=$OWN_INBOUND_ID
 save_state
 
 if [ "$EXIT_MODE" != direct ] && [ "$HAVE_WARP" = 0 ]; then
@@ -3141,6 +3275,7 @@ EOF
 fi
 SSH_PORTS=$(ssh_ports)
 SSH_PORT=${SSH_PORTS%% *}
+SSH_NOW_PORT=$(ssh_conn_port)   # порт, через который вошли сейчас (пусто — не по SSH): фаервол его без разрешения не оставит
 SSH_LOGIN=root   # под кем входить в инструкциях: зашли через sudo (AWS, Oracle — ubuntu) — под тем же пользователем
 if [[ ${SUDO_USER:-} =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] && [ "$SUDO_USER" != root ]; then SSH_LOGIN=$SUDO_USER; fi
 
@@ -3186,77 +3321,50 @@ else
 	fi
 fi
 
-xui_inbound_ports() {  # «порт/протокол» включённых подключений панели, которые слушают не только localhost
-	[ -f "$DB" ] || return 0
-	python3 -I - "$DB" <<'PY' 2>/dev/null || true
-import json, sqlite3, sys
-db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-
-
-def obj(text):  # JSON-объект из поля базы; всё остальное (null, список, строка, не JSON) — пустой объект
-    try:
-        v = json.loads(text or "{}")
-    except (TypeError, ValueError):
-        return {}
-    return v if isinstance(v, dict) else {}
-
-
-def kinds_of(proto, st, ss):  # что слушает подключение: tcp, udp или оба
-    proto = str(proto or "").lower()
-    net = str(ss.get("network") or "tcp").lower()
-    tls = ss.get("tlsSettings")
-    alpn = (tls.get("alpn") if isinstance(tls, dict) else None) or []
-    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
-        return {"udp"}
-    if net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
-        return {"tcp", "udp"}
-    if proto in ("shadowsocks", "dokodemo-door", "tunnel"):
-        n = str(st.get("network") or "tcp").lower()
-        return {k for k in ("tcp", "udp") if k in n} or {"tcp"}
-    if proto in ("mixed", "socks"):
-        return {"tcp", "udp"} if st.get("udp") else {"tcp"}
-    return {"tcp"}
-
-
-out = set()
-for port, listen, proto, settings, stream, enable in db.execute(
-        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
-    listen = str(listen or "").strip()
-    try:
-        port = int(port)
-    except (TypeError, ValueError):
-        continue
-    if not enable or port <= 0 or listen.startswith(("127.", "/", "@")) or listen in ("::1", "[::1]", "localhost"):
-        continue
-    try:
-        kinds = kinds_of(proto, obj(settings), obj(stream))
-    except Exception:   # строку не разобрать — порт всё равно не терять (считаем его TCP), остальные строки читаем дальше
-        kinds = {"tcp"}
-    out.update((port, k) for k in kinds)
-for port, kind in sorted(out):
-    print("%d/%s" % (port, kind))
-PY
+listens_outside() {  # listens_outside ПОРТ — на этом TCP-порту кто-то слушает не только на localhost
+	{ ss -Htln 2>/dev/null || true; } | awk -v p="$1" '
+		{ n = split($4, a, ":") }
+		a[n] == p && $4 !~ /^(127\.|\[::1\])/ { found = 1 }
+		END { exit !found }'
 }
-fw_kept_ports() {  # ufw выключен (сам так ответил) — подключения панели сейчас доступны снаружи; их порты включённый ufw не должен закрыть
-	[ "$(ufw_state)" = inactive ] || return 0   # включён — его правила остаются как есть; не понять — лишнего не открываем
-	xui_inbound_ports
-}
-fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в ufw; 1 — не тронуто: на этом порту работает подключение панели
+fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в ufw; 1 — не тронуто: на этом порту работает подключение панели или
+	# снаружи слушает кто-то ещё (сайт хозяина сервера на :80) — скрипту порт не нужен, но и закрывать его не ему
 	case " $FW_INBOUND " in *" ${1%/*}/"*) return 1 ;; esac
+	! listens_outside "${1%/*}" || return 1
 	ufw delete allow "$1" >/dev/null 2>&1 || true
 }
 fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить
-	local KEEP OPEN KEPT CLOSING p pp state lost="" lost_ssh="" ssh_as_is="" opened=""
+	local KEEP="" OPEN KEPT CLOSING p pp state inb inb_ok=1 lost="" lost_ssh="" as_is="" ssh_ok="" ssh_left="" vpn_as_is="" vpn_opened="" opened=""
+	# Состояние ufw спрашивается один раз на весь шаг: от ответа зависит и что открывать, и можно ли включать. Два вопроса
+	# могли получить два разных ответа — и ufw включался без разрешений, которые по первому ответу были нужны.
 	state=$(ufw_state)
 	# Порты включённых подключений панели, слушающих не только localhost. Скрипт их не закрывает никогда, был ufw включён
 	# или нет: ни удалением разрешения (fw_close), ни включением ufw, в котором для них нет разрешения.
-	FW_INBOUND=$(xui_inbound_ports | tr '\n' ' ')
-	KEEP=$(fw_kept_ports | tr '\n' ' ')
-	# SSH. Когда ufw включает скрипт, разрешение для портов SSH обязательно. Когда ufw уже включён (или его состояние не
-	# понять) и для порта есть разрешающее правило — пусть только с адреса админа, — общее не добавляется: оно открыло бы
-	# SSH всем, кому админ его закрыл. Нынешний вход от этого не страдает: его пускают правила, которые есть.
+	inb=$(xui_inbound_ports) || inb_ok=0   # база есть, а прочитать её не вышло — на каких портах подключения, неизвестно
+	FW_INBOUND=${inb//$'\n'/ }
+	# ufw выключен (сам так ответил) — подключения панели сейчас доступны снаружи, и включённый ufw не должен их закрыть.
+	# Включён — его правила остаются как есть; состояние не понять — лишнего не открываем.
+	[ "$state" != inactive ] || KEEP=$FW_INBOUND
+	# SSH. Когда ufw включает скрипт, разрешение для всех портов SSH обязательно. Когда ufw уже включён (или его состояние
+	# не понять), главнее правила хозяина сервера:
+	# — у порта есть разрешающее правило, пусть только с адреса админа, — общее не добавляется: оно открыло бы SSH всем,
+	#   кому админ его закрыл. Нынешний вход от этого не страдает: его пускают правила, которые есть;
+	# — у порта правила нет (или стоит deny), а вход по SSH разрешён через другой порт — порт остаётся как есть: общее
+	#   разрешение отменило бы и явный deny. Кроме порта, через который вошли сейчас: он без разрешения не остаётся;
+	# — разрешающего правила нет ни у одного порта SSH — разрешаются все, как раньше.
 	if [ "$state" != inactive ]; then
-		for p in $SSH_PORTS; do ! ufw_allows_tcp "$p" || ssh_as_is="$ssh_as_is $p/tcp"; done
+		for p in $SSH_PORTS; do ! ufw_allows "$p" tcp || ssh_ok="$ssh_ok $p"; done
+		for p in $SSH_PORTS; do
+			if [[ " $ssh_ok " == *" $p "* ]]; then
+				as_is="$as_is $p/tcp"
+			elif [ -n "$ssh_ok" ] && [ "$p" != "${SSH_NOW_PORT:-}" ]; then
+				as_is="$as_is $p/tcp" ssh_left="$ssh_left $p"
+			fi
+		done
+		# Порт соседнего VPN, у которого разрешающее правило уже есть (пусть только с одной подсети), — тоже как есть.
+		for pp in $OTHER_VPN_PORTS; do
+			! ufw_allows "${pp%/*}" "${pp#*/}" || as_is="$as_is $pp" vpn_as_is="$vpn_as_is $pp"
+		done
 	fi
 	OPEN=$( {
 		for p in $SSH_PORTS; do echo "$p/tcp"; done   # среди них и порт нынешнего входа (ssh_ports)
@@ -3267,38 +3375,50 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		for pp in $OTHER_VPN_PORTS $KEEP; do echo "$pp"; done
 	} | sort -u | sort -t/ -k1,1n -k2,2)
 	for p in $OPEN; do
-		case " $ssh_as_is " in *" $p "*) continue ;; esac
+		case " $as_is " in *" $p "*) continue ;; esac
 		if ufw allow "$p" >/dev/null; then opened="$opened $p"; continue; fi
 		bad "ufw allow $p не прошёл"
-		case " $KEEP " in *" $p "*) lost="$lost $p" ;; esac
+		case " $KEEP $OTHER_VPN_PORTS " in *" $p "*) lost="$lost $p" ;; esac   # то, что работает сейчас и чего включённый ufw не должен закрыть
 		for pp in $SSH_PORTS; do [ "$pp/tcp" != "$p" ] || lost_ssh="$lost_ssh $pp"; done
 	done
-	if [ -n "$ssh_as_is" ]; then
-		p=${ssh_as_is# }; p=${p//\/tcp/}
+	if [ -n "$ssh_ok" ]; then
+		p=${ssh_ok# }
 		ok "SSH :${p// /,} уже разрешён правилами ufw — их не менял"
+	fi
+	if [ -n "$ssh_left" ]; then
+		p=${ssh_left# }
+		ok "SSH :${p// /,} в ufw не разрешён, а вход по SSH разрешён через другой порт — оставил как есть (нужен и этот: ufw allow ПОРТ/tcp)"
 	fi
 	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || [[ " $lost " == *" $pp "* ]] || printf '%s ' "$pp"; done)
 	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
-	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
+	# «Открыл» — только про то, что действительно открыл скрипт: не про несостоявшийся «ufw allow» и не про оставленное правило.
+	vpn_opened=$(for pp in $OTHER_VPN_PORTS; do [[ " $opened " != *" $pp "* ]] || printf '%s ' "$pp"; done)
+	[ -z "$vpn_opened" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw (${vpn_opened% }), чтобы фаервол его не отрубил"
+	[ -z "$vpn_as_is" ] || ok "рядом работает ${OTHER_VPN:-другой VPN}: его порты (${vpn_as_is# }) уже разрешены правилами ufw — их не менял"
 	if [ "$state" = unknown ]; then
 		# Включён ufw или нет — неизвестно: включение закрыло бы порты, о которых скрипт не знает, а убирать правила вслепую нельзя.
 		bad "состояние ufw понять не удалось («ufw status» не ответил ни «active», ни «inactive») — включать его и убирать в нём правила не стал${opened:+; разрешения добавил:$opened}. Проверьте: ufw status"
 		return 0
 	fi
-	if [ "$state" = inactive ] && [ -n "$lost_ssh$lost" ]; then
+	if [ "$state" = inactive ] && { [ -n "$lost_ssh$lost" ] || [ "$inb_ok" = 0 ]; }; then
 		[ -z "$lost_ssh" ] || bad "ufw не включал: не удалось разрешить в нём порт SSH$lost_ssh — с включённым фаерволом вы остались бы без входа на сервер. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
-		[ -z "$lost" ] || bad "ufw не включал: не удалось разрешить в нём$lost, а включённый фаервол закрыл бы подключения панели на этих портах. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
+		[ -z "$lost" ] || bad "ufw не включал: не удалось разрешить в нём$lost, а включённый фаервол закрыл бы то, что работает на этих портах сейчас (подключения панели, соседний VPN). Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
+		[ "$inb_ok" = 1 ] || bad "ufw не включал: базу панели ($DB) прочитать не удалось, и на каких портах её подключения — неизвестно; включённый фаервол мог бы их закрыть. Запустите скрипт ещё раз"
 		return 0
 	fi
-	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ] && fw_close "$MOVED_FROM/tcp"; then
-		ok "старый порт подключения $MOVED_FROM закрыт в ufw"
+	if [ "$inb_ok" = 0 ]; then   # ufw включён: нужное разрешено, а убирать правила, не зная портов подключений, нельзя
+		warn "базу панели ($DB) прочитать не удалось — лишние правила ufw не убирал: на каких портах её подключения, неизвестно"
+	else
+		if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ] && fw_close "$MOVED_FROM/tcp"; then
+			ok "старый порт подключения $MOVED_FROM закрыт в ufw"
+		fi
+		# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
+		if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
+			for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || fw_close "$p" || true; done
+		fi
+		# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
+		if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then fw_close "$WEB_PORT/tcp" || true; fi
 	fi
-	# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
-	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
-		for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || fw_close "$p" || true; done
-	fi
-	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
-	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then fw_close "$WEB_PORT/tcp" || true; fi
 	if [ "$state" = inactive ]; then
 		# Что ещё слушает снаружи, фаервол закроет — назвать, чтобы чужая служба не пропала молча.
 		CLOSING=$(ss -Htuln 2>/dev/null | awk '{print $1, $5}' | while read -r proto addr; do
@@ -3309,7 +3429,17 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		done | sort -u | { grep -vxF -f <(printf '%s\n' 68/udp 546/udp $OPEN) || true; } | sort -t/ -k1,1n | tr '\n' ' ')
 		[ -z "$CLOSING" ] || warn "фаервол закроет и порты, которые сейчас слушает этот сервер: ${CLOSING}— если там нужная служба, откройте: ufw allow ПОРТ/tcp (или /udp)"
 	fi
-	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $opened)"; else bad "ufw не включился (ufw status)"; fi
+	if ufw --force enable >/dev/null 2>&1; then
+		ok "включён, открыто: $(echo $opened)"
+	elif [ "$state" != inactive ]; then
+		bad "ufw не включился (ufw status)"   # он был включён и до запуска: выключать его — не скрипту
+	elif ufw --force disable >/dev/null 2>&1; then
+		# После неудачного включения ufw оставляет политику «всё закрыто», а правила мог и не загрузить — вплоть до правила
+		# для SSH (проверено на настоящем ufw 0.36.1). До запуска он был выключен — вернуть как было.
+		bad "ufw не включился — вернул его в выключенное состояние, как было до запуска (после неудачного включения он оставляет «всё закрыто», иногда и для SSH). Сервер сейчас без фаервола; что мешает включению, покажет: ufw enable"
+	else
+		bad "ufw не включился, и выключить его обратно не удалось — проверьте, что вход по SSH работает (в новом окне, не закрывая это), и разберитесь с ufw: ufw status, ufw disable"
+	fi
 }
 say "Фаервол ufw"
 if [ "$DO_UFW" = 1 ]; then
