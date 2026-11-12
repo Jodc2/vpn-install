@@ -243,9 +243,10 @@ print(r[0] if r else "")' "$DB" "$1" "${2:-0}" 2> /dev/null ||
 		sqlite3 -readonly "$DB" "select id from inbounds where port=$((10#$1)) and id<>$((10#${2:-0})) order by id limit 1;" 2> /dev/null || true
 }
 xui_inbound_ports() {  # xui_inbound_ports [local] → «порт/протокол» включённых подключений панели, которые слушают не только
-	# localhost (это нужно фаерволу); с «local» — и тех, что слушают только localhost (это нужно сверке портов)
+	# localhost (это нужно фаерволу); с «local» — и тех, что слушают только localhost (это нужно сверке портов).
+	# Код 1 — база есть, а прочитать её не вышло: «подключений нет» и «не знаю» — разные ответы.
 	[ -f "$DB" ] || return 0
-	python3 -I - "$DB" "${1:-}" <<'PY' 2>/dev/null || true
+	python3 -I - "$DB" "${1:-}" <<'PY' 2>/dev/null
 import json, sqlite3, sys
 db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
 local = sys.argv[2] == "local"
@@ -308,7 +309,7 @@ service_port_check() {  # service_port_check РЕЖИМ [ХВОСТ] — на п
 	# остановиться, пока ничего не изменено. Иначе (проверено на настоящих x-ui и Xray) не поднимается либо Xray — и не
 	# работает ни одно подключение, чужое и своё, — либо сама панель.
 	local p why busy
-	busy=$(xui_inbound_ports local)
+	busy=$(xui_inbound_ports local) || return 0   # базу не прочитать — сверить не с чем
 	[ -n "$busy" ] || return 0
 	while IFS='|' read -r p why; do
 		! grep -qx "$p/tcp" <<<"$busy" ||
@@ -3307,21 +3308,22 @@ else
 	fi
 fi
 
-fw_kept_ports() {  # ufw выключен (сам так ответил) — подключения панели сейчас доступны снаружи; их порты включённый ufw не должен закрыть
-	[ "$(ufw_state)" = inactive ] || return 0   # включён — его правила остаются как есть; не понять — лишнего не открываем
-	xui_inbound_ports
-}
 fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в ufw; 1 — не тронуто: на этом порту работает подключение панели
 	case " $FW_INBOUND " in *" ${1%/*}/"*) return 1 ;; esac
 	ufw delete allow "$1" >/dev/null 2>&1 || true
 }
 fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить
-	local KEEP OPEN KEPT CLOSING p pp state lost="" lost_ssh="" ssh_as_is="" opened=""
+	local KEEP="" OPEN KEPT CLOSING p pp state inb inb_ok=1 lost="" lost_ssh="" ssh_as_is="" opened=""
+	# Состояние ufw спрашивается один раз на весь шаг: от ответа зависит и что открывать, и можно ли включать. Два вопроса
+	# могли получить два разных ответа — и ufw включался без разрешений, которые по первому ответу были нужны.
 	state=$(ufw_state)
 	# Порты включённых подключений панели, слушающих не только localhost. Скрипт их не закрывает никогда, был ufw включён
 	# или нет: ни удалением разрешения (fw_close), ни включением ufw, в котором для них нет разрешения.
-	FW_INBOUND=$(xui_inbound_ports | tr '\n' ' ')
-	KEEP=$(fw_kept_ports | tr '\n' ' ')
+	inb=$(xui_inbound_ports) || inb_ok=0   # база есть, а прочитать её не вышло — на каких портах подключения, неизвестно
+	FW_INBOUND=${inb//$'\n'/ }
+	# ufw выключен (сам так ответил) — подключения панели сейчас доступны снаружи, и включённый ufw не должен их закрыть.
+	# Включён — его правила остаются как есть; состояние не понять — лишнего не открываем.
+	[ "$state" != inactive ] || KEEP=$FW_INBOUND
 	# SSH. Когда ufw включает скрипт, разрешение для портов SSH обязательно. Когда ufw уже включён (или его состояние не
 	# понять) и для порта есть разрешающее правило — пусть только с адреса админа, — общее не добавляется: оно открыло бы
 	# SSH всем, кому админ его закрыл. Нынешний вход от этого не страдает: его пускают правила, которые есть.
@@ -3355,20 +3357,25 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		bad "состояние ufw понять не удалось («ufw status» не ответил ни «active», ни «inactive») — включать его и убирать в нём правила не стал${opened:+; разрешения добавил:$opened}. Проверьте: ufw status"
 		return 0
 	fi
-	if [ "$state" = inactive ] && [ -n "$lost_ssh$lost" ]; then
+	if [ "$state" = inactive ] && { [ -n "$lost_ssh$lost" ] || [ "$inb_ok" = 0 ]; }; then
 		[ -z "$lost_ssh" ] || bad "ufw не включал: не удалось разрешить в нём порт SSH$lost_ssh — с включённым фаерволом вы остались бы без входа на сервер. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
 		[ -z "$lost" ] || bad "ufw не включал: не удалось разрешить в нём$lost, а включённый фаервол закрыл бы подключения панели на этих портах. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
+		[ "$inb_ok" = 1 ] || bad "ufw не включал: базу панели ($DB) прочитать не удалось, и на каких портах её подключения — неизвестно; включённый фаервол мог бы их закрыть. Запустите скрипт ещё раз"
 		return 0
 	fi
-	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ] && fw_close "$MOVED_FROM/tcp"; then
-		ok "старый порт подключения $MOVED_FROM закрыт в ufw"
+	if [ "$inb_ok" = 0 ]; then   # ufw включён: нужное разрешено, а убирать правила, не зная портов подключений, нельзя
+		warn "базу панели ($DB) прочитать не удалось — лишние правила ufw не убирал: на каких портах её подключения, неизвестно"
+	else
+		if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ] && fw_close "$MOVED_FROM/tcp"; then
+			ok "старый порт подключения $MOVED_FROM закрыт в ufw"
+		fi
+		# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
+		if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
+			for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || fw_close "$p" || true; done
+		fi
+		# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
+		if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then fw_close "$WEB_PORT/tcp" || true; fi
 	fi
-	# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
-	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
-		for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || fw_close "$p" || true; done
-	fi
-	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
-	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then fw_close "$WEB_PORT/tcp" || true; fi
 	if [ "$state" = inactive ]; then
 		# Что ещё слушает снаружи, фаервол закроет — назвать, чтобы чужая служба не пропала молча.
 		CLOSING=$(ss -Htuln 2>/dev/null | awk '{print $1, $5}' | while read -r proto addr; do

@@ -1593,8 +1593,8 @@ test_no_password_login_nag() {  # решение владельца 11.11: бе�
 }
 
 # ——— Чужой 3x-ui: вопрос в самом начале, порты его подключений фаервол не закрывает ———
-xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports / fw_kept_ports; die/ok/warn — строками в $WORK/out
-	eval "$(awk '/^(foreign_xui_check|foreign_on_port|service_ports|service_port_check|xui_inbound_ports|fw_kept_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports; die/ok/warn — строками в $WORK/out
+	eval "$(awk '/^(foreign_xui_check|foreign_on_port|service_ports|service_port_check|xui_inbound_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1675,12 +1675,6 @@ test_inbound_ports_by_protocol() {  # порты включённых подкл
 		'8444||vless|{}|{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]}}|1'
 	t_eq "1080/tcp 1080/udp 1081/tcp 1081/udp 2083/tcp 4443/udp 8443/tcp 8444/tcp 8444/udp 51820/udp" "$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "порты"
 }
-test_fw_kept_ports_long_active_ufw() {  # длинный вывод включённого ufw: «| grep -q» под pipefail читал его как «выключен»
-	xui_fns
-	mkdb '8443||vmess|{}|{"network":"ws"}|1'
-	ufw() { echo "Status: active"; seq 1 200000 | sed 's/^/22\/tcp ALLOW IN Anywhere # /'; }
-	t_eq "" "$(fw_kept_ports)" "включённый ufw — порты не открываем"
-}
 test_no_ufw_status_pipelines() {  # «ufw status | grep» под pipefail путает «включён» с «выключен» — только через переменную
 	! grep -nE '^[^#]*ufw status[^|#]*\| *grep' "$ROOT/src/install-vpn.sh.in" || t_fail "остался конвейер ufw status | grep"
 }
@@ -1688,15 +1682,6 @@ test_inbound_ports_no_db() {
 	xui_fns
 	declare -F xui_inbound_ports > /dev/null || t_fail "нет xui_inbound_ports в шаблоне"
 	t_eq "" "$(xui_inbound_ports)" "без базы — ничего"
-}
-test_fw_kept_ports_only_when_ufw_was_off() {  # фаервол уже включён — его правила остаются как есть, лишнего не открываем
-	xui_fns
-	mkdb '8443||vmess|{}|{"network":"ws"}|1'
-	ufw() { echo "Status: inactive"; }
-	t_eq "8443/tcp" "$(fw_kept_ports)" "ufw выключен — порты подключений остаются открытыми"
-	ufw() { printf 'Status: active\n\nTo Action From\n'; }
-	t_eq "" "$(fw_kept_ports)" "ufw включён — не трогаем"
-	grep -q 'OTHER_VPN_PORTS \$KEEP' "$ROOT/src/install-vpn.sh.in" || t_fail "шаг фаервола не открывает порты подключений панели"
 }
 
 # ——— ревью 12.11: ядро установщика ———
@@ -1743,7 +1728,7 @@ test_inbound_ports_odd_row_keeps_the_rest() {  # settings или stream_settings
 # Шаг «Фаервол ufw» целиком: ufw — заглушка (ответ на status — $UFW_SAYS, код — $UFW_STATUS_RC; команды из $UFW_FAIL
 # не проходят), всё, что скрипт у неё просит, — построчно в $WORK/ufw.calls; правила ufw — файл $UFW_RULES.
 fw_env() {
-	eval "$(awk '/^(fw_step|fw_kept_ports|fw_close|xui_inbound_ports|ufw_active|ufw_state|ufw_allows_tcp)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(fw_step|fw_close|xui_inbound_ports|ufw_active|ufw_state|ufw_allows_tcp)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	say() { :; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1811,6 +1796,76 @@ test_fw_off_keeps_inbound_ports_and_enables() {  # ufw был выключен: 
 	t_has "OK включён, открыто: 22/tcp 80/tcp 2083/tcp 8443/tcp" "$(cat "$WORK/out")" "итог"
 }
 
+test_fw_long_active_ufw_output_is_active() {  # длинный вывод включённого ufw: «| grep -q» под pipefail читал его как «выключен»
+	fw_env
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	ufw() {
+		if [ "$1" = status ]; then echo "Status: active"; seq 1 200000 | sed 's/^/22\/tcp ALLOW IN Anywhere # /'; return 0; fi
+		echo "$*" >> "$WORK/ufw.calls"
+	}
+	fw_step
+	! fw_called "allow 8443/tcp" || t_fail "включённый ufw принят за выключенный: открыт порт чужого подключения: $(fw_calls)"
+}
+test_fw_inbound_ports_opened_only_when_ufw_was_off() {  # фаервол уже включён — его правила остаются как есть, лишнего не открываем
+	fw_env
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	fw_step
+	fw_called "allow 8443/tcp" || t_fail "ufw выключен — порт подключения панели должен остаться открытым: $(fw_calls)"
+	fw_env; UFW_SAYS=$ACTIVE
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	fw_step
+	! fw_called "allow 8443/tcp" || t_fail "ufw включён — чужой порт не трогаем: $(fw_calls)"
+}
+test_fw_reads_ufw_state_once() {  # состояние ufw спрашивается один раз на весь шаг. Спрашивалось дважды: первый ответ «выключен», второй не
+	# пришёл — и ufw включался без разрешений для портов подключений панели
+	fw_env
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+	ufw() {  # на «status» отвечает только в первый раз
+		if [ "$1" = status ]; then
+			echo x >> "$WORK/status.calls"
+			[ "$(wc -l < "$WORK/status.calls")" = 1 ] || return 1
+			echo "Status: inactive"
+			return 0
+		fi
+		echo "$*" >> "$WORK/ufw.calls"
+	}
+	fw_step
+	fw_called "--force enable" || t_fail "ufw сказал «выключен» — его надо включить: $(fw_calls)"
+	fw_called "allow 8443/tcp" || t_fail "ufw включён без порта подключения панели 8443: $(fw_calls)"
+}
+test_fw_unreadable_panel_db() {  # база панели есть, а прочитать её не вышло — на каких портах её подключения, неизвестно:
+	# выключенный ufw не включать (он мог бы их закрыть), во включённом — ничего не удалять
+	fw_env; echo "это не база SQLite" > "$DB"
+	fw_step
+	! fw_called "--force enable" || t_fail "ufw включён, хотя порты подключений панели неизвестны: $(fw_calls)"
+	grep -q '^BAD ufw не включал.*базу панели' "$WORK/out" || t_fail "не сказано, почему ufw не включён: $(cat "$WORK/out")"
+	! grep -q '^delete ' "$WORK/ufw.calls" || t_fail "удалено правило, хотя порты подключений неизвестны: $(fw_calls)"
+	fw_called "allow 22/tcp" && fw_called "allow 2083/tcp" || t_fail "свои порты всё равно разрешаются: $(fw_calls)"
+	! grep -q 'включён, открыто' "$WORK/out" || t_fail "сказано «включён»: $(cat "$WORK/out")"
+	fw_env; UFW_SAYS=$ACTIVE; echo "это не база SQLite" > "$DB"
+	fw_step
+	! grep -q '^delete ' "$WORK/ufw.calls" || t_fail "ufw включён, база не читается — удалено правило: $(fw_calls)"
+	grep -q '^WARN .*базу панели' "$WORK/out" || t_fail "не сказано, что правила не убирались: $(cat "$WORK/out")"
+	fw_called "allow 2083/tcp" || t_fail "свой порт не разрешён: $(fw_calls)"
+	fw_env   # панели нет вовсе — читать нечего, это не сбой
+	fw_step
+	fw_called "--force enable" || t_fail "без базы панели ufw включается как обычно: $(fw_calls)"
+	fw_called "delete allow 54321/tcp" || t_fail "и лишнее убирается как обычно: $(fw_calls)"
+}
+test_inbound_ports_says_when_db_unreadable() {  # «подключений нет» и «базу не прочитать» — разные ответы: по первому ufw включать можно, по второму нет
+	xui_fns
+	xui_inbound_ports > /dev/null || t_fail "базы нет — это не сбой"
+	mkdb '2083||vless|{}|{}|1'
+	xui_inbound_ports > /dev/null || t_fail "обычная база — не сбой"
+	echo "это не база SQLite" > "$DB"
+	! xui_inbound_ports > /dev/null || t_fail "база не читается, а функция ответила «подключений нет»"
+	# Сверка служебных портов на такой базе идёт дальше, а не обрывает скрипт. Не «( … ) || t_fail»: в условии bash выключает
+	# set -e и внутри, а обрыв был бы именно из-за него (присваивание с ненулевым кодом).
+	set +e
+	( set -e; service_port_check domain; : > "$WORK/reached" )
+	set -e
+	[ -e "$WORK/reached" ] || t_fail "сверка служебных портов на нечитаемой базе оборвала скрипт: $(cat "$WORK/out")"
+}
 test_ufw_state_needs_a_clear_answer() {  # пункт 5: «выключен» — только когда ufw так и сказал; молчание и чужой язык — «не понять»
 	fw_env
 	t_eq inactive "$(ufw_state)" "Status: inactive"
