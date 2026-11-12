@@ -1375,13 +1375,18 @@ foreign_db_copy() {  # копия базы чужого 3x-ui рядом с не
 	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
 }
 xui_stop() {  # остановить x-ui на время правки базы; вотчдог цепочки — тоже, чтобы не перезапустил x-ui посреди правки
+	local first=0
+	[ "$XUI_TOUCHED" != 0 ] || first=1
+	# Отметка «x-ui трогали» — раньше самой остановки: сигнал (Ctrl-C, обрыв SSH), пришедший во время остановки, bash
+	# обрабатывает сразу после неё, и on_exit уже должен знать, что x-ui надо запустить снова.
+	XUI_TOUCHED=1
 	systemctl stop vpn-exit-watchdog 2>/dev/null || true
 	systemctl stop x-ui 2>/dev/null || true
 	# Первая остановка работавшего VPN — снимок базы: оборвётся установка — база вернётся как была до запуска.
-	if [ "$XUI_TOUCHED" = 0 ] && [ "$XUI_WAS_ACTIVE" = 1 ] && [ -f "$DB" ]; then
+	# (Пока снимка нет, база ещё не менялась: возвращать нечего, on_exit только запустит x-ui.)
+	if [ "$first" = 1 ] && [ "$XUI_WAS_ACTIVE" = 1 ] && [ -f "$DB" ]; then
 		sqlite3 "$DB" ".backup '$WORK/db.before'" 2>/dev/null || cp -a "$DB" "$WORK/db.before" 2>/dev/null || true
 	fi
-	XUI_TOUCHED=1
 }
 xui_set() {  # xui_set КЛЮЧ=ЗНАЧЕНИЕ… — строки таблицы settings (x-ui должен быть остановлен)
 	python3 - "$DB" "$@" <<'PY'
@@ -2426,6 +2431,11 @@ WD_WAS_ACTIVE=0; systemctl is-active -q vpn-exit-watchdog 2>/dev/null && WD_WAS_
 XUI_TOUCHED=0
 on_exit() {
 	local rc=$?
+	# Откат — до конца, что бы ни случилось: повторный сигнал (второй Ctrl-C) его не прерывает; сообщение, которое некуда
+	# напечатать (терминал пропал, tee уже нет — SIGPIPE), тоже: под set -e первый же неудавшийся printf оборвал бы ловушку
+	# между «x-ui остановлен» и «x-ui запущен».
+	trap '' INT HUP TERM PIPE
+	set +e
 	[ -z "${TOKEN_ID:-}" ] || sqlite3 "$DB" "delete from api_tokens where id=$TOKEN_ID;" 2>/dev/null || true
 	if [ "$rc" != 0 ] && [ "$XUI_TOUCHED" = 1 ] && [ "${INSTALL_DONE:-0}" != 1 ]; then
 		if [ "$XUI_WAS_ACTIVE" = 1 ]; then
@@ -2442,6 +2452,12 @@ on_exit() {
 	[ -z "${BOT_DIR:-}" ] || rm -rf "$BOT_DIR"   # каталог токенов с вопросов (вне $WORK)
 }
 trap on_exit EXIT
+# Сигнал — тоже обрыв: Ctrl-C, пропавший терминал (обрыв SSH), kill. Без этих ловушек bash запускает on_exit с кодом
+# последней завершившейся команды, то есть 0, — и ни база не возвращается, ни x-ui не запускается заново. Подействует
+# сигнал, когда закончится текущая внешняя команда (она получает его от терминала сама и обычно завершается сразу).
+trap 'trap "" INT HUP TERM; exit 130' INT
+trap 'trap "" INT HUP TERM; exit 129' HUP
+trap 'trap "" INT HUP TERM; exit 143' TERM
 
 # --- Только проверка ---
 if [ "$CHECK_ONLY" = 1 ]; then
@@ -2525,7 +2541,9 @@ if [ -n "$WARP_CMD" ]; then
 fi
 
 touch "$LOG" && chmod 600 "$LOG"
-exec > >(tee -a "$LOG") 2>&1
+# tee сигналы не слушает: от терминала их получает вся группа процессов, и без этого он умирал бы раньше, чем скрипт
+# допишет, что вернул при обрыве, — в журнал это не попадало, а на экран тем более. Кончится tee сам — вместе со скриптом.
+exec > >(trap '' INT HUP TERM; exec tee -a "$LOG") 2>&1
 START=$(date +%s)
 if [ "$MODE" = domain ]; then
 	printf '\033[1mУстановка VPN на %s (3x-ui %s, Xray %s, выход: %s)\033[0m\n' "$DOMAIN" "$XUI_VERSION" "$XRAY_VERSION" "$EXIT_MODE"

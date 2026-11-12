@@ -2838,6 +2838,233 @@ test_every_ufw_status_is_asked_in_english() {  # «ufw status» читается
 	[ "$calls" -ge 2 ] || t_fail "вызовов «LANGUAGE=C LC_ALL=C ufw status» в шаблоне: $calls — страж ничего не сторожит"
 }
 
+# Обрыв установки сигналом: Ctrl-C, обрыв SSH (терминал пропал), SIGTERM. README обещает, что база 3x-ui возвращается и VPN
+# работает как работал, — а bash после сигнала запускал on_exit с кодом 0 (код последней завершившейся команды), и отката не
+# было. Проверяется настоящим процессом в псевдотерминале: on_exit, ловушки и вывод через tee — строки шаблона как есть;
+# systemctl — заглушка, пишущая в $WORK/calls.
+exit_script() {  # сценарий $WORK/exit.sh: «установка», которая уже остановила x-ui и поменяла базу
+	local f=$ROOT/src/install-vpn.sh.in
+	{
+		echo 'set -euo pipefail'
+		echo "T='$WORK'"
+		cat <<'EOF'
+WORK=$T/w CHK_OUT=$T/chk DB=$T/x-ui.db LOG=$T/install.log STATE=$T/vpn-install.env
+mkdir -p "$WORK"; : > "$CHK_OUT"
+XUI_TOUCHED=1 XUI_WAS_ACTIVE=1 WD_WAS_ACTIVE=0 TOKEN_ID='' BOT_DIR=''
+systemctl() { echo "systemctl $*" >> "$T/calls"; [ "$1" != stop ] || sleep "${STOP_TAKES:-0}"; }
+sqlite3() { :; }
+echo "база до запуска" > "$WORK/db.before"
+echo "база, изменённая запуском" > "$DB"
+EOF
+		awk '/^on_exit\(\) \{/,/^}/' "$f"
+		grep -E "^trap (on_exit EXIT|'[^']*' (INT|HUP|TERM))( |\$)" "$f"   # ловушки основного скрипта
+		grep -m1 '^exec > >(' "$f"                                          # вывод — на экран и в журнал
+		cat <<'EOF'
+echo "работаю"
+: > "$T/ready"
+for _ in $(seq 1 "${WORK_STEPS:-60}"); do sleep 0.5; done
+[ -z "${FAIL_AT_END:-}" ] || exit 1
+echo "дошёл до конца"
+EOF
+	} > "$WORK/exit.sh"
+	grep -q '^on_exit() {' "$WORK/exit.sh" && grep -q '^trap on_exit EXIT' "$WORK/exit.sh" && grep -q '^exec > >(' "$WORK/exit.sh" ||
+		t_fail "в шаблоне не нашлись on_exit, ловушка EXIT или вывод через tee"
+}
+sig_run() {  # sig_run ДЕЙСТВИЕ → код возврата $WORK/exit.sh. Действие — когда сценарий уже «работает»: int (Ctrl-C), int2 (ещё два
+	# Ctrl-C во время отката), hup (терминал пропал; сценарий — задание интерактивной оболочки, как при входе по SSH),
+	# termgrp (SIGTERM группе процессов), int_in_rollback (сценарий падает сам, а Ctrl-C приходит уже во время отката),
+	# tee_killed (tee убит, потом SIGTERM сценарию: печатать некуда вовсе), none (не мешать)
+	python3 -I - "$WORK" "$1" <<'EOF'
+import os, pty, select, signal, sys, time
+work, action = sys.argv[1:3]
+script, ready, calls = (os.path.join(work, n) for n in ("exit.sh", "ready", "calls"))
+os.environ.update(HOME=work, HISTFILE="/dev/null")   # интерактивная оболочка — без чужих настроек и без записи истории
+pid, fd = pty.fork()
+if pid == 0:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # Python её игнорирует, и потомки это наследуют; у человека в терминале — как здесь
+    if action == "hup":
+        os.execvp("bash", ["bash", "--norc", "--noprofile", "-i"])
+    os.execvp("bash", ["bash", script])
+if action == "hup":
+    time.sleep(0.5)
+    os.write(fd, ("bash '%s'\n" % script).encode())
+
+
+def drain():
+    try:
+        while select.select([fd], [], [], 0)[0]:
+            if not os.read(fd, 65536):
+                break
+    except OSError:
+        pass
+
+
+def done():
+    try:
+        return "systemctl start x-ui" in open(calls).read()
+    except OSError:
+        return False
+
+
+end = time.time() + 15
+while not os.path.exists(ready) and time.time() < end:
+    drain()
+    time.sleep(0.05)
+if not os.path.exists(ready):
+    print("сценарий не запустился")
+    sys.exit(0)
+time.sleep(0.4)
+closed = False
+if action in ("int", "int2"):
+    os.write(fd, b"\x03")
+if action == "int2":   # откат уже идёт (заглушка «systemctl stop» медлит): человек жмёт Ctrl-C ещё и ещё
+    for _ in range(2):
+        time.sleep(0.4)
+        os.write(fd, b"\x03")
+elif action == "hup":
+    os.close(fd)
+    closed = True
+elif action == "termgrp":
+    os.killpg(pid, signal.SIGTERM)
+elif action == "int_in_rollback":
+    end = time.time() + 20
+    while time.time() < end:   # сценарий завершается ошибкой сам; ждём начала отката
+        drain()
+        try:
+            if "systemctl stop x-ui" in open(calls).read():
+                break
+        except OSError:
+            pass
+        time.sleep(0.05)
+    for _ in range(2):
+        time.sleep(0.3)
+        os.write(fd, b"\x03")
+elif action == "tee_killed":
+    for d in os.listdir("/proc"):
+        try:
+            f = open("/proc/%s/stat" % d).read().rsplit(")", 1)
+            if d.isdigit() and f[0].endswith("(tee") and int(f[1].split()[1]) == pid:
+                os.kill(int(d), signal.SIGKILL)
+        except (OSError, ValueError, IndexError):
+            pass
+    time.sleep(0.3)
+    os.kill(pid, signal.SIGTERM)
+status, end = None, time.time() + 45
+while time.time() < end:
+    if not closed:
+        drain()
+    got, st = os.waitpid(pid, os.WNOHANG)
+    if got:
+        status = st
+        break
+    time.sleep(0.05)
+if status is None:
+    os.killpg(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    print("завис")
+    sys.exit(0)
+if action == "hup":   # оболочка входа уже вышла; сценарий доделывает откат без терминала — дождаться
+    end = time.time() + 15
+    while time.time() < end and not done():
+        time.sleep(0.1)
+    print("hup")
+else:
+    print(os.waitstatus_to_exitcode(status))
+time.sleep(0.6)   # tee дописывает журнал
+EOF
+}
+exit_rolled_back() {  # exit_rolled_back 'что это было' — x-ui остановлен и запущен снова, база — как до запуска, в журнале — записи об этом
+	local calls
+	calls=$({ cat "$WORK/calls" 2> /dev/null || true; } | tr '\n' ';')
+	[[ $calls == *"systemctl stop x-ui;"*"systemctl start x-ui;"* ]] || t_fail "$1: x-ui не запущен снова (вызовы: ${calls:-нет})"
+	t_eq "база до запуска" "$(cat "$WORK/x-ui.db")" "$1: база 3x-ui возвращена такой, как была до запуска"
+	grep -q 'база 3x-ui возвращена' "$WORK/install.log" && grep -q 'x-ui запущен снова' "$WORK/install.log" ||
+		t_fail "$1: в журнале установки нет записи об откате: $(tr '\n' ';' < "$WORK/install.log")"
+}
+test_exit_ctrl_c_rolls_back() {  # Ctrl-C посреди установки: база возвращена, x-ui запущен снова, код 130
+	exit_script
+	t_eq 130 "$(sig_run int)" "код возврата после Ctrl-C"
+	exit_rolled_back "Ctrl-C"
+}
+test_exit_ssh_drop_rolls_back() {  # обрыв SSH: терминала уже нет, печатать некуда — откат всё равно доходит до конца, и в журнале он записан
+	exit_script
+	t_eq hup "$(sig_run hup)" "сценарий запущен из интерактивной оболочки, терминал закрыт"
+	exit_rolled_back "обрыв SSH"
+}
+test_exit_sigterm_rolls_back() {  # SIGTERM всей группе процессов (kill, остановка сеанса): то же
+	exit_script
+	t_eq 143 "$(sig_run termgrp)" "код возврата после SIGTERM"
+	exit_rolled_back "SIGTERM"
+}
+test_exit_second_ctrl_c_does_not_stop_rollback() {  # человек жмёт Ctrl-C ещё раз, пока идёт откат: откат не прерывается
+	exit_script
+	t_eq 130 "$(STOP_TAKES=1.5 sig_run int2)" "код возврата"
+	exit_rolled_back "повторный Ctrl-C во время отката"
+}
+test_exit_ctrl_c_during_rollback_after_error() {  # установка упала сама и уже откатывается — Ctrl-C в этот момент откат не прерывает
+	exit_script
+	t_eq 1 "$(WORK_STEPS=2 FAIL_AT_END=1 STOP_TAKES=1.5 sig_run int_in_rollback)" "код возврата — от ошибки, а не от Ctrl-C"
+	exit_rolled_back "Ctrl-C во время отката после ошибки"
+}
+test_exit_rolls_back_with_nowhere_to_print() {  # печатать некуда вовсе (tee убит): сообщения об откате пропадают, сам откат — нет
+	local calls
+	exit_script
+	t_eq 143 "$(sig_run tee_killed)" "код возврата"
+	calls=$({ cat "$WORK/calls" 2> /dev/null || true; } | tr '\n' ';')
+	[[ $calls == *"systemctl stop x-ui;"*"systemctl start x-ui;"* ]] || t_fail "x-ui не запущен снова (вызовы: ${calls:-нет})"
+	t_eq "база до запуска" "$(cat "$WORK/x-ui.db")" "база 3x-ui возвращена"
+}
+test_exit_signal_during_stop_still_restarts() {  # сигнал пришёл, пока x-ui останавливался: bash обрабатывает его сразу после этой команды —
+	# on_exit к этому моменту уже должен знать, что x-ui трогали, иначе VPN так и останется выключенным
+	local f=$ROOT/src/install-vpn.sh.in
+	{
+		echo 'set -euo pipefail'
+		echo "T='$WORK'"
+		cat <<'EOF'
+WORK=$T/w CHK_OUT=$T/chk DB=$T/x-ui.db LOG=$T/install.log STATE=$T/vpn-install.env
+mkdir -p "$WORK"; : > "$CHK_OUT"; echo "база" > "$DB"
+XUI_TOUCHED=0 XUI_WAS_ACTIVE=1 WD_WAS_ACTIVE=0 TOKEN_ID='' BOT_DIR=''
+systemctl() {
+	echo "systemctl $*" >> "$T/calls"
+	# «stop x-ui» отработал — и тут же срабатывает ловушка сигнала, пришедшего во время остановки: exit 130
+	if [ "$*" = "stop x-ui" ] && [ ! -e "$T/fired" ]; then : > "$T/fired"; exit 130; fi
+}
+sqlite3() { cp "$1" "$WORK/db.before"; }
+EOF
+		awk '/^(on_exit|xui_stop)\(\) \{/,/^}/' "$f"
+		echo 'trap on_exit EXIT'
+		echo 'xui_stop'
+		echo 'echo "сюда дойти не должны" >> "$T/calls"'
+	} > "$WORK/stop.sh"
+	set +e; bash "$WORK/stop.sh" > "$WORK/stop.out" 2>&1; set -e
+	t_eq "systemctl stop vpn-exit-watchdog;systemctl stop x-ui;systemctl stop x-ui;systemctl start x-ui;" "$(tr '\n' ';' < "$WORK/calls")" \
+		"x-ui остановлен — и запущен снова, хотя обрыв пришёлся на саму остановку"
+	t_eq "база" "$(cat "$WORK/x-ui.db")" "база не тронута (снимка ещё не было — возвращать нечего)"
+	# Без обрыва: снимок базы — при первой остановке, и только при первой (вторая остановка идёт уже по изменённой базе).
+	: > "$WORK/fired"; rm -f "$WORK/calls"
+	sed -i 's/^xui_stop$/xui_stop; echo "изменено" > "$DB"; xui_stop; cp "$WORK\/db.before" "$T\/snapshot"; exit 1/' "$WORK/stop.sh"
+	set +e; bash "$WORK/stop.sh" > "$WORK/stop.out" 2>&1; set -e
+	t_eq "база" "$(cat "$WORK/snapshot")" "снимок — база до первых изменений"
+	t_eq "база" "$(cat "$WORK/x-ui.db")" "при ошибке после изменений база возвращена из снимка"
+}
+test_exit_without_signal_as_before() {  # без сигнала — как раньше: успешный запуск ничего не откатывает, ошибка — откатывает
+	exit_script
+	t_eq 0 "$(WORK_STEPS=2 sig_run none)" "успешный запуск"
+	[ ! -e "$WORK/calls" ] || t_fail "успешный запуск, а x-ui трогали: $(tr '\n' ';' < "$WORK/calls")"
+	t_eq "база, изменённая запуском" "$(cat "$WORK/x-ui.db")" "после успешного запуска база — новая"
+	grep -q 'дошёл до конца' "$WORK/install.log" || t_fail "вывод не попал в журнал: $(cat "$WORK/install.log")"
+	rm -f "$WORK/ready" "$WORK/install.log"
+	t_eq 1 "$(WORK_STEPS=2 FAIL_AT_END=1 sig_run none)" "запуск с ошибкой"
+	exit_rolled_back "ошибка (код 1)"
+}
+test_flow_signal_traps_next_to_exit_trap() {  # ловушки сигналов стоят сразу за ловушкой выхода — раньше первого изменения системы
+	local a
+	a=$(tl '^trap on_exit EXIT$')
+	in_order "ловушки INT, HUP, TERM — сразу после «trap on_exit EXIT», до вывода через tee и «Проверки сервера»" \
+		"$a" "$(tl "^trap '.*exit 130' INT\$" "$a")" "$(tl "^trap '.*exit 129' HUP\$" "$a")" "$(tl "^trap '.*exit 143' TERM\$" "$a")" \
+		"$(tl '^exec > >\(' "$a")" "$(tl '^say "Проверка сервера"$' "$a")"
+}
+
 # ——— запуск под sudo: SSH_CONNECTION стёрта, а знать о своём входе скрипту нужно ———
 test_ssh_login_method_seen_through_sudo() {  # --ssh-key-only: «вы вошли по паролю» должно быть видно и под sudo — иначе пароль выключался, и человек оставался без входа
 	local out
