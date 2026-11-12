@@ -2050,9 +2050,9 @@ test_ssh_port_of_this_login_survives_sudo() {  # пункт 9в: sudo стира
 	out=$(SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222' bash -c 'SSH_CONNECTION="203.0.113.9 50001 198.51.100.1 2200" bash "$0"; :' "$WORK/ports.sh")
 	t_eq "22 2200" "$out" "своя SSH_CONNECTION главнее родительской"
 }
-test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» слушает от имени sshd сеанса — это не порт SSH; у сеанса родитель тоже sshd
+sshd_session_fixture() {  # настоящие процессы с именем sshd: слушающий (порт 2233) и его сеанс с пробросами (8080, 8081) —
+	# в $WORK/ss.out, как их показал бы ss; после проверки: kill $SSHD_FIXTURE_PIDS
 	local parent child n=0
-	ssh_fns
 	cp "$(command -v bash)" "$WORK/sshd"   # имя процесса — по имени файла: это и есть «sshd» для /proc
 	mkfifo "$WORK/hold"
 	cat > "$WORK/session.sh" <<'EOF'
@@ -2076,8 +2076,15 @@ LISTEN 0      128          0.0.0.0:2233      0.0.0.0:*    users:(("sshd",pid=$pa
 LISTEN 0      128          0.0.0.0:8080      0.0.0.0:*    users:(("sshd",pid=$child,fd=9))
 LISTEN 0      128                *:8081            *:*    users:(("sshd",pid=$child,fd=10))
 EOF
+	SSHD_FIXTURE_PIDS="$child $parent"
+}
+test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» слушает от имени sshd сеанса — это не порт SSH; у сеанса родитель тоже sshd
+	local n
+	ssh_fns
+	sshd_session_fixture
 	n=$(sshd_listen_ports | tr '\n' ' ')
-	kill "$child" "$parent" 2> /dev/null || true
+	# shellcheck disable=SC2086  # два pid — по словам
+	kill $SSHD_FIXTURE_PIDS 2> /dev/null || true
 	t_eq "2233 " "$n" "только порт самого sshd, без портов, проброшенных его сеансом"
 }
 
@@ -2390,6 +2397,9 @@ restore_fw() {  # restore_fw 'ПОРТЫ' — шаг «Фаервол ufw» из
 	[ -n "$code" ] || t_fail "шаг «Фаервол ufw» в restore.sh не найден"
 	: > "$WORK/ufw.calls"
 	(
+		set -euo pipefail   # как сам restore.sh: шаг не должен обрываться молча
+		eval "$(awk '/^sshd_listen_ports\(\) \{/,/^}/' "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh")"
+		ss() { cat "$WORK/ss.out" 2> /dev/null || true; }
 		say() { :; }
 		ok() { echo "OK $*"; }
 		warn() { echo "WARN $*"; }
@@ -2404,7 +2414,9 @@ restore_fw() {  # restore_fw 'ПОРТЫ' — шаг «Фаервол ufw» из
 		inbound_ports() { echo 2083/tcp; }
 		DO_UFW=1 HAS_NGINX=0 DOMAIN=vpn.example.com DB=$WORK/x.db FAIL_ALLOW=$1
 		export SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222'
+		[ "${NO_SSH_CONNECTION:-0}" != 1 ] || unset SSH_CONNECTION
 		eval "$code"
+		echo "ШАГ ДОШЁЛ ДО КОНЦА"
 	)
 }
 test_restore_fw_ssh_allow_failure_leaves_ufw_off() {  # не разрешился порт SSH — ufw не включать: на новый сервер после переезда было бы не войти
@@ -2422,6 +2434,62 @@ test_restore_fw_ssh_allow_failure_leaves_ufw_off() {  # не разрешилс�
 	out=$(restore_fw "2083/tcp")   # не SSH — как раньше: сказать и включить (без VPN-порта перенос и так считается неудачным)
 	grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "сбой не на порту SSH не должен мешать включению"
 	t_has "BAD ufw allow 2083/tcp" "$out" "сбой назван"
+}
+
+# ——— ревью 12.11, вторая порция: ядро установщика ———
+# restore.sh (пункт 11): разбор подключений панели — тот же, что в установщике; порты SSH — и те, что sshd слушает на деле.
+ODD_ROWS=('2083||vless|{}|{"network":"xhttp","security":"reality"}|1'
+	'8443||vmess|null|null|1' '8444||trojan|[]|[]|1' '8445||vless|"x"|"y"|1'
+	'8446||vless|{}|{"network":"ws","tlsSettings":"не объект"}|1' '8447||shadowsocks|[1]|{}|1'
+	'8448||vless|{}|{"network":"xhttp","tlsSettings":{"alpn":["h3"]}}|1' '8449||vless|{не json|{и это тоже|1'
+	'51820||wireguard|null|null|1' '1080||shadowsocks|{"network":"tcp,udp"}|{}|1' '1081||mixed|{"udp":true}|{}|1'
+	'4443||vless|{}|{"network":"kcp"}|1' '9000|127.0.0.1|vless|{}|{"network":"ws"}|1' '9001||trojan|{}|{}|0' '9002|::1|vless|{}|{}|1')
+test_restore_inbound_ports_same_as_installer() {  # в restore.sh был свой разбор со старой слабостью: строка с null роняла его, и restore обрывался на шаге фаервола
+	local want got
+	xui_fns
+	mkdb "${ODD_ROWS[@]}"
+	want=$(xui_inbound_ports)
+	t_has "8443/tcp" "$want" "образец — разбор установщика"
+	eval "$(awk '/^inbound_ports\(\) \{/,/^}/' "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh")"
+	got=$(inbound_ports "$DB") || t_fail "inbound_ports из restore.sh упал на странной строке базы"
+	t_eq "$want" "$got" "restore.sh и установщик называют одни и те же порты"
+}
+test_restore_fw_opens_port_sshd_listens_on() {  # порт, заданный не в sshd_config (ssh.socket), restore узнаёт по тому, что sshd слушает на деле
+	local out
+	cat > "$WORK/ss.out" <<'EOF'
+LISTEN 0      128          0.0.0.0:2200      0.0.0.0:*    users:(("sshd",pid=999999901,fd=3))
+LISTEN 0      128        127.0.0.1:6010      0.0.0.0:*    users:(("sshd",pid=999999902,fd=9))
+LISTEN 0      511          0.0.0.0:443       0.0.0.0:*    users:(("nginx",pid=999999903,fd=6))
+EOF
+	out=$(restore_fw "")
+	grep -qx 'allow 2200/tcp' "$WORK/ufw.calls" || t_fail "порт, который слушает sshd, не разрешён: $(tr '\n' ';' < "$WORK/ufw.calls")"
+	! grep -qx 'allow 6010/tcp' "$WORK/ufw.calls" || t_fail "порт на localhost (проброс X11) разрешён как порт SSH"
+	grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "ufw не включён"
+	out=$(restore_fw "2200/tcp")
+	! grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "ufw включён, хотя порт 2200, который слушает sshd, не разрешился"
+	t_has "2200" "$out" "порт назван"
+}
+test_restore_sshd_listen_ports_skips_session_forwards() {  # копия функции в restore.sh: проброс сеанса («ssh -R») — не порт SSH, открывать его незачем
+	local n
+	eval "$(awk '/^sshd_listen_ports\(\) \{/,/^}/' "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh")"
+	declare -F sshd_listen_ports > /dev/null || t_fail "в restore.sh нет sshd_listen_ports"
+	ss() { cat "$WORK/ss.out"; }
+	sshd_session_fixture
+	n=$(sshd_listen_ports | tr '\n' ' ')
+	# shellcheck disable=SC2086  # два pid — по словам
+	kill $SSHD_FIXTURE_PIDS 2> /dev/null || true
+	t_eq "2233 " "$n" "только порт самого sshd, без портов, проброшенных его сеансом"
+}
+test_restore_fw_runs_outside_ssh_session() {  # restore запущен не из сеанса SSH (консоль хостера, sudo): шаг не должен обрываться
+	local out rc
+	set +e   # не «… || t_fail»: в условии bash выключает set -e и внутри шага, и обрыв не был бы виден
+	out=$(NO_SSH_CONNECTION=1 restore_fw "")
+	rc=$?
+	set -e
+	[ "$rc" = 0 ] || t_fail "шаг фаервола оборвался без SSH_CONNECTION (под set -e — молча, на полпути restore): код $rc"
+	t_has "ШАГ ДОШЁЛ ДО КОНЦА" "$out" "шаг выполнен целиком"
+	grep -qx 'allow 22/tcp' "$WORK/ufw.calls" || t_fail "порт SSH из sshd -T не разрешён"
+	grep -qx -- '--force enable' "$WORK/ufw.calls" || t_fail "ufw не включён"
 }
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———

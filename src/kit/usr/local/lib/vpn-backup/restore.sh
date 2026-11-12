@@ -89,28 +89,67 @@ port_users() {  # имена процессов, слушающих TCP-порт
 	{ ss -Htlnp "sport = :$1" 2>/dev/null || true; } | { grep -o 'users:(("[^"]*"' || true; } | cut -d'"' -f2 | sort -u | tr '\n' ' '
 }
 
+sshd_listen_ports() {  # порты, которые сам sshd слушает на деле (не только на localhost). Порт, проброшенный сеансом
+	# («ssh -R», X11), тоже слушает процесс sshd — но у него и родитель sshd, а у самого sshd — нет.
+	local port pid ppid
+	{ ss -Htlnp 2>/dev/null || true; } | awk 'match($0, /\("sshd",pid=[0-9]+/) && $4 !~ /^(127\.|\[::1\])/ {
+			n = split($4, a, ":"); print a[n], substr($0, RSTART + 12, RLENGTH - 12) }' |
+		while read -r port pid; do
+			ppid=$(awk '$1 == "PPid:" {print $2}' "/proc/$pid/status" 2>/dev/null || true)
+			[ "$(cat "/proc/${ppid:-0}/comm" 2>/dev/null || true)" = sshd ] || echo "$port"
+		done
+}
+
 inbound_ports() {  # «порт/протокол» внешних (не loopback) включённых inbound'ов из базы $1
+	# Разбор — тот же, что в install-vpn.sh (xui_inbound_ports): строка со странным содержимым (null, список, не JSON)
+	# не роняет функцию. Раньше роняла — и restore под set -e обрывался на шаге фаервола.
 	python3 - "$1" <<'PY'
 import json, sqlite3, sys
-db = sqlite3.connect(sys.argv[1])
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+
+
+def obj(text):  # JSON-объект из поля базы; всё остальное (null, список, строка, не JSON) — пустой объект
+    try:
+        v = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def kinds_of(proto, st, ss):  # что слушает подключение: tcp, udp или оба
+    proto = str(proto or "").lower()
+    net = str(ss.get("network") or "tcp").lower()
+    tls = ss.get("tlsSettings")
+    alpn = (tls.get("alpn") if isinstance(tls, dict) else None) or []
+    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
+        return {"udp"}
+    if net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
+        return {"tcp", "udp"}
+    if proto in ("shadowsocks", "dokodemo-door", "tunnel"):
+        n = str(st.get("network") or "tcp").lower()
+        return {k for k in ("tcp", "udp") if k in n} or {"tcp"}
+    if proto in ("mixed", "socks"):
+        return {"tcp", "udp"} if st.get("udp") else {"tcp"}
+    return {"tcp"}
+
+
 out = set()
-for port, listen, proto, ss, st, enable in db.execute(
-        "select port, listen, protocol, stream_settings, settings, enable from inbounds"):
-    if not enable or (listen or "").strip() in ("127.0.0.1", "::1", "localhost"):
+for port, listen, proto, settings, stream, enable in db.execute(
+        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
+    listen = str(listen or "").strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
         continue
-    def load(v):
-        try:
-            return json.loads(v or "{}")
-        except ValueError:
-            return {}
-    s, cfg = load(ss), load(st)
-    udp_only = proto in ("wireguard", "hysteria", "hysteria2", "tuic") or s.get("network") in ("kcp", "quic")
-    if not udp_only:
-        out.add("%s/tcp" % port)
-    if udp_only or "udp" in str(cfg.get("network", "")).lower() or cfg.get("udp") is True:
-        out.add("%s/udp" % port)
-for p in sorted(out):
-    print(p)
+    if not enable or port <= 0 or listen.startswith(("127.", "/", "@")) or listen in ("::1", "[::1]", "localhost"):
+        continue
+    try:
+        kinds = kinds_of(proto, obj(settings), obj(stream))
+    except Exception:   # строку не разобрать — порт всё равно не терять (считаем его TCP), остальные строки читаем дальше
+        kinds = {"tcp"}
+    out.update((port, k) for k in kinds)
+for port, kind in sorted(out):
+    print("%d/%s" % (port, kind))
 PY
 }
 
@@ -730,10 +769,12 @@ fi
 
 say "Фаервол ufw"
 if [ "$DO_UFW" = 1 ]; then
-	# Порты SSH: из настроек sshd и тот, через который вошли сейчас (в том числе бот при переезде).
+	# Порты SSH: из настроек sshd, тот, через который вошли сейчас (в том числе бот при переезде), и те, что sshd
+	# слушает на деле (порт может быть задан не в sshd_config, а SSH_CONNECTION под sudo или с консоли нет).
 	SSH_OPEN=$( {
-		sshd -T 2>/dev/null | awk '$1=="port"{print $2"/tcp"}'
-		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
+		sshd -T 2>/dev/null | awk '$1=="port"{print $2"/tcp"}' || true
+		[ -z "${SSH_CONNECTION:-}" ] || echo "${SSH_CONNECTION##* }/tcp"
+		sshd_listen_ports | sed 's|$|/tcp|'
 	} | sort -u | tr '\n' ' ')
 	OPEN=$( {
 		for p in $SSH_OPEN; do echo "$p"; done
