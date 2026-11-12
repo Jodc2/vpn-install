@@ -43,6 +43,12 @@ fetch() {  # fetch ФАЙЛ АДРЕС
 	fi
 }
 mb_free() { df -k "$1" 2> /dev/null | tail -n 1 | awk '{print int($(NF-2) / 1024)}'; }   # свободно, МБ
+tmp_free() {  # сколько МБ можно занять в /tmp: он в памяти (tmpfs), и df показывает его потолок (половину всей памяти),
+	# а не то, что свободно сейчас, — поэтому не больше свободной памяти. tmp_free [ФАЙЛ_MEMINFO]
+	t=$(mb_free /tmp)
+	m=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' "${1:-/proc/meminfo}" 2> /dev/null)
+	if [ -n "$m" ] && [ "$m" -lt "${t:-0}" ]; then echo "$m"; else echo "${t:-0}"; fi
+}
 
 # ——— менеджер пакетов: opkg (OpenWrt 24.10 и старше) или apk (25.x) ———
 pm_update() { if [ "$PM" = apk ]; then run apk update; else run opkg update; fi; }
@@ -177,7 +183,14 @@ main() {
 	ok "память $ram МБ, свободно $root МБ, пакеты — $PM"
 
 	say "Выпуск PassWall2 на GitHub"
-	fetch "$W/release.json" "$API" || die "GitHub не отвечает (нет интернета на роутере или github.com недоступен) — ничего не изменено"
+	fetch "$W/release.json" "$API" || {
+		rc=$?
+		# wget (uclient-fetch) возвращает 8, curl — 22, когда сервер ответил, но ошибкой HTTP: связь есть, это отказ.
+		case $rc in
+			8 | 22) die "GitHub ответил отказом, а не списком файлов выпуска — чаще всего это лимит запросов с одного адреса (60 в час, ответ 403). Запустите через час; ничего не изменено" ;;
+		esac
+		die "GitHub не отвечает (нет интернета на роутере или github.com недоступен) — ничего не изменено"
+	}
 	tag=$(jsonfilter -i "$W/release.json" -e '@.tag_name' 2> /dev/null)
 	[ -n "$tag" ] || die "GitHub ответил непонятно (лимит запросов?) — запустите через час, ничего не изменено"
 	if [ "$PM" = apk ]; then
@@ -191,7 +204,7 @@ main() {
 	u_zip=$(asset "/$zip_name\$")
 	[ -n "$u_app" ] && [ -n "$u_zip" ] || die "в выпуске $tag нет пакетов для архитектуры $ARCH ($EXT) — для этой модели PassWall2 не собран"
 	zip_mb=$(jsonfilter -i "$W/release.json" -e "@.assets[@.name='$zip_name'].size" 2> /dev/null | awk '{print int($1 / 1048576) + 1}')
-	tmp=$(mb_free /tmp)
+	tmp=$(tmp_free)
 	[ "$tmp" -ge $((${zip_mb:-60} + 30)) ] || die "для загрузки нужно ~$((${zip_mb:-60} + 30)) МБ памяти в /tmp, свободно $tmp — перезагрузите роутер и запустите снова"
 	have=$(pm_ver luci-app-passwall2)
 	ok "PassWall2 $tag${have:+ (сейчас стоит $have)}"

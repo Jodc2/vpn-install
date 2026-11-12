@@ -1395,6 +1395,31 @@ test_fw_kept_ports_only_when_ufw_was_off() {  # фаервол уже включ
 	grep -q 'OTHER_VPN_PORTS \$KEEP' "$ROOT/src/install-vpn.sh.in" || t_fail "шаг фаервола не открывает порты подключений панели"
 }
 
+# ——— ревью 12.11: ядро установщика ———
+# Роутер (install-passwall2.sh): всё, что меняет систему, проверяется на настоящем OpenWrt (test/passwall2.container.sh);
+# здесь — только функции, которые ничего не трогают. pw_sh ОБОЛОЧКА 'команды' — выполнить их после определений скрипта.
+pw_sh() {
+	local sh=$1
+	shift
+	# shellcheck disable=SC2086  # «busybox ash» — два слова
+	$sh -c "$(sed -n '/^main() {/q; p' "$ROOT/install-passwall2.sh")
+$*"
+}
+test_passwall_tmp_room_is_free_memory() {  # /tmp роутера — в памяти: df показывает потолок tmpfs, а не свободную память
+	local sh df_mb
+	printf 'MemTotal:  250000 kB\nMemFree:  9000 kB\nMemAvailable:    40960 kB\n' > "$WORK/low"
+	printf 'MemTotal:  250000 kB\nMemAvailable: 999999999999 kB\n' > "$WORK/high"
+	printf 'MemTotal:  250000 kB\nMemFree:  9000 kB\n' > "$WORK/old-kernel"
+	for sh in dash "busybox ash"; do
+		df_mb=$(pw_sh "$sh" 'mb_free /tmp')
+		[ "$df_mb" -gt 40 ] || t_fail "$sh: в /tmp этой машины меньше 40 МБ — тест не о том"
+		t_eq 40 "$(pw_sh "$sh" "tmp_free '$WORK/low'")" "$sh: свободной памяти меньше, чем показывает df, — считаем по памяти"
+		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/high'")" "$sh: памяти больше, чем места в /tmp, — считаем по df"
+		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/old-kernel'")" "$sh: в meminfo нет MemAvailable — как раньше, по df"
+		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/нет-такого'")" "$sh: meminfo не прочитать — как раньше, по df"
+	done
+}
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.

@@ -27,7 +27,7 @@ for v in $VERS; do
 		PW_MIN_ROOT_MB=999999 sh /work/install-passwall2.sh > /tmp/o1.txt 2>&1; rc=$?
 		chk "код 1 и понятная причина" "[ $rc = 1 ] && grep -q \"во флеш-памяти\" /tmp/o1.txt"
 		chk "ничего не установлено" "! has luci-app-passwall2 && plain_dnsmasq"
-		# Подмена менеджера пакетов: что ломать — в /tmp/fake/mode, остальное уходит настоящей программе.
+		# Подмена менеджера пакетов и wget: что ломать — в /tmp/fake/mode, остальное уходит настоящей программе.
 		# «Сети нет» — имя сервера пакетов ведёт в никуда: на роутере без dnsmasq нет и DNS, докачать нечем.
 		mkdir -p /tmp/fake
 		net_on() { grep -v "^127.0.0.1 downloads.openwrt.org" /etc/hosts > /tmp/hosts.new; cat /tmp/hosts.new > /etc/hosts; }
@@ -78,6 +78,21 @@ W
 			rm -f /tmp/fake/mode
 			return $rc
 		}
+
+		echo "--- GitHub ответил отказом (403, лимит запросов) и GitHub недоступен — разные слова"
+		printf "#!/bin/sh\nexit \"\$(cat /tmp/fake/wget.rc)\"\n" > /tmp/fake/wget; chmod +x /tmp/fake/wget
+		echo 8 > /tmp/fake/wget.rc   # uclient-fetch: 8 — сервер ответил ошибкой HTTP
+		faulty http; rc=$?
+		chk "отказ: код 1, сказано про лимит запросов, не про интернет" "[ $rc = 1 ] && grep -q \"лимит запросов\" /tmp/o-http.txt && ! grep -q \"нет интернета\" /tmp/o-http.txt"
+		echo 4 > /tmp/fake/wget.rc   # uclient-fetch: 4 — соединиться не удалось
+		faulty net; rc=$?
+		chk "нет связи: код 1, сказано про интернет, не про лимит" "[ $rc = 1 ] && grep -q \"нет интернета\" /tmp/o-net.txt && ! grep -q \"лимит запросов\" /tmp/o-net.txt"
+		rm -f /tmp/fake/wget /tmp/fake/wget.rc
+		printf "#!/bin/sh\nexit 22\n" > /tmp/fake/curl; chmod +x /tmp/fake/curl   # curl -f: 22 — сервер ответил ошибкой HTTP
+		faulty http2; rc=$?
+		chk "отказ при скачивании через curl: тоже про лимит запросов" "[ $rc = 1 ] && grep -q \"лимит запросов\" /tmp/o-http2.txt && ! grep -q \"нет интернета\" /tmp/o-http2.txt"
+		rm -f /tmp/fake/curl
+		chk "ничего не установлено" "! has luci-app-passwall2 && plain_dnsmasq"
 
 		if command -v apk > /dev/null; then
 			echo "--- пакеты dnsmasq-full не скачались (apk): замена не начинается"
