@@ -3065,8 +3065,8 @@ fw_kept_ports() {  # фаервол ещё выключен — подключе
 	! ufw_active || return 0   # уже включён — его правила остаются как есть
 	xui_inbound_ports
 }
-say "Фаервол ufw"
-if [ "$DO_UFW" = 1 ]; then
+fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить
+	local KEEP OPEN KEPT CLOSING p pp
 	KEEP=$(fw_kept_ports)
 	OPEN=$( {
 		for p in $SSH_PORTS; do echo "$p/tcp"; done
@@ -3102,6 +3102,10 @@ if [ "$DO_UFW" = 1 ]; then
 		[ -z "$CLOSING" ] || warn "фаервол закроет и порты, которые сейчас слушает этот сервер: ${CLOSING}— если там нужная служба, откройте: ufw allow ПОРТ/tcp (или /udp)"
 	fi
 	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился (ufw status)"; fi
+}
+say "Фаервол ufw"
+if [ "$DO_UFW" = 1 ]; then
+	fw_step
 else
 	warn "фаервол не трогали (--no-ufw)"
 fi

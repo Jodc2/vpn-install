@@ -1436,6 +1436,60 @@ test_inbound_ports_odd_row_keeps_the_rest() {  # settings или stream_settings
 		"$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "порты: странные строки не теряются и не роняют остальные"
 }
 
+# Шаг «Фаервол ufw» целиком: ufw — заглушка (ответ на status — $UFW_SAYS, код — $UFW_STATUS_RC; команды из $UFW_FAIL
+# не проходят), всё, что скрипт у неё просит, — построчно в $WORK/ufw.calls; правила ufw — файл $UFW_RULES.
+fw_env() {
+	eval "$(awk '/^(fw_step|fw_kept_ports|fw_close|xui_inbound_ports|ufw_active|ufw_state|ufw_allows_tcp)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	say() { :; }
+	ok() { echo "OK $*" >> "$WORK/out"; }
+	warn() { echo "WARN $*" >> "$WORK/out"; }
+	bad() { echo "BAD $*" >> "$WORK/out"; }
+	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
+	ufw() {
+		local f
+		if [ "$1" = status ]; then
+			[ -z "$UFW_STATUS_RC" ] || return "$UFW_STATUS_RC"
+			printf '%s\n' "$UFW_SAYS"
+			return 0
+		fi
+		echo "$*" >> "$WORK/ufw.calls"
+		while IFS= read -r f; do [ "$f" != "$*" ] || return 1; done <<< "$UFW_FAIL"
+		[ "$*" != "--force enable" ] || UFW_SAYS="Status: active"
+	}
+	ss() { cat "$WORK/ss.out" 2> /dev/null || true; }
+	port_users() { :; }
+	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env UFW_RULES=$WORK/user.rules
+	MODE=nodomain PANEL_PUBLIC=0 SUB_TLS=0 SUB_PORT=2096 WEB_PORT=54321 REALITY_PORT=2083 SSH_PORTS=22
+	OTHER_VPN='' OTHER_VPN_PORTS='' MOVED_FROM='' FAILS=0
+	UFW_SAYS="Status: inactive" UFW_STATUS_RC='' UFW_FAIL=''
+	unset SSH_CONNECTION   # тесты идут и по SSH: порты SSH шагу задаёт только $SSH_PORTS
+	: > "$WORK/out"; : > "$WORK/ufw.calls"; : > "$UFW_RULES"
+}
+fw_called() { grep -qxF -- "$1" "$WORK/ufw.calls"; }
+fw_calls() { tr '\n' ';' < "$WORK/ufw.calls"; }
+ACTIVE=$'Status: active\n\nTo                         Action      From\n--                         ------      ----\n22/tcp                     ALLOW       Anywhere'
+
+test_fw_closes_ports_nobody_uses() {  # обратная сторона: порт без включённого подключения, слушающего снаружи, закрывается как раньше
+	fw_env; UFW_SAYS=$ACTIVE MOVED_FROM=443
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' \
+		'80||vless|{}|{"network":"ws"}|0' '2096|127.0.0.1|vmess|{}|{}|1' '1443||vless|{}|{}|1' '8080||vless|{}|{}|1'
+	fw_step
+	fw_called "delete allow 80/tcp" || t_fail "выключенное подключение на 80 — порт не закрыт: $(fw_calls)"
+	fw_called "delete allow 2096/tcp" || t_fail "подключение только на 127.0.0.1:2096 — порт не закрыт: $(fw_calls)"
+	fw_called "delete allow 54321/tcp" || t_fail "порт панели (--panel-local) не закрыт: $(fw_calls)"
+	fw_called "delete allow 443/tcp" || t_fail "старый порт подключения 443 не закрыт (на 1443 — другое подключение): $(fw_calls)"
+	t_has "старый порт подключения 443 закрыт" "$(cat "$WORK/out")" "сообщение"
+}
+test_fw_off_keeps_inbound_ports_and_enables() {  # ufw был выключен: порты подключений панели разрешаются до включения
+	fw_env
+	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1' '80||vless|{}|{}|1'
+	fw_step
+	t_eq "allow 22/tcp;allow 80/tcp;allow 2083/tcp;allow 8443/tcp;delete allow 2096/tcp;delete allow 54321/tcp;--force enable;" "$(fw_calls)" "что попросили у ufw"
+	t_has "доступны, как раньше: 80/tcp 8443/tcp" "$(cat "$WORK/out")" "сказано про порты подключений"
+	t_has "OK включён, открыто: 22/tcp 80/tcp 2083/tcp 8443/tcp" "$(cat "$WORK/out")" "итог"
+}
+
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.
