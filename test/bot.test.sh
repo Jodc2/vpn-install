@@ -321,77 +321,177 @@ test_no_xray_restart_on_client_disable() {
 	sed -n '/^COMMON_SETTINGS=(/,/)$/p' "$ROOT/src/install-vpn.sh.in" | grep -q '"restartXrayOnClientDisable=false"' ||
 		t_fail "в настройках панели нет restartXrayOnClientDisable=false"
 }
-# ——— запасной режим цепочки: метки правил (Xray 26.10+ не запускается при повторе ruleTag) ———
-fallback_env() {
+# ——— цепочка: на запасной выход и обратно переключает сам Xray (балансировщики + burstObservatory); сторожа нет ———
+chain_tpl_env() {
 	base_env
 	DB=$WORK/x-ui.db
 	sqlite3 "$DB" "create table settings (id integer primary key autoincrement, key text, value text);"
-	eval "$(awk '/^(template_json|chain_activate)\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(template_json|chain_active)\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in")"
 	echo '{"tag": "warp", "protocol": "wireguard", "settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "domainStrategy": "ForceIPv4v6", "peers": [{"publicKey": "p", "endpoint": "192.0.2.1:2408"}], "noKernelTun": true}}' > "$WORK/warp.json"
 	echo '{"tag": "chain", "protocol": "vless", "settings": {"vnext": [{"address": "192.0.2.9", "port": 2087, "users": [{"id": "u", "encryption": "none", "flow": ""}]}]}}' > "$WORK/chain.json"
-	template_json chain "$WORK/warp.json" "$WORK/chain.json" > "$WORK/tpl.json"
-	sqlite3 "$DB" "insert into settings (key, value) values ('xrayTemplateConfig', readfile('$WORK/tpl.json'));"
 }
-tpl_rules() {  # правила шаблона из базы: «outboundTag ruleTag» построчно
-	sqlite3 "$DB" "select value from settings where key='xrayTemplateConfig';" |
-		python3 -I -c 'import json, sys; [print(r.get("outboundTag"), r.get("ruleTag") or "-") for r in json.load(sys.stdin)["routing"]["rules"]]'
-}
-dup_tags() { tpl_rules | awk '$2 != "-" {print $2}' | sort | uniq -d | tr '\n' ' '; }
-test_fallback_rule_tags_unique() {
-	fallback_env
-	chain_activate fallback
-	t_eq "" "$(dup_tags)" "повтор ruleTag в запасном режиме"
-	t_eq 2 "$(tpl_rules | grep -c '^warp ')" "правил «через WARP»"
-	t_eq "direct main" "$(tpl_rules | grep ' main$')" "главное правило — напрямую"
-}
-test_fallback_round_trip() {  # туда-обратно и снова туда: правила РФ не копятся, метки не повторяются
-	fallback_env
-	chain_activate fallback; chain_activate chain
-	t_eq 0 "$(tpl_rules | grep -c '^warp ')" "после возврата правил WARP нет"
-	t_eq "chain main" "$(tpl_rules | grep ' main$')" "главное правило — цепочка"
-	chain_activate fallback; chain_activate fallback
-	t_eq 2 "$(tpl_rules | grep -c '^warp ')" "правил WARP после двух переключений подряд"
-	t_eq "" "$(dup_tags)" "повтор ruleTag"
-}
-test_fallback_heals_old_template() {  # шаблон прежней версии: два правила с одной меткой — убираются, ставятся с разными
-	fallback_env
-	sqlite3 "$DB" "select value from settings where key='xrayTemplateConfig';" | python3 -I -c '
+tpl_routes() {  # tpl_routes ШАБЛОН → правила «метка>куда» через пробел; куда — выход или @балансировщик
+	python3 -I -c '
 import json, sys
-t = json.load(sys.stdin)
-r = t["routing"]["rules"]
-at = next(i for i, x in enumerate(r) if x.get("ruleTag") == "dns-out")
-r[at:at] = [{"type": "field", "ruleTag": "ru-via-warp", "outboundTag": "warp", "domain": ["geosite:category-ru"]},
-            {"type": "field", "ruleTag": "ru-via-warp", "outboundTag": "warp", "ip": ["geoip:ru"]}]
-open(sys.argv[1], "w").write(json.dumps(t))' "$WORK/old.json"
-	sqlite3 "$DB" "update settings set value=readfile('$WORK/old.json') where key='xrayTemplateConfig';"
-	chain_activate chain
-	t_eq 0 "$(tpl_rules | grep -c '^warp ')" "старые правила РФ убраны"
-	chain_activate fallback
-	t_eq "" "$(dup_tags)" "повтор ruleTag"
+t = json.load(open(sys.argv[1]))
+print(" ".join("%s>%s" % (r.get("ruleTag") or "-", r.get("outboundTag") or "@" + str(r.get("balancerTag"))) for r in t["routing"]["rules"]))' "$1"
 }
-wd_fns() {  # state и switch из встроенного сторожа (vpn-exit-watchdog.sh)
-	fallback_env
-	systemctl() { :; }
-	sed -n "/^\tcat > \/usr\/local\/bin\/vpn-exit-watchdog.sh <<'VPN_WD'$/,/^VPN_WD$/p" "$ROOT/src/install-vpn.sh.in" | sed '1d;$d' > "$WORK/wd.sh"
-	[ -s "$WORK/wd.sh" ] || t_fail "сторож не найден в шаблоне"
-	eval "$(awk '/^(state|switch)\(\) \{/,/^}$/' "$WORK/wd.sh")"
-	CHAIN=chain
+tpl_failover() {  # tpl_failover ШАБЛОН → «балансировщики | проверка выхода» — что Xray сделает, когда выход упадёт
+	python3 -I -c '
+import json, sys
+t = json.load(open(sys.argv[1]))
+b = " ".join("%s:%s>%s" % (x["tag"], ",".join(x["selector"]), x.get("fallbackTag", "-")) for x in t["routing"].get("balancers") or [])
+o = t.get("burstObservatory") or t.get("observatory")
+p = (o or {}).get("pingConfig") or {}
+print("%s | %s" % (b or "-", "%s %s %s/%s" % (",".join(o["subjectSelector"]), p.get("destination"), p.get("interval"), p.get("sampling")) if o else "-"))' "$1"
 }
-test_watchdog_fallback_rule_tags_unique() {
-	wd_fns
-	switch fallback || t_fail "switch fallback"
-	t_eq direct "$(state)" "главный выход в запасном режиме"
-	t_eq "" "$(dup_tags)" "повтор ruleTag у сторожа"
-	switch chain || t_fail "switch chain"
-	switch fallback || t_fail "switch fallback ещё раз"
-	t_eq 2 "$(tpl_rules | grep -c '^warp ')" "правил WARP у сторожа"
-	t_eq "" "$(dup_tags)" "повтор ruleTag у сторожа после круга"
+test_chain_template_failover_by_xray() {  # выход жив — всё через него; умер — Xray сам: российские сайты через WARP, остальное и DNS напрямую
+	chain_tpl_env
+	template_json chain "$WORK/warp.json" "$WORK/chain.json" > "$WORK/t.json"
+	t_eq "->api ->blocked ->blocked ru-exit>@exit-ru ru-exit-ip>@exit-ru dns-out>@exit main>@exit" "$(tpl_routes "$WORK/t.json")" "правила цепочки"
+	t_eq "exit:chain>direct exit-ru:chain>warp | chain https://www.google.com/generate_204 15s/4" "$(tpl_failover "$WORK/t.json")" "переключение"
+	t_eq "chain warp direct blocked" "$(python3 -I -c 'import json, sys; print(" ".join(o["tag"] for o in json.load(open(sys.argv[1]))["outbounds"]))' "$WORK/t.json")" "выходы"
 }
-test_watchdog_and_installer_switch_alike() {  # одна логика в двух местах — расходиться им нельзя
-	wd_fns
-	a=$(awk '/^chain_activate\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in" | sed -n "/^import json$/,/^db.commit()$/p" | sed 's/, timeout=30//')
-	b=$(awk '/^switch\(\) \{/,/^}$/' "$WORK/wd.sh" | sed -n "/^import json$/,/^db.commit()$/p" | sed 's/, timeout=30//')
-	[ -n "$a" ] && [ "$a" = "$b" ] || t_fail "переключение в установщике и в стороже разошлось: $(diff <(echo "$a") <(echo "$b") | head -6 | tr '\n' ' ')"
+test_chain_template_without_warp() {  # без WARP правил для российских сайтов нет: упал выход — всё напрямую
+	chain_tpl_env
+	template_json chain - "$WORK/chain.json" > "$WORK/t.json"
+	t_eq "->api ->blocked ->blocked dns-out>@exit main>@exit" "$(tpl_routes "$WORK/t.json")" "правила"
+	t_eq "exit:chain>direct | chain https://www.google.com/generate_204 15s/4" "$(tpl_failover "$WORK/t.json")" "переключение"
+}
+test_other_exits_without_balancers() {  # балансировщики и проверка — только у цепочки
+	chain_tpl_env
+	for m in direct warp warp-ru; do
+		template_json "$m" "$WORK/warp.json" > "$WORK/t-$m.json"
+		t_eq "- | -" "$(tpl_failover "$WORK/t-$m.json")" "режим $m"
+	done
+}
+chain_db() {  # chain_db ПОРТ — шаблон цепочки в базу, метрики Xray на 127.0.0.1:ПОРТ
+	template_json chain "$WORK/warp.json" "$WORK/chain.json" |
+		python3 -I -c 'import json, sys; t = json.load(sys.stdin); t["metrics"]["listen"] = "127.0.0.1:" + sys.argv[1]; print(json.dumps(t))' "$1" > "$WORK/t.json"
+	sqlite3 "$DB" "delete from settings; insert into settings (key, value) values ('xrayTemplateConfig', readfile('$WORK/t.json'));"
+}
+test_chain_active_from_xray_check() {  # какой путь сейчас работает — по проверке выхода самим Xray (его метрики)
+	chain_tpl_env
+	port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+	chain_db "$port"
+	mkdir -p "$WORK/www/debug"
+	echo '{"observatory": {"chain": {"alive": true, "delay": 40, "outbound_tag": "chain"}}}' > "$WORK/www/debug/vars"
+	python3 -I -m http.server "$port" --bind 127.0.0.1 --directory "$WORK/www" > /dev/null 2>&1 &
+	srv=$!
+	trap 'kill "$srv" 2> /dev/null || true; rm -rf "$WORK"' EXIT   # под set -e неудачный kill в ловушке сменил бы код выхода
+	for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$port/debug/vars" && break; python3 -c 'import time; time.sleep(0.1)'; done
+	t_eq chain "$(chain_active)" "выход жив"
+	# у мёртвого выхода Xray поля alive не пишет вовсе (json omitempty) — образец как у настоящего Xray
+	echo '{"observatory": {"chain": {"outbound_tag": "chain", "last_error_reason": "dial tcp: i/o timeout", "last_try_time": 1}}}' > "$WORK/www/debug/vars"
+	t_eq direct "$(chain_active)" "выход мёртв — запасной режим"
+	echo '{"observatory": {}}' > "$WORK/www/debug/vars"
+	t_eq chain "$(chain_active)" "проверок ещё не было — Xray считает выход живым"
+	kill "$srv"; wait "$srv" 2> /dev/null || true
+	t_eq chain "$(chain_active)" "метрики не отвечают"
+}
+test_chain_active_watchdog_era_template() {  # шаблон времён сторожа: путь записан в самом правиле — читается как раньше
+	chain_tpl_env
+	echo '{"routing": {"rules": [{"type": "field", "ruleTag": "main", "network": "tcp,udp", "outboundTag": "direct"}]}, "outbounds": [{"tag": "chain"}]}' > "$WORK/old.json"
+	sqlite3 "$DB" "insert into settings (key, value) values ('xrayTemplateConfig', readfile('$WORK/old.json'));"
+	t_eq direct "$(chain_active)" "запасной режим прежнего сторожа"
+}
+test_installer_has_no_watchdog() {  # сторож не ставится; сторож прежних версий снимается при любом выходе — после успешной установки
+	if grep -nE 'install_watchdog|VPN_WD|chain_activate' "$ROOT/src/install-vpn.sh.in"; then t_fail "в установщике остался сторож"; fi
+	rm_line=$(tl "^if grep -qs 'EXIT_IP=' /etc/systemd/system/vpn-exit-watchdog.service; then\$")
+	[ -n "$rm_line" ] || t_fail "нет снятия сторожа прежних версий"
+	if sed -n "${rm_line}p" "$ROOT/src/install-vpn.sh.in" | grep -q 'EXIT_MODE'; then t_fail "сторож снимается не при любом выходе"; fi
+	done_line=$(tl '^INSTALL_DONE=1')
+	[ "$rm_line" -gt "$done_line" ] || t_fail "сторож снимается раньше INSTALL_DONE (строка $rm_line < $done_line): оборвись установка — вернётся прежний шаблон, а сторожа уже нет"
+}
+tpl_tags() { sqlite3 "$DB" "select value from settings where key='xrayTemplateConfig';" | python3 -I -c 'import json, sys; print(" ".join(r.get("ruleTag") or "-" for r in json.load(sys.stdin)["routing"]["rules"]))'; }
+test_heal_rule_tags_old_fallback() {  # запасной режим сторожа до 3.11: «ru-via-warp» на двух правилах — Xray 26.10+ с этим не запускается
+	chain_tpl_env
+	eval "$(awk '/^heal_rule_tags\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in")"
+	cat > "$WORK/old.json" << 'J'
+{"routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+  {"type": "field", "ruleTag": "ru-via-warp", "outboundTag": "warp", "domain": ["geosite:category-ru", "domain:ru"]},
+  {"type": "field", "ruleTag": "ru-via-warp", "outboundTag": "warp", "ip": ["geoip:ru"]},
+  {"type": "field", "ruleTag": "dns-out", "inboundTag": ["dns-internal"], "outboundTag": "direct"},
+  {"type": "field", "ruleTag": "main", "network": "tcp,udp", "outboundTag": "direct"}]}, "outbounds": [{"tag": "chain"}]}
+J
+	sqlite3 "$DB" "insert into settings (key, value) values ('xrayTemplateConfig', readfile('$WORK/old.json'));"
+	heal_rule_tags > /dev/null
+	t_eq "- ru-via-warp ru-via-warp-ip dns-out main" "$(tpl_tags)" "метки разведены"
+	before=$(sqlite3 "$DB" "select value from settings where key='xrayTemplateConfig';")
+	heal_rule_tags > /dev/null
+	t_eq "$before" "$(sqlite3 "$DB" "select value from settings where key='xrayTemplateConfig';")" "повторный вызов ничего не меняет"
+}
+test_heal_rule_tags_before_first_start() {  # разводятся после установки новой программы и до первого запуска x-ui
+	local mig heal first
+	mig=$(tl '"\$XUI" migrate')
+	heal=$(tl 'heal_rule_tags' "$mig")
+	first=$(tl '^systemctl restart x-ui \|\| die' "$mig")
+	[ -n "$heal" ] && [ -n "$first" ] && [ "$heal" -lt "$first" ] || t_fail "heal_rule_tags (строка ${heal:-нет}) — не до первого запуска x-ui (строка ${first:-нет})"
+}
+test_xui_upgrade_keeps_prev_program() {  # прежняя 3x-ui при замене откладывается, а не удаляется; после успешной установки копия убирается
+	local mv tarl done rmp
+	grep -qE '^\s*rm -rf /usr/local/x-ui$' "$ROOT/src/install-vpn.sh.in" && t_fail "прежняя 3x-ui удаляется — откатывать будет нечего"
+	mv=$(tl 'mv "\$XUI_DIR" "\$XUI_PREV"')
+	tarl=$(tl '^\ttar -C /usr/local -xzf "\$TMP/x-ui.tgz"$')
+	[ -n "$mv" ] && [ -n "$tarl" ] && [ "$mv" -lt "$tarl" ] || t_fail "прежняя программа не отложена до распаковки новой (mv ${mv:-нет}, tar ${tarl:-нет})"
+	done=$(tl '^INSTALL_DONE=1')
+	rmp=$(tl 'rm -rf "\$XUI_PREV"' "$done")
+	[ -n "$rmp" ] || t_fail "после INSTALL_DONE отложенная копия не убирается"
+}
+prog_script() {  # как exit_script, только запуск уже заменил 3x-ui: прежняя версия отложена в $T/xui.before-install
+	exit_script
+	python3 -I - "$WORK/exit.sh" << 'PY2'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+anchor = 'echo "база до запуска" > "$WORK/db.before"\n'
+assert s.count(anchor) == 1
+s = s.replace(anchor, anchor + """XUI_DIR=$T/xui XUI_CMD=$T/x-ui.cmd XUI_UNIT=$T/x-ui.service XUI_PREV=$T/xui.before-install
+mkdir -p "$XUI_DIR" "$XUI_PREV"; echo новая > "$XUI_DIR/version"; echo прежняя > "$XUI_PREV/version"
+echo новый > "$XUI_CMD"; echo новый > "$XUI_UNIT"; echo прежний > "$WORK/x-ui.cmd.before"; echo прежний > "$WORK/x-ui.service.before"
+""")
+open(p, "w", encoding="utf-8").write(s)
+PY2
+}
+test_exit_rolls_back_xui_program() {  # запуск заменил 3x-ui и оборвался: вместе с базой из снимка возвращается и её программа
+	local calls
+	prog_script
+	t_eq 1 "$(WORK_STEPS=2 FAIL_AT_END=1 sig_run none)" "запуск с ошибкой"
+	exit_rolled_back "ошибка после замены 3x-ui"
+	t_eq прежняя "$(cat "$WORK/xui/version")" "программа 3x-ui"
+	[ ! -e "$WORK/xui.before-install" ] || t_fail "отложенная копия осталась"
+	t_eq "прежний прежний" "$(cat "$WORK/x-ui.cmd") $(cat "$WORK/x-ui.service")" "x-ui.sh и служба"
+	calls=$(tr '\n' ';' < "$WORK/calls")
+	[[ $calls == *"systemctl daemon-reload;"*"systemctl start x-ui;"* ]] || t_fail "служба перечитана не до запуска x-ui: $calls"
+	grep -q '3x-ui возвращена прежней версии' "$WORK/install.log" || t_fail "в журнале нет записи о возврате программы: $(tr '\n' ';' < "$WORK/install.log")"
+}
+test_exit_drops_prev_xui_when_nothing_to_restore() {  # x-ui до запуска не работал (снимка нет) — откатывать нечего, копию не оставляем
+	prog_script
+	sed -i 's/XUI_WAS_ACTIVE=1/XUI_WAS_ACTIVE=0/' "$WORK/exit.sh"
+	t_eq 1 "$(WORK_STEPS=2 FAIL_AT_END=1 sig_run none)" "запуск с ошибкой"
+	t_eq новая "$(cat "$WORK/xui/version")" "программа — новая (база уже перенесена на неё)"
+	[ ! -e "$WORK/xui.before-install" ] || t_fail "отложенная копия осталась на диске"
+}
+test_xray_check_wait() {  # vpn-check в цепочке ждёт первую проверку выхода самим Xray (до неё Xray считает выход живым), но не дольше предела
+	local port t0 dt
+	chain_tpl_env
+	eval "$(awk '/^xray_check_wait\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in")"
+	port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+	chain_db "$port"
+	mkdir -p "$WORK/www/debug"; echo '{"observatory": {}}' > "$WORK/www/debug/vars"
+	python3 -I -m http.server "$port" --bind 127.0.0.1 --directory "$WORK/www" > /dev/null 2>&1 &
+	srv=$!
+	trap 'kill "$srv" 2> /dev/null || true; rm -rf "$WORK"' EXIT   # под set -e неудачный kill в ловушке сменил бы код выхода
+	for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$port/debug/vars" && break; python3 -c 'import time; time.sleep(0.1)'; done
+	t0=$(date +%s%N); XRAY_CHECK_WAIT=1 xray_check_wait; dt=$((($(date +%s%N) - t0) / 1000000))
+	[ "$dt" -ge 900 ] && [ "$dt" -lt 4000 ] || t_fail "без результата проверки ждали $dt мс, а нужно ~1000 (предел XRAY_CHECK_WAIT=1)"
+	echo '{"observatory": {"chain": {"outbound_tag": "chain"}}}' > "$WORK/www/debug/vars"
+	t0=$(date +%s%N); XRAY_CHECK_WAIT=5 xray_check_wait; dt=$((($(date +%s%N) - t0) / 1000000))
+	[ "$dt" -lt 1500 ] || t_fail "результат уже есть, а ждали $dt мс"
+	template_json direct - > "$WORK/t.json"; sqlite3 "$DB" "delete from settings; insert into settings (key, value) values ('xrayTemplateConfig', readfile('$WORK/t.json'));"
+	kill "$srv"; wait "$srv" 2> /dev/null || true
+	t0=$(date +%s%N); XRAY_CHECK_WAIT=5 xray_check_wait; dt=$((($(date +%s%N) - t0) / 1000000))
+	[ "$dt" -lt 1500 ] || t_fail "без цепочки ждать нечего, а ждали $dt мс"
 }
 # ——— выход WARP в виде Xray 26.9.30+: settings.domainStrategy у WireGuard ядро молча игнорирует ———
 warp_shape() {  # warp_shape ШАБЛОН → «settings.domainStrategy|targetStrategy|sockopt.domainStrategy» у выхода warp
@@ -401,7 +501,8 @@ w = next(o for o in json.load(open(sys.argv[1]))["outbounds"] if o["tag"] == "wa
 print("%s|%s|%s" % (w["settings"].get("domainStrategy", "-"), w.get("targetStrategy", "-"), (w.get("streamSettings") or {}).get("sockopt", {}).get("domainStrategy", "-")))' "$1"
 }
 test_template_warp_modern_strategy() {  # сохранённая копия WARP прежней версии — в шаблон уходит уже в новом виде
-	fallback_env
+	chain_tpl_env
+	template_json chain "$WORK/warp.json" "$WORK/chain.json" > "$WORK/tpl.json"
 	for m in warp warp-ru; do
 		template_json "$m" "$WORK/warp.json" > "$WORK/t-$m.json"
 		t_eq "-|ForceIPv4v6|ForceIPv4v6" "$(warp_shape "$WORK/t-$m.json")" "выход warp в режиме $m"
@@ -409,13 +510,13 @@ test_template_warp_modern_strategy() {  # сохранённая копия WARP
 	t_eq "-|ForceIPv4v6|ForceIPv4v6" "$(warp_shape "$WORK/tpl.json")" "выход warp в цепочке"
 }
 test_template_warp_keeps_set_strategy() {  # уже новый вид не трогаем: своя стратегия человека остаётся
-	fallback_env
+	chain_tpl_env
 	echo '{"tag": "warp", "protocol": "wireguard", "targetStrategy": "UseIPv4", "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4"}}, "settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "peers": [{"publicKey": "p", "endpoint": "192.0.2.1:2408"}]}}' > "$WORK/w2.json"
 	template_json warp "$WORK/w2.json" > "$WORK/t2.json"
 	t_eq "-|UseIPv4|UseIPv4" "$(warp_shape "$WORK/t2.json")" "своя стратегия"
 }
 test_warp_register_modern_shape() {  # новая регистрация WARP — сразу в новом виде
-	fallback_env
+	chain_tpl_env
 	eval "$(awk '/^warp_register\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in")"
 	WARP_ENDPOINT=192.0.2.1:2408
 	save_warp() { cp "$1" "$WORK/saved.json"; }

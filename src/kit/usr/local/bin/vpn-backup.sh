@@ -160,9 +160,11 @@ for o in obs:
     if o.get("protocol") in ("vless", "vmess", "trojan"):
         v = ((o.get("settings") or {}).get("vnext") or [{}])[0]
         wd = os.path.exists("/etc/systemd/system/vpn-exit-watchdog.service")
+        xr = bool((t.get("routing") or {}).get("balancers")) and bool(t.get("burstObservatory") or t.get("observatory"))
         print("  цепочка: outbound %s -> %s:%s%s" % (
             o.get("tag"), v.get("address"), v.get("port"),
-            " (если выход недоступен, вотчдог переключает на WARP)" if wd else ""))
+            " (если выход недоступен, Xray сам переключает: российские сайты через WARP, остальное напрямую)" if xr
+            else " (если выход недоступен, вотчдог переключает на WARP)" if wd else ""))
 PY
 if [ -n "$DOMAIN" ]; then
 	{

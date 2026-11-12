@@ -174,6 +174,32 @@ for o in t.get("outbounds") or []:
 PY
 }
 
+xray_chain_state() {  # цепочка, где на запасной выход переключает сам Xray (проверка выхода в шаблоне): дождаться первой
+	# проверки (до 12 с; до неё Xray считает выход живым) → alive | dead. Без такой проверки — пусто.
+	python3 - "$DB" <<'PY' 2>/dev/null || true
+import json, sqlite3, sys, time, urllib.request
+row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+t = json.loads(row[0]) if row and row[0] else {}
+o = t.get("burstObservatory") or t.get("observatory")
+if not o:
+    sys.exit(0)
+pref = (o.get("subjectSelector") or ["chain"])[0]
+listen = (t.get("metrics") or {}).get("listen") or "127.0.0.1:11111"
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+end = time.time() + 12
+while time.time() < end:
+    try:
+        obs = json.load(opener.open("http://%s/debug/vars" % listen, timeout=2)).get("observatory") or {}
+        st = next((v for k, v in obs.items() if k.startswith(pref)), None)
+        if st is not None:
+            print("alive" if st.get("alive") else "dead")
+            sys.exit(0)
+    except Exception:
+        pass
+    time.sleep(0.5)
+PY
+}
+
 local_scheme() {  # local_scheme webCertFile|subCertFile → https, если панель/подписка сама держит TLS, иначе http
 	if [ -n "$(setting "$1")" ]; then echo https; else echo http; fi
 }
@@ -286,7 +312,7 @@ tunnel_check() {  # tunnel_check LINK XRAY → «код_ответа ip_выхо
 
 verify() {
 	say "Проверка"
-	local T s p code code2 n link xray_bin exit_ip exit_warp chain log web_port web_path sub_port subid want sub_listen
+	local T s p code code2 n link xray_bin exit_ip exit_warp chain cst log web_port web_path sub_port subid want sub_listen
 	T=$(mktemp -d)
 	web_port=$(setting webPort); web_path=$(setting webBasePath)
 	sub_port=$(setting subPort)
@@ -369,6 +395,7 @@ verify() {
 
 	xray_bin=$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -1 || true)
 	if [ -n "$link" ] && [ -n "$xray_bin" ]; then
+		cst=$(xray_chain_state)
 		read -r code exit_ip exit_warp log <<<"$(tunnel_check "$link" "$xray_bin")"
 		chain=$(chain_exit)
 		if [ "$code" = 204 ]; then
@@ -379,7 +406,11 @@ verify() {
 				ok "туннель по ссылке клиента работает (выход цепочкой через сервер ${chain%:*})"
 			else
 				ok "туннель по ссылке клиента работает (выход в интернет с IP $exit_ip)"
-				[ "$exit_ip" = "$PUBLIC_IP" ] || warn "IP выхода $exit_ip не совпал с IP сервера $PUBLIC_IP"
+				if [ -n "$chain" ] && [ "$cst" = dead ]; then
+					warn "основной выход — сервер ${chain%:*}, а сейчас запасной режим (российские сайты через WARP, остальное напрямую): с этого IP он недоступен — на нём: ufw allow from $PUBLIC_IP to any port ${chain##*:} proto tcp (у AWS/Oracle — и в панели хостера); как откроют, переключится сам"
+				elif [ "$exit_ip" != "$PUBLIC_IP" ]; then
+					warn "IP выхода $exit_ip не совпал с IP сервера $PUBLIC_IP"
+				fi
 			fi
 		elif [[ $link == *fp=random* ]] && read -r code2 _ <<<"$(tunnel_check "${link/fp=random/fp=chrome}" "$xray_bin")" &&
 			[ "$code2" = 204 ]; then
@@ -388,7 +419,7 @@ verify() {
 		else
 			bad "туннель по ссылке клиента не работает (ответ $code): $log"
 			if [ -n "$chain" ]; then
-				warn "выход идёт цепочкой через ${chain%:*}: на нём должен быть открыт порт ${chain##*:} для этого сервера — ufw allow from $PUBLIC_IP to any port ${chain##*:} proto tcp (через 2 мин вотчдог переключит на WARP)"
+				warn "выход идёт цепочкой через ${chain%:*}: на нём должен быть открыт порт ${chain##*:} для этого сервера — ufw allow from $PUBLIC_IP to any port ${chain##*:} proto tcp (пока порт закрыт — запасной режим: российские сайты через WARP, остальное напрямую)"
 			elif grep -q '"warp"' <<<"$(setting xrayTemplateConfig)"; then
 				warn "выход клиентов идёт через Cloudflare WARP (outbound warp в шаблоне Xray): без WARP туннель не работает — см. README, «Тонкости»"
 			fi
@@ -415,7 +446,7 @@ final_note() {
 Выход клиентов идёт цепочкой через сервер ${chain%:*}. На нём должен быть открыт порт для нового IP:
   ufw allow from $PUBLIC_IP to any port ${chain##*:} proto tcp comment 'vpn entry'
 (у AWS и Oracle — ещё и в панели хостера: Security Group / Security List; старое правило для прежнего IP
-входа потом удалить: ufw status numbered → ufw delete N). Как порт откроется, вотчдог сам вернёт цепочку.
+входа потом удалить: ufw status numbered → ufw delete N). Как порт откроется, цепочка вернётся сама.
 EOF
 	fi
 	if [ "$FAILS" != 0 ]; then

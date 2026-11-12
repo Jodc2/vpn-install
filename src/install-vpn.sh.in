@@ -79,6 +79,8 @@ INFO=/root/vpn-info.txt
 LOG=/root/vpn-install.log
 DB=/etc/x-ui/x-ui.db
 XUI=/usr/local/x-ui/x-ui
+XUI_DIR=/usr/local/x-ui XUI_CMD=/usr/bin/x-ui XUI_UNIT=/etc/systemd/system/x-ui.service
+XUI_PREV=   # прежняя версия 3x-ui, отложенная этим запуском при замене: оборвётся запуск — on_exit вернёт её вместе с базой
 F2B_JAIL=/etc/fail2ban/jail.d/vpn-sshd.local
 UFW_RULES="/etc/ufw/user.rules /etc/ufw/user6.rules"   # правила ufw, как он сам их хранит (IPv4 и IPv6)
 WARP_ENDPOINT=162.159.192.8:2408   # engage.cloudflareclient.com по IP: имя через DNS дало бы петлю
@@ -1273,14 +1275,19 @@ local_checks() {
 		if wait_port "$p" 15; then ok "слушает $p"; else bad "никто не слушает $p"; fi
 	done
 	if [ "$(exit_mode_now)" = chain ]; then
+		xray_check_wait
 		s=$(chain_active)
 		if [ "$s" = chain ]; then
 			ok "выход клиентов: $(exit_label chain)"
 		else
-			warn "выход клиентов: $(exit_label chain), но сейчас $(active_label "$s"): старый сервер $CHAIN_IP:$CHAIN_PORT отсюда недоступен (выключен? порт закрыт у хостера?) — когда вернётся, вотчдог переключит сам"
+			warn "выход клиентов: $(exit_label chain), но сейчас $(active_label "$s"): старый сервер $CHAIN_IP:$CHAIN_PORT отсюда недоступен (выключен? порт закрыт у хостера?) — когда вернётся, переключится сам"
 		fi
-		if [ -f /etc/systemd/system/vpn-exit-watchdog.service ]; then
+		if [ -f /etc/systemd/system/vpn-exit-watchdog.service ]; then   # установка прежней версии: переключает сторож
 			if systemctl is-active -q vpn-exit-watchdog; then ok "вотчдог следит за старым сервером (упадёт — российские сайты через WARP, остальное напрямую; вернётся — назад)"; else bad "вотчдог не работает (journalctl -u vpn-exit-watchdog)"; fi
+		elif chain_by_xray; then
+			ok "за старым сервером следит сам Xray: упадёт — российские сайты через WARP, остальное напрямую; вернётся — назад"
+		else
+			bad "за старым сервером никто не следит: упадёт — клиенты останутся без интернета (повтори установку: bash install-vpn.sh)"
 		fi
 	else
 		ok "выход клиентов: $(exit_label "$(exit_mode_now)") (переключить: vpn-warp off|on|ru)"
@@ -1434,6 +1441,35 @@ for kv in sys.argv[2:]:
 db.commit()
 PY
 }
+heal_rule_tags() {  # метки правил шаблона Xray — без повторов (x-ui остановлен); печатает, сколько развела
+	# Xray 26.10+ не запускается, если у двух правил один ruleTag, а сторож цепочки версий до 3.11 в запасном режиме
+	# ставил «ru-via-warp» на два правила. Шаблон с ними остаётся до переписывания цепочки, а x-ui запускается раньше.
+	[ -s "$DB" ] || return 0
+	python3 - "$DB" <<'PY'
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=30)
+row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+t = json.loads(row[0]) if row and row[0] else {}
+seen, fixed = set(), 0
+for r in (t.get("routing") or {}).get("rules") or []:
+    tag = r.get("ruleTag")
+    if not tag:
+        continue
+    if tag in seen:
+        base = tag + "-ip" if r.get("ip") and not r.get("domain") else tag + "-2"
+        new, n = base, 2
+        while new in seen:
+            n += 1
+            new = "%s-%d" % (base, n)
+        r["ruleTag"] = new
+        fixed += 1
+    seen.add(r["ruleTag"])
+if fixed:
+    db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(t, ensure_ascii=False),))
+    db.commit()
+    print(fixed)
+PY
+}
 template_json() {  # template_json РЕЖИМ ФАЙЛ_WARP|- → шаблон Xray (проверенная схема)
 	python3 - "$1" "$2" "${3:--}" <<'PY'
 import json, sys
@@ -1461,24 +1497,48 @@ rules = [{"inboundTag": ["api"], "outboundTag": "api", "type": "field"},
 dns = ["1.1.1.1", "1.0.0.1"]
 if warp:
     dns = [{"address": "localhost", "domains": ["full:engage.cloudflareclient.com"], "skipFallback": True}] + dns
+RU = ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]
+balancers, observatory = [], None
 if mode == "warp" and warp:
     outbounds, main, dns_out = [warp, direct, blocked], "warp", "warp"
 elif mode == "warp-ru" and warp:
     outbounds, main, dns_out = [direct, warp, blocked], "direct", "warp"
-    rules += [{"type": "field", "outboundTag": "warp", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
+    rules += [{"type": "field", "outboundTag": "warp", "domain": RU},
               {"type": "field", "outboundTag": "warp", "ip": ["geoip:ru"]}]
 elif mode == "chain" and chain:
-    # Цепочка через чужой сервер первым выходом; WARP — для российских сайтов в запасном режиме (вотчдог переключает).
+    # Цепочка через чужой сервер: пока он жив — весь трафик и DNS через него. Упал — переключает сам Xray, без
+    # перезапусков: российские сайты — через WARP, остальное и DNS — напрямую; вернулся — снова всё через него.
+    # Так устроены балансировщики: у каждого один участник (chain) и свой запасной выход (fallbackTag). Жив ли
+    # старый сервер, Xray узнаёт сам (burstObservatory): запрос через цепочку раз в ~15 с; мёртв — после 4 неудач
+    # подряд, жив — с первой удачной. Проверено на Xray 26.10.21: обрыв сети до выхода — переключение за 75–90 с,
+    # закрытый порт — за ~40 с, возврат — за секунды.
     outbounds = [chain] + ([warp] if warp else []) + [direct, blocked]
-    main, dns_out = "chain", "chain"
+    main = dns_out = None
+    balancers = [{"tag": "exit", "selector": ["chain"], "strategy": {"type": "random"}, "fallbackTag": "direct"}]
+    if warp:
+        rules += [{"type": "field", "ruleTag": "ru-exit", "domain": RU, "balancerTag": "exit-ru"},
+                  {"type": "field", "ruleTag": "ru-exit-ip", "ip": ["geoip:ru"], "balancerTag": "exit-ru"}]
+        balancers.append({"tag": "exit-ru", "selector": ["chain"], "strategy": {"type": "random"}, "fallbackTag": "warp"})
+    observatory = {"subjectSelector": ["chain"],
+                   "pingConfig": {"destination": "https://www.google.com/generate_204", "interval": "15s",
+                                  "connectivity": "", "timeout": "5s", "sampling": 4, "httpMethod": "HEAD"}}
 else:
     outbounds, main, dns_out = [direct, blocked], "direct", "direct"
-# Метки main и dns-out: по ним вотчдог и vpn-check находят главные правила, а не по признакам.
-rules += [{"type": "field", "ruleTag": "dns-out", "inboundTag": ["dns-internal"], "outboundTag": dns_out},
-          {"type": "field", "ruleTag": "main", "network": "tcp,udp", "outboundTag": main}]
-print(json.dumps({
+
+
+def to(tag):  # куда ведёт главное правило: в цепочке — балансировщик exit, иначе — выход
+    return {"balancerTag": "exit"} if balancers else {"outboundTag": tag}
+
+
+# Метки main и dns-out: по ним vpn-check (и прежний сторож) находят главные правила, а не по признакам.
+rules += [dict({"type": "field", "ruleTag": "dns-out", "inboundTag": ["dns-internal"]}, **to(dns_out)),
+          dict({"type": "field", "ruleTag": "main", "network": "tcp,udp"}, **to(main))]
+routing = {"domainStrategy": "AsIs", "rules": rules}
+if balancers:
+    routing["balancers"] = balancers
+tpl = {
     "log": {"access": "none", "dnsLog": False, "error": "", "loglevel": "warning", "maskAddress": ""},
-    "routing": {"domainStrategy": "AsIs", "rules": rules},
+    "routing": routing,
     "inbounds": [{"listen": "127.0.0.1", "port": 62789, "protocol": "tunnel", "settings": {"rewriteAddress": "127.0.0.1"}, "tag": "api"}],
     "outbounds": outbounds,
     "policy": {"levels": {"0": {"statsUserDownlink": True, "statsUserOnline": True, "statsUserUplink": True}},
@@ -1486,8 +1546,10 @@ print(json.dumps({
     "api": {"services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"], "tag": "api"},
     "stats": {},
     "metrics": {"listen": "127.0.0.1:11111", "tag": "metrics_out"},
-    "dns": {"servers": dns, "queryStrategy": "UseIP", "tag": "dns-internal"},
-}, ensure_ascii=False))
+    "dns": {"servers": dns, "queryStrategy": "UseIP", "tag": "dns-internal"}}   # «}» не с начала строки: так конец функции ищут тесты
+if observatory:
+    tpl["burstObservatory"] = observatory
+print(json.dumps(tpl, ensure_ascii=False))
 PY
 }
 save_state() {
@@ -1585,14 +1647,60 @@ exit_label() {
 	esac
 }
 
-chain_active() {  # активный выход цепочки: chain (старый сервер) | direct (запасной: РФ через WARP) | warp (запасной прежней версии)
+chain_active() {  # активный выход цепочки: chain (старый сервер) | direct (запасной: РФ через WARP) | warp (запасной самой старой версии)
+	python3 - "$DB" <<'PY'
+import json, sqlite3, sys, urllib.request
+row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+t = json.loads(row[0]) if row and row[0] else {}
+routing = t.get("routing") or {}
+rules = routing.get("rules") or []
+cat = [r for r in rules if r.get("ruleTag") == "main"] or [r for r in rules if r.get("network") == "tcp,udp"]
+main = cat[0] if cat else {}
+if main.get("outboundTag"):   # шаблон времён сторожа: путь записан в самом правиле
+    print(main["outboundTag"])
+    sys.exit(0)
+# Переключает сам Xray (балансировщик): жив ли старый сервер — по его же проверке, из метрик Xray. Проверок ещё не было
+# или метрики не отвечают — «chain»: так считает и Xray, пока проверка не сказала обратного.
+bal = next((b for b in routing.get("balancers") or [] if b.get("tag") == main.get("balancerTag")), {})
+listen = (t.get("metrics") or {}).get("listen") or "127.0.0.1:11111"
+try:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    obs = json.load(opener.open("http://%s/debug/vars" % listen, timeout=3)).get("observatory") or {}
+except Exception:
+    obs = {}
+st = obs.get("chain") or {}
+print((bal.get("fallbackTag") or "direct") if (st and not st.get("alive")) else "chain")
+PY
+}
+
+xray_check_wait() {  # цепочка: подождать первую проверку старого сервера самим Xray, не дольше XRAY_CHECK_WAIT (12) секунд
+	# Сразу после запуска Xray результатов ещё нет, и выход считается живым: проверка туннеля ушла бы в цепочку, даже если
+	# её порт закрыт (облачный фаервол молча отбрасывает пакеты), — и показала бы ошибку там, где работает запасной режим.
+	python3 - "$DB" "${XRAY_CHECK_WAIT:-12}" <<'PY' || true
+import json, sqlite3, sys, time, urllib.request
+row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+t = json.loads(row[0]) if row and row[0] else {}
+if not (t.get("burstObservatory") or t.get("observatory")):
+    sys.exit(0)
+listen = (t.get("metrics") or {}).get("listen") or "127.0.0.1:11111"
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+end = time.time() + float(sys.argv[2])
+while time.time() < end:
+    try:
+        if "chain" in (json.load(opener.open("http://%s/debug/vars" % listen, timeout=2)).get("observatory") or {}):
+            sys.exit(0)
+    except Exception:
+        pass
+    time.sleep(0.5)
+PY
+}
+
+chain_by_xray() {  # шаблон с балансировщиком и проверкой выхода — на запасной выход переключает сам Xray
 	python3 - "$DB" <<'PY'
 import json, sqlite3, sys
 row = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select value from settings where key='xrayTemplateConfig'").fetchone()
 t = json.loads(row[0]) if row and row[0] else {}
-rules = (t.get("routing") or {}).get("rules") or []
-cat = [r for r in rules if r.get("ruleTag") == "main"] or [r for r in rules if r.get("network") == "tcp,udp"]
-print(cat[0].get("outboundTag", "chain") if cat else "chain")
+sys.exit(0 if (t.get("routing") or {}).get("balancers") and (t.get("burstObservatory") or t.get("observatory")) else 1)
 PY
 }
 
@@ -1603,60 +1711,6 @@ active_label() {  # понятное имя активного пути цепо
 		chain) echo "старый сервер ${CHAIN_IP:-?}" ;;
 		*) echo "$1" ;;
 	esac
-}
-
-chain_activate() {  # chain_activate chain|fallback — как переключение вотчдога (x-ui остановлен)
-	python3 - "$DB" "$1" chain <<'PY'
-import json
-import sqlite3
-import sys
-
-path, mode, chain = sys.argv[1:4]
-# У каждого правила своя метка: Xray 26.10+ не запускается, если у двух правил один ruleTag (прежние версии
-# проверяли повтор только при подгрузке правил через API). Метку «ru-via-warp» на двух правилах ставили версии до 3.11.
-RU_TAG, RU_TAG_IP = "ru-via-warp", "ru-via-warp-ip"
-db = sqlite3.connect(path, timeout=30)
-t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
-tags = {o.get("tag") for o in t.get("outbounds", [])}
-main = chain if mode == "chain" else "direct"
-if main not in tags:
-    sys.exit(3)
-all_rules = t["routing"]["rules"]
-# Главные правила помечены ruleTag (main — весь трафик, dns-out — DNS самого Xray). В шаблонах прежних версий
-# меток нет — тогда по признакам; свои правила человека с network tcp,udp при метках не трогаются.
-tagged = any(r.get("ruleTag") in ("main", "dns-out") for r in all_rules)
-
-
-def is_ru(r):
-    return r.get("ruleTag") in (RU_TAG, RU_TAG_IP) or (r.get("outboundTag") == "warp" and (
-        "geosite:category-ru" in (r.get("domain") or []) or "geoip:ru" in (r.get("ip") or [])))
-
-
-def is_main(r):
-    if tagged:
-        return r.get("ruleTag") in ("main", "dns-out")
-    return r.get("network") == "tcp,udp" or "dns-internal" in (r.get("inboundTag") or [])
-
-
-rules = [r for r in all_rules if not is_ru(r)]
-for r in rules:
-    if is_main(r):
-        r["outboundTag"] = main
-        r.pop("balancerTag", None)
-if mode == "fallback" and "warp" in tags:
-    at = next((i for i, r in enumerate(rules) if is_main(r)), len(rules))
-    rules[at:at] = [
-        {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp",
-         "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
-        {"type": "field", "ruleTag": RU_TAG_IP, "outboundTag": "warp", "ip": ["geoip:ru"]},
-    ]
-t["routing"]["rules"] = rules
-# Основной выход первым, остальные в постоянном порядке — переключение туда-обратно даёт тот же шаблон.
-rank = {chain: 0, "warp": 1, "direct": 2, "blocked": 3}
-t["outbounds"] = sorted(t["outbounds"], key=lambda o: (o.get("tag") != main, rank.get(o.get("tag"), 9)))
-db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(t, ensure_ascii=False),))
-db.commit()
-PY
 }
 
 CHAIN_SAVED=/etc/x-ui/chain/outbound.json   # копия outbound цепочки (для повторной сборки шаблона и бэкапа)
@@ -1956,128 +2010,16 @@ echo "EXIT_RESULT=OK"
 VPN_EXIT_SETUP
 }
 
-install_watchdog() {  # вотчдог: выход на цепочке; старый сервер недоступен — РФ через WARP, остальное напрямую; вернулся — назад
-	cat > /usr/local/bin/vpn-exit-watchdog.sh <<'VPN_WD'
-#!/bin/bash
-# Выход цепочкой через EXIT_IP:EXIT_PORT. Сервер-выход недоступен FAIL_LIMIT проверок подряд — запасной режим:
-# российские сайты (.ru/.su/.рф, geosite:category-ru, geoip:ru) через WARP, остальное и DNS напрямую.
-# Доступен OK_LIMIT проверок подряд — обратно на цепочку.
-set -u
-DB=/etc/x-ui/x-ui.db
-EXIT_IP=${EXIT_IP:?}
-EXIT_PORT=${EXIT_PORT:?}
-CHAIN=chain
-FAIL_LIMIT=${FAIL_LIMIT:-4}; OK_LIMIT=${OK_LIMIT:-3}; INTERVAL=${INTERVAL:-30}
-fails=0; oks=0
-state() {  # chain | direct (запасной) | warp (запасной прежней версии)
-python3 - "$DB" <<'PY'
-import json, sqlite3, sys
-t = json.loads(sqlite3.connect(sys.argv[1], timeout=30).execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
-rules = t["routing"]["rules"]
-cat = [r for r in rules if r.get("ruleTag") == "main"] or [r for r in rules if r.get("network") == "tcp,udp"]
-print(cat[0].get("outboundTag", "?") if cat else "?")
-PY
-}
-switch() {  # switch chain|fallback → 0, если шаблон переписан и x-ui перезапущен
-python3 - "$DB" "$1" "$CHAIN" <<'PY' || return 1
-import json
-import sqlite3
-import sys
-
-path, mode, chain = sys.argv[1:4]
-# У каждого правила своя метка: Xray 26.10+ не запускается, если у двух правил один ruleTag (прежние версии
-# проверяли повтор только при подгрузке правил через API). Метку «ru-via-warp» на двух правилах ставили версии до 3.11.
-RU_TAG, RU_TAG_IP = "ru-via-warp", "ru-via-warp-ip"
-db = sqlite3.connect(path, timeout=30)
-t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
-tags = {o.get("tag") for o in t.get("outbounds", [])}
-main = chain if mode == "chain" else "direct"
-if main not in tags:
-    sys.exit(3)
-all_rules = t["routing"]["rules"]
-# Главные правила помечены ruleTag (main — весь трафик, dns-out — DNS самого Xray). В шаблонах прежних версий
-# меток нет — тогда по признакам; свои правила человека с network tcp,udp при метках не трогаются.
-tagged = any(r.get("ruleTag") in ("main", "dns-out") for r in all_rules)
-
-
-def is_ru(r):
-    return r.get("ruleTag") in (RU_TAG, RU_TAG_IP) or (r.get("outboundTag") == "warp" and (
-        "geosite:category-ru" in (r.get("domain") or []) or "geoip:ru" in (r.get("ip") or [])))
-
-
-def is_main(r):
-    if tagged:
-        return r.get("ruleTag") in ("main", "dns-out")
-    return r.get("network") == "tcp,udp" or "dns-internal" in (r.get("inboundTag") or [])
-
-
-rules = [r for r in all_rules if not is_ru(r)]
-for r in rules:
-    if is_main(r):
-        r["outboundTag"] = main
-        r.pop("balancerTag", None)
-if mode == "fallback" and "warp" in tags:
-    at = next((i for i, r in enumerate(rules) if is_main(r)), len(rules))
-    rules[at:at] = [
-        {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp",
-         "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
-        {"type": "field", "ruleTag": RU_TAG_IP, "outboundTag": "warp", "ip": ["geoip:ru"]},
-    ]
-t["routing"]["rules"] = rules
-# Основной выход первым, остальные в постоянном порядке — переключение туда-обратно даёт тот же шаблон.
-rank = {chain: 0, "warp": 1, "direct": 2, "blocked": 3}
-t["outbounds"] = sorted(t["outbounds"], key=lambda o: (o.get("tag") != main, rank.get(o.get("tag"), 9)))
-db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(t, ensure_ascii=False),))
-db.commit()
-PY
-systemctl restart x-ui
-}
-probe() { timeout 3 bash -c "cat </dev/null >/dev/tcp/$EXIT_IP/$EXIT_PORT" 2>/dev/null; }
-logger -t vpn-watchdog "started exit=$EXIT_IP:$EXIT_PORT (fail=$FAIL_LIMIT ok=$OK_LIMIT interval=${INTERVAL}s; fallback: RU via WARP, rest direct)"
-while true; do
-  st=$(state)
-  if probe; then oks=$((oks+1)); fails=0; else fails=$((fails+1)); oks=0; fi
-  if [ "$st" = "$CHAIN" ] && [ "$fails" -ge "$FAIL_LIMIT" ]; then
-     if switch fallback; then logger -t vpn-watchdog "exit $EXIT_IP unreachable x$fails -> fallback: RU via WARP, rest direct"
-     else logger -t vpn-watchdog "exit $EXIT_IP unreachable x$fails, switch to fallback FAILED (no direct outbound in template?)"; fi
-     fails=0; oks=0
-  elif { [ "$st" = direct ] || [ "$st" = warp ]; } && [ "$oks" -ge "$OK_LIMIT" ]; then
-     if switch chain; then logger -t vpn-watchdog "exit $EXIT_IP recovered x$oks -> chain"
-     else logger -t vpn-watchdog "exit $EXIT_IP recovered x$oks, switch to chain FAILED (no outbound $CHAIN in template?)"; fi
-     oks=0; fails=0
-  fi
-  sleep "$INTERVAL"
-done
-VPN_WD
-	chmod 755 /usr/local/bin/vpn-exit-watchdog.sh
-	cat > /etc/systemd/system/vpn-exit-watchdog.service <<EOF
-[Unit]
-Description=VPN exit watchdog (chain primary, WARP on real exit-down)
-After=network-online.target x-ui.service
-[Service]
-Type=simple
-Environment=EXIT_IP=$CHAIN_IP EXIT_PORT=$CHAIN_PORT FAIL_LIMIT=4 OK_LIMIT=3 INTERVAL=30
-ExecStart=/usr/local/bin/vpn-exit-watchdog.sh
-Restart=always
-RestartSec=10
-[Install]
-WantedBy=multi-user.target
-EOF
-	systemctl daemon-reload
-	systemctl enable vpn-exit-watchdog >/dev/null 2>&1 || true
-	systemctl restart vpn-exit-watchdog || warn "вотчдог не запустился (journalctl -u vpn-exit-watchdog)"
-}
-
-chain_apply() {  # шаблон с цепочкой ($CHAIN_SAVED); порт старого отсюда закрыт — сразу запасной режим
+chain_apply() {  # шаблон с цепочкой ($CHAIN_SAVED). Порт старого отсюда закрыт — Xray сам уйдёт в запасной режим (первая же
+	# его проверка не пройдёт) и сам вернётся на старый сервер, когда порт откроют
 	xui_stop
 	xui_set "xrayTemplateConfig=$(template_json chain "$WORK/warp.json" "$CHAIN_SAVED")"
 	if timeout 6 bash -c "cat </dev/null >/dev/tcp/$CHAIN_IP/$CHAIN_PORT" 2>/dev/null; then
 		CHAIN_BLOCKED=0
-		ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — вотчдог включит запасной режим (российские сайты через WARP, остальное напрямую) и вернёт назад"
+		ok "весь трафик пойдёт через $CHAIN_IP; если он упадёт — Xray сам включит запасной режим (российские сайты через WARP, остальное напрямую) и вернёт назад"
 	else
 		CHAIN_BLOCKED=1
-		chain_activate fallback
-		warn "порт $CHAIN_PORT старого сервера $CHAIN_IP отсюда не открывается — почти всегда это фаервол хостера: откройте входящий TCP $CHAIN_PORT для $PUBLIC_IP в панели хостера (AWS — Security Group, Oracle — Security List или NSG). Пока — запасной режим (российские сайты через WARP, остальное напрямую); как порт откроется, вотчдог сам переключит на старый сервер"
+		warn "порт $CHAIN_PORT старого сервера $CHAIN_IP отсюда не открывается — почти всегда это фаервол хостера: откройте входящий TCP $CHAIN_PORT для $PUBLIC_IP в панели хостера (AWS — Security Group, Oracle — Security List или NSG). Пока — запасной режим (российские сайты через WARP, остальное напрямую); как порт откроется, Xray сам переключит на старый сервер"
 	fi
 }
 
@@ -2497,6 +2439,16 @@ on_exit() {
 	if [ "$rc" != 0 ] && [ "$XUI_TOUCHED" = 1 ] && [ "${INSTALL_DONE:-0}" != 1 ]; then
 		if [ "$XUI_WAS_ACTIVE" = 1 ]; then
 			systemctl stop x-ui >/dev/null 2>&1 || true
+			# Запуск заменил 3x-ui — сначала обратно прежняя программа: база из снимка — её.
+			if [ -s "$WORK/db.before" ] && [ -n "${XUI_PREV:-}" ] && [ -d "$XUI_PREV" ] && [ -n "${XUI_DIR:-}" ]; then
+				rm -rf "$XUI_DIR"
+				if mv "$XUI_PREV" "$XUI_DIR"; then
+					[ ! -s "$WORK/x-ui.cmd.before" ] || cp -f "$WORK/x-ui.cmd.before" "$XUI_CMD"
+					[ ! -s "$WORK/x-ui.service.before" ] || cp -f "$WORK/x-ui.service.before" "$XUI_UNIT"
+					systemctl daemon-reload >/dev/null 2>&1 || true
+					printf '  3x-ui возвращена прежней версии\n' >&2
+				fi
+			fi
 			if [ -s "$WORK/db.before" ] && cp -f "$WORK/db.before" "$DB"; then
 				rm -f "$DB-wal" "$DB-shm"
 				# Своё подключение создано в этом запуске и исчезло вместе с возвращённой базой: его номер в настройках
@@ -2508,6 +2460,8 @@ on_exit() {
 		fi
 		if [ "$WD_WAS_ACTIVE" = 1 ]; then systemctl start vpn-exit-watchdog >/dev/null 2>&1 || true; fi
 	fi
+	# Отложенная прежняя 3x-ui, которую не вернули (запуск дошёл до конца или возвращать было нечего), больше не нужна.
+	[ -z "${XUI_PREV:-}" ] || [ ! -d "$XUI_PREV" ] || rm -rf "$XUI_PREV"
 	rm -rf "$WORK" "$CHK_OUT"
 	[ -z "${BOT_DIR:-}" ] || rm -rf "$BOT_DIR"   # каталог токенов с вопросов (вне $WORK)
 }
@@ -2540,7 +2494,8 @@ if [ -n "$WARP_CMD" ]; then
 	. "$STATE"
 	NOW=$(exit_mode_now)
 	if [ "$NOW" = chain ]; then
-		echo "Выход цепочкой через ${CHAIN_IP:-?}, сейчас активно: $(active_label "$(chain_active)"). В запасной режим (российские сайты через WARP, остальное напрямую) и обратно переключает вотчдог (journalctl -t vpn-watchdog)."
+		if [ -f /etc/systemd/system/vpn-exit-watchdog.service ]; then who="вотчдог (journalctl -t vpn-watchdog)"; else who="сам Xray: он проверяет старый сервер раз в ~15 секунд"; fi
+		echo "Выход цепочкой через ${CHAIN_IP:-?}, сейчас активно: $(active_label "$(chain_active)"). В запасной режим (российские сайты через WARP, остальное напрямую) и обратно переключает $who."
 		[ "$TARGET_EXIT" != status ] || exit 0
 		echo "Чтобы сменить выход насовсем — переустанови: bash install-vpn.sh --exit direct (или warp)."
 		exit 1
@@ -2731,7 +2686,17 @@ else
 	fi
 	echo "$XUI_SHA256  $TMP/x-ui.tgz" | sha256sum -c --quiet - >/dev/null 2>&1 || die "архив 3x-ui не совпал по sha256 — скачан не тот файл"
 	xui_stop
-	rm -rf /usr/local/x-ui
+	# Прежняя версия не удаляется, а откладывается рядом (тот же диск — переименование мгновенное). Оборвётся запуск —
+	# on_exit вернёт её вместе с базой из снимка: база в снимке — её, и только с ней VPN заработает в точности как до
+	# запуска. Иначе под новой программой оказалась бы прежняя база, а сторож цепочки версий до 3.11 в запасном режиме
+	# пишет в неё метки правил, с которыми новый Xray не запускается вовсе.
+	if [ -d "$XUI_DIR" ]; then
+		rm -rf "$XUI_DIR.before-install"   # остаток запуска, убитого вместе с ловушкой
+		cp -a "$XUI_CMD" "$WORK/x-ui.cmd.before" 2>/dev/null || true
+		cp -a "$XUI_UNIT" "$WORK/x-ui.service.before" 2>/dev/null || true
+		XUI_PREV=$XUI_DIR.before-install
+		mv "$XUI_DIR" "$XUI_PREV"
+	fi
 	tar -C /usr/local -xzf "$TMP/x-ui.tgz"
 	rm -rf "$TMP"
 	chmod +x /usr/local/x-ui/x-ui /usr/local/x-ui/x-ui.sh /usr/local/x-ui/bin/xray-linux-*
@@ -2753,6 +2718,8 @@ case $XV in "Xray $XRAY_VERSION "*) ;; *) warn "Xray не $XRAY_VERSION: ${XV%%$
 # Пароль, порт и секретный путь панели — до первого запуска x-ui, чтобы она ни минуты не жила с admin/admin.
 xui_stop
 mkdir -p /etc/x-ui
+n=$(heal_rule_tags) || die "не удалось проверить метки правил в шаблоне Xray"
+[ -z "$n" ] || ok "в шаблоне Xray разведены повторяющиеся метки правил ($n) — с повтором Xray $XRAY_VERSION не запустился бы"
 "$XUI" setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$WEB_PORT" -webBasePath "$WEB_PATH" -listenIP 127.0.0.1 >/dev/null ||
 	die "x-ui setting не прошёл"
 if [ "$MODE" = domain ]; then
@@ -3247,25 +3214,17 @@ if [ "$EXIT_MODE" = chain ]; then
 		fi
 	fi
 fi
-if [ "$EXIT_MODE" != chain ] && grep -qs 'EXIT_IP=' /etc/systemd/system/vpn-exit-watchdog.service; then
-	systemctl disable --now vpn-exit-watchdog >/dev/null 2>&1 || true
-	rm -f /etc/systemd/system/vpn-exit-watchdog.service /usr/local/bin/vpn-exit-watchdog.sh
-	systemctl daemon-reload 2>/dev/null || true
-	ok "вотчдог цепочки снят — выход больше не через другой сервер"
-fi
 save_state
 systemctl restart x-ui || bad "x-ui не перезапустился (journalctl -u x-ui)"
-# Вотчдог — только на окончательном шаблоне: раньше он мог переключить выход и перезапустить x-ui посреди установки.
-[ "$EXIT_MODE" != chain ] || install_watchdog
 case $EXIT_MODE in
 	direct) ok "выход клиентов в интернет — напрямую с IP сервера $PUBLIC_IP (включить WARP потом: vpn-warp on или vpn-warp ru)" ;;
 	warp) ok "выход клиентов — через Cloudflare WARP (IP сервера сайтам не виден; выключить: vpn-warp off)" ;;
 	warp-ru) ok "выход: российские сайты — через WARP, остальное — напрямую с $PUBLIC_IP (выключить: vpn-warp off)" ;;
 	chain)
 		if [ "${CHAIN_BLOCKED:-0}" = 1 ]; then
-			warn "выход клиентов — цепочкой через $CHAIN_IP, но пока порт $CHAIN_PORT закрыт фаерволом хостера — запасной режим (российские сайты через WARP, остальное напрямую), вотчдог переключит сам"
+			warn "выход клиентов — цепочкой через $CHAIN_IP, но пока порт $CHAIN_PORT закрыт фаерволом хостера — запасной режим (российские сайты через WARP, остальное напрямую); как откроют, Xray переключит сам"
 		else
-			ok "выход клиентов — цепочкой через $CHAIN_IP (упадёт — российские сайты через WARP, остальное напрямую; управляет вотчдог vpn-exit-watchdog)"
+			ok "выход клиентов — цепочкой через $CHAIN_IP (упадёт — российские сайты через WARP, остальное напрямую; переключает сам Xray, без перезапусков)"
 		fi ;;
 esac
 
@@ -3578,6 +3537,17 @@ if [ "$MODE" = domain ]; then systemctl restart nginx || bad "nginx не зап�
 INSTALL_DONE=1   # дальше — проверки и итог: ловушка на выходе x-ui уже не трогает
 S_DONE=1
 save_state
+[ -z "$XUI_PREV" ] || { rm -rf "$XUI_PREV"; XUI_PREV=; }   # прежняя 3x-ui, отложенная на случай отката, больше не нужна
+# Сторож цепочки прежних версий (vpn-exit-watchdog) больше не нужен: на запасной выход и обратно переключает сам Xray.
+# Снимается при любом выходе, но только здесь — после успешной установки: оборвись она раньше, ловушка вернула бы
+# прежний шаблон (а он без сторожа не переключается) и запустила бы прежний сторож. Метка EXIT_IP= в его unit-файле —
+# только у сторожа из этого скрипта; службу с тем же именем, поставленную иначе, не трогаем.
+if grep -qs 'EXIT_IP=' /etc/systemd/system/vpn-exit-watchdog.service; then
+	systemctl disable --now vpn-exit-watchdog >/dev/null 2>&1 || true
+	rm -f /etc/systemd/system/vpn-exit-watchdog.service /usr/local/bin/vpn-exit-watchdog.sh
+	systemctl daemon-reload 2>/dev/null || true
+	if [ "$EXIT_MODE" = chain ]; then ok "сторож цепочки снят: на запасной выход и обратно теперь переключает сам Xray"; else ok "сторож цепочки снят — выход больше не через другой сервер"; fi
+fi
 
 if [ "$BOT_DO" = 1 ]; then
 	say "Телеграм-бот"
@@ -3674,10 +3644,10 @@ rm -f /root/vpn-qr/*.png   # прежние QR (удалённых клиент�
 	echo "Если VPN перестал работать — проверка одной командой (службы, туннель, доступность из России):"
 	if [ -x /usr/local/bin/vpn-check ]; then echo "  vpn-check"; else echo "  bash install-vpn.sh --check"; fi
 	if [ "$EXIT_MODE" = chain ]; then
-		echo "Выход клиентов: цепочкой через $CHAIN_IP (его IP видят сайты). Если он упадёт — вотчдог включит запасной режим (российские сайты через WARP, остальное напрямую) и вернёт обратно."
+		echo "Выход клиентов: цепочкой через $CHAIN_IP (его IP видят сайты). Если он упадёт — Xray сам включит запасной режим (российские сайты через WARP, остальное напрямую) и вернёт обратно."
 		if [ "${CHAIN_BLOCKED:-0}" = 1 ]; then
 			echo "  ⚠ Сейчас — запасной режим (РФ через WARP, остальное напрямую): порт $CHAIN_PORT закрыт фаерволом хостера. Откройте входящий TCP $CHAIN_PORT"
-			echo "    для $PUBLIC_IP (AWS — Security Group, Oracle — Security List/NSG) — вотчдог сам переключит на старый сервер."
+			echo "    для $PUBLIC_IP (AWS — Security Group, Oracle — Security List/NSG) — Xray сам переключит на старый сервер."
 		fi
 		echo "  Переехал новый сервер на другой IP — на старом открой порт новому (ufw allow from НОВЫЙ_IP to any port $CHAIN_PORT"
 		echo "  proto tcp; у AWS/Oracle — ещё и в панели хостера) или переустанови с --exit-host."
