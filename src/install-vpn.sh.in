@@ -490,7 +490,7 @@ SSH_PORT_NOW=$(sshd -T 2> /dev/null | awk '$1 == "port" {print $2; exit}' || tru
 BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_SKIP='' BOT_RESULT=''
 if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
 	bot_decide
-	[ "$BOT_ARG" != 0 ] || S_BOT=0   # --no-bot запоминается
+	[ "$BOT_ARG" != 0 ] || bot_decline   # --no-bot запоминается
 	if [ "$BOT_ASK" = 1 ]; then
 		cat > /dev/tty <<'EOF'
 
@@ -499,7 +499,7 @@ if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
 и несколько админов (приглашение ссылкой).
 Бесплатно, на вашем аккаунте Cloudflare. Нужны домен в Cloudflare и бот от @BotFather.
 EOF
-		if bot_consent "Поставить бота?"; then BOT_DO=1; else S_BOT=0; fi
+		if bot_consent "Поставить бота?"; then BOT_DO=1; else bot_decline; fi
 	fi
 	if [ "$BOT_DO" = 1 ] || { [ "$BOT_KEEP" = 1 ] && [ "$BOT_STALE" = 1 ]; }; then bot_read_tokens; fi
 fi
@@ -2289,6 +2289,7 @@ elif [ "$FOREIGN_XUI" = 1 ]; then   # чужой 3x-ui (согласие — в 
 	cp -a "$DB" "$DB.before-install-$(date +%Y%m%d-%H%M%S)"
 	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
 fi
+bot_keep_decision   # «нет» и --no-bot сказаны раньше, чем прочитаны прошлые настройки, — они главнее прочитанного
 : "${PANEL_USER:=$(rnd "$LOWER$DIGITS" 10)}"
 : "${PANEL_PASS:=$(rnd "$LOWER${LOWER^^}$DIGITS" 22)}"
 : "${WEB_PORT:=$(free_port)}"
@@ -3246,16 +3247,7 @@ rm -f /root/vpn-qr/*.png   # прежние QR (удалённых клиент�
 		echo "  (секретный; забрать: ssh -p $SSH_PORT $SSH_LOGIN@$PUBLIC_IP 'sudo cat /root/backups/latest.tgz' > latest.tgz), дальше — README.md"
 	fi
 	echo "  в архиве (restore.sh$([ "$MODE" = domain ] && echo ", потом смена A-записи")). Сам бэкап не запускается."
-	if [ "${S_BOT:-}" = 1 ]; then
-		echo
-		echo "Телеграм-бот для управления VPN: @${S_BOT_USER:-?} — https://t.me/${S_BOT_USER:-}"
-		echo "  клиенты, статистика, проверка блокировки раз в 3 часа, бэкапы, переезд на новый сервер кнопкой"
-		[ "${BOT_RESULT:-}" != fail ] || echo "  ⚠ в этот раз бот не обновился: ${BOT_ERR:-} (повторить: bash install-vpn.sh --bot)"
-	elif [ -n "${BOT_SKIP:-}" ] || [ "${BOT_RESULT:-}" = fail ]; then
-		echo
-		echo "Телеграм-бот не поставлен: ${BOT_ERR:-$BOT_SKIP}"
-		echo "  повторить: bash install-vpn.sh --bot — токены скрипт спросит сам"
-	fi
+	bot_summary
 } > "$INFO"
 chmod 600 "$INFO"
 cat "$INFO"

@@ -358,12 +358,13 @@ deploy_env() {
 	printf '#!/bin/bash\necho "Бэкап готов"\necho %s\n' "$WORK/latest.tgz" > "$WORK/backup.sh"; chmod +x "$WORK/backup.sh"
 	BOT_BACKUP_CMD=$WORK/backup.sh
 	bot_extract_bundle() { echo 'export default {}' > "$BOT_DIR/worker.js"; }
-	bot_http() { printf '%s\n' "$1" >> "$WORK/http.calls"; case $1 in /healthz) echo ok ;; "/selftest?part="*) cat "$WORK/st.${1#*part=}" ;; esac; }
+	bot_http() { printf '%s\n' "$1" >> "$WORK/http.calls"; case $1 in /healthz) echo ok ;; "/selftest?part="*) st_part "$1" ;; esac; }
 	echo '{"panel":{"ok":true,"clients":3},"dns":{"ok":true,"ip":"1.2.3.4"},"webhook":{"ok":true,"url":"https://vpn-bot.sub1.workers.dev/tg"},"admin":{"ok":true}}' > "$WORK/st.base"
 	echo '{"ok":true}' > "$WORK/st.entry"
 	echo '{"skipped":true}' > "$WORK/st.exit"
-	tg_push setWebhook '{"ok":true,"result":true}'
+	echo '{"ok":true}' > "$WORK/st.hook"
 }
+st_part() { local q=${1#*part=}; cat "$WORK/st.${q%%&*}"; }   # ответ воркера на /selftest?part=ИМЯ[&…]
 mb() {  # mb ИМЯ → «тип|значение» привязки из загруженного metadata.json
 	python3 -I -c 'import json, sys
 m = json.load(open(sys.argv[1]))
@@ -387,8 +388,7 @@ test_deploy_first_install() {
 	t_eq "plain_text|https://vpn-bot.sub1.workers.dev" "$(mb SELF_ORIGIN)" "адрес воркера"
 	t_eq "kv_namespace|K1" "$(mb STATE)" "KV"
 	t_eq "" "$(mb EXIT_HOST)" "без цепочки нет EXIT_*"
-	t_has '"drop_pending_updates": true' "$(grep '^setWebhook' "$WORK/tg.calls")" "очередь сброшена при первой установке"
-	t_has '"url": "https://vpn-bot.sub1.workers.dev/tg"' "$(grep '^setWebhook' "$WORK/tg.calls")" "адрес вебхука"
+	grep -qx '/selftest?part=hook&drop=1' "$WORK/http.calls" || t_fail "вебхук не поставлен или очередь не сброшена при первой установке: $(tr '\n' ' ' < "$WORK/http.calls")"
 	grep -qF '0 */3 * * *' "$WORK"/cap.*.req.json 2> /dev/null || grep -rqF '0 */3 * * *' "$WORK"/cap.* || t_fail "нет cron"
 	grep -qx 'PUT /accounts/A1/storage/kv/namespaces/K1/values/entry%3Afpr' "$WORK/cf.calls" || t_fail "нет entry:fpr"
 	grep -q "$(ssh-keygen -lf "$WORK/etc_ssh/ssh_host_ed25519_key.pub" | awk '{print $2}')" "$WORK"/cap.*.fpr.json || t_fail "в entry:fpr не тот ключ"
@@ -409,7 +409,7 @@ test_deploy_rerun_inherits() {
 	for n in BOT_TOKEN WEBHOOK_SECRET ADMIN_ID PANEL_TOKEN ENTRY_SSH_KEY; do t_eq "inherit|" "$(mb $n)" "$n наследуется"; done
 	t_eq "inherit|" "$(mb GLOBALPING_TOKEN)" "чужая настройка владельца сохраняется"
 	t_eq "" "$(mb EXIT_HOST)" "цепочки больше нет — EXIT_HOST не тянется"
-	! grep -q '^setWebhook' "$WORK/tg.calls" 2> /dev/null || t_fail "вебхук трогали без токена бота"
+	grep -qx '/selftest?part=hook' "$WORK/http.calls" || t_fail "повтор не переустановил вебхук — так он чинится после оборванного запуска"
 }
 test_deploy_no_secret_on_disk_after() {
 	deploy_env
@@ -609,7 +609,7 @@ test_validate_foreign_webhook_consented() {
 test_deploy_keeps_queue_of_previous_webhook() {  # перенастроили чужой вебхук — его очередь не стираем
 	deploy_env; BOT_HOOK_URL=https://other.example/hook
 	bot_deploy || t_fail "не развернул: $BOT_ERR"
-	t_has '"drop_pending_updates": false' "$(grep '^setWebhook' "$WORK/tg.calls")" "очередь сохранена"
+	grep -qx '/selftest?part=hook' "$WORK/http.calls" || t_fail "очередь прежнего вебхука стёрта: $(tr '\n' ' ' < "$WORK/http.calls")"
 }
 other_server_env() {  # наш воркер, но управляет он VPN на другом домене
 	validate_env
@@ -782,7 +782,6 @@ test_deploy_grant_failure_is_not_fatal() {  # сбой записи заявки
 	grant_env
 	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '[]'
 	cf_set "PUT /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}'
-	tg_push setWebhook '{"ok":true,"result":true}'
 	bot_deploy || t_fail "сбой заявки уронил развёртывание: $BOT_ERR"
 	t_has "⚠ админа 42 не добавил" "$BOT_REPORT" "сказано в отчёте"
 }
@@ -898,16 +897,16 @@ test_deploy_new_subdomain_waits_before_webhook() {  # I8: новый адрес 
 		case $1 in
 			/healthz)
 				n=$(($(cat "$WORK/hz.n" 2> /dev/null || echo 0) + 1)); echo "$n" > "$WORK/hz.n"
-				if [ "$n" -gt 20 ]; then echo "healthz ok" >> "$WORK/tg.calls"; echo ok; fi ;;
-			"/selftest?part="*) cat "$WORK/st.${1#*part=}" ;;
+				if [ "$n" -gt 20 ]; then echo "healthz ok" >> "$WORK/http.calls"; echo ok; fi ;;
+			"/selftest?part="*) printf '%s\n' "$1" >> "$WORK/http.calls"; st_part "$1" ;;
 		esac
 	}
 	bot_deploy || t_fail "не дождался нового адреса: $BOT_ERR"
 	t_eq "https://vpn-bot.vpnbot-abc123.workers.dev" "$BOT_ORIGIN" "адрес"
 	local hz wh
-	hz=$(grep -n '^healthz ok' "$WORK/tg.calls" | head -1 | cut -d: -f1)
-	wh=$(grep -n '^setWebhook' "$WORK/tg.calls" | head -1 | cut -d: -f1)
-	[ -n "$hz" ] && [ -n "$wh" ] && [ "$hz" -lt "$wh" ] || t_fail "вебхук поставлен раньше, чем адрес заработал (healthz $hz, setWebhook $wh)"
+	hz=$(grep -n '^healthz ok' "$WORK/http.calls" | head -1 | cut -d: -f1)
+	wh=$(grep -n '^/selftest?part=hook' "$WORK/http.calls" | head -1 | cut -d: -f1)
+	[ -n "$hz" ] && [ -n "$wh" ] && [ "$hz" -lt "$wh" ] || t_fail "вебхук поставлен раньше, чем адрес заработал (healthz $hz, вебхук $wh)"
 }
 test_ssh_key_only_ignores_bot_key() {  # I5: ключ бота — не ключ человека, с ним одним пароль не выключать
 	eval "$(awk '/^root_has_own_key\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
@@ -923,6 +922,273 @@ test_ssh_key_only_ignores_bot_key() {  # I5: ключ бота — не ключ
 }
 test_hints_never_put_tokens_in_history() {  # I7: токен в командной строке — это /root/.bash_history
 	! grep -nE '(CF_API_TOKEN|VPN_BOT_TOKEN)=…' "$ROOT/src/install-vpn.sh.in" "$ROOT/README.md" || t_fail "подсказка с токеном в командной строке"
+}
+
+# ——— ревью 12.11: бот в установщике ———
+test_pair_sender_without_username() {  # у аккаунта нет @имени — пустое поле не должно съедать соседние (так привязка не узнавала человека вовсе)
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":true,"result":[]}'
+	tg_push getUpdates '{"ok":true,"result":[{"update_id":10,"message":{"from":{"id":42,"first_name":"Аня"},"chat":{"type":"private"},"text":"hi"}}]}'
+	answers y
+	bot_pair 30 || t_fail "не привязал: $BOT_ERR"
+	t_eq 42 "$BOT_ADMIN_ID" "id"; t_eq "Аня" "$BOT_ADMIN_NAME" "имя"
+	t_has "Это ты: Аня, id 42?" "$(cat "$WORK/tty.out")" "вопрос без @имени"
+}
+test_pair_sender_without_any_name() {  # ни имени, ни @имени — вопрос всё равно задаётся
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":true,"result":[]}'
+	tg_push getUpdates '{"ok":true,"result":[{"update_id":10,"message":{"from":{"id":42},"chat":{"type":"private"},"text":"hi"}}]}'
+	answers y
+	bot_pair 30 || t_fail "не привязал: $BOT_ERR"
+	t_eq 42 "$BOT_ADMIN_ID" "id"
+}
+test_pair_group_message_ignored() {  # сообщение в группе, куда добавили бота, — не «это ты?»
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":true,"result":[]}'
+	tg_push getUpdates '{"ok":true,"result":[{"update_id":10,"message":{"from":{"id":42,"first_name":"Аня"},"chat":{"type":"supergroup"},"text":"hi"}}]}'
+	answers y
+	! bot_pair 1 || t_fail "привязал по сообщению из группы"
+}
+test_pair_name_printed_safely() {  # имя приходит из Телеграма — управляющие символы на терминал не выводим
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	tg_push getUpdates '{"ok":true,"result":[]}'
+	tg_push getUpdates '{"ok":true,"result":[{"update_id":10,"message":{"from":{"id":42,"first_name":"A\u001b[31mnn\u0007","username":"ann"},"chat":{"type":"private"},"text":"hi"}}]}'
+	answers y
+	bot_pair 30 || t_fail "не привязал: $BOT_ERR"
+	! grep -q $'[\x01-\x08\x0b-\x1f\x7f]' "$WORK/tty.out" || t_fail "управляющий символ в вопросе: $(cat -v "$WORK/tty.out")"
+	! printf '%s' "$BOT_ADMIN_NAME" | grep -q $'[\x01-\x1f\x7f]' || t_fail "управляющий символ в имени админа"
+	t_has "(@ann), id 42?" "$(cat "$WORK/tty.out")" "остальное на месте"
+}
+test_pair_timeout_names_the_way_out() {  # не дождались сообщения — сказать, как назначить админа без переписки
+	base_env; BOT_USERNAME=my_vpn_bot; BOT_HOOK_URL=
+	answers y
+	! bot_pair 1 || t_fail "привязал без сообщений"
+	t_has "VPN_BOT_ADMIN_ID" "$BOT_ERR" "запасной путь"
+}
+test_deploy_webhook_is_set_by_worker() {  # вебхук ставит сам воркер (part=hook): секрет вебхука установщику для этого не нужен
+	deploy_env
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	grep -qx '/selftest?part=hook&drop=1' "$WORK/http.calls" || t_fail "воркер не просили поставить вебхук: $(tr '\n' ' ' < "$WORK/http.calls")"
+	! grep -q '^setWebhook' "$WORK/tg.calls" 2> /dev/null || t_fail "вебхук ставил сам установщик"
+}
+test_deploy_webhook_refused() {  # Телеграм вебхук не принял — это не «всё хорошо»
+	deploy_env
+	echo '{"ok":false,"error":"tg setWebhook: Unauthorized"}' > "$WORK/st.hook"
+	! bot_deploy || t_fail "успех, хотя вебхук не встал"
+	t_has "вебхук" "$BOT_ERR" "что случилось"; t_has "Unauthorized" "$BOT_ERR" "почему"
+}
+test_deploy_webhook_before_later_steps() {  # сбой на расписании (и дальше) не оставляет работавшего бота без вебхука
+	deploy_env
+	cf_set "PUT /accounts/A1/workers/scripts/vpn-bot/schedules" '{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}'
+	! bot_deploy || t_fail "успех при сбое расписания"
+	grep -q '^/selftest?part=hook' "$WORK/http.calls" || t_fail "до сбоя вебхук не поставлен — бот остался бы глухим"
+}
+test_deploy_keeps_webhook_secret_of_working_bot() {  # сменить секрет вебхука — значит заглушить бота до конца настройки: у работающего он прежний и с токеном бота
+	deploy_env
+	settings '[{"type":"secret_text","name":"BOT_TOKEN"},{"type":"secret_text","name":"WEBHOOK_SECRET"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"secret_text","name":"PANEL_TOKEN"},{"type":"secret_text","name":"ENTRY_SSH_KEY"}]'
+	BOT_ADMIN_ID=
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_eq "inherit|" "$(mb WEBHOOK_SECRET)" "секрет вебхука прежний"
+	t_eq "secret_text|t" "$(mb BOT_TOKEN)" "токен бота — новый"
+}
+test_deploy_new_bot_gets_webhook_secret() {
+	deploy_env
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	case $(mb WEBHOOK_SECRET) in "secret_text|"?*) ;; *) t_fail "у нового бота нет секрета вебхука: $(mb WEBHOOK_SECRET)" ;; esac
+}
+test_deploy_webhook_secret_made_when_missing() {  # у нашего воркера секрета вебхука почему-то нет — выдать, и без токена бота
+	deploy_env
+	settings '[{"type":"secret_text","name":"BOT_TOKEN"},{"type":"secret_text","name":"ADMIN_ID"},{"type":"secret_text","name":"PANEL_TOKEN"},{"type":"secret_text","name":"ENTRY_SSH_KEY"}]'
+	rm -f "$BOT_DIR/tg.token"; BOT_ADMIN_ID=
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	case $(mb WEBHOOK_SECRET) in "secret_text|"?*) ;; *) t_fail "воркеру без секрета вебхука он не выдан: $(mb WEBHOOK_SECRET)" ;; esac
+}
+test_deploy_new_bot_needs_admin() {  # новый бот без админа достался бы первому, кто напишет /start, — такого не разворачиваем
+	deploy_env; BOT_ADMIN_ID=
+	! bot_deploy || t_fail "новый бот развёрнут без админа"
+	t_has "ADMIN_ID" "$BOT_ERR" "причина"
+	! grep -q '^PUT /accounts/A1/workers/scripts/' "$WORK/cf.calls" || t_fail "воркер загружен"
+}
+test_validate_admin_id_canonical() {  # бот понимает только обычное положительное число: 0042, 0 и 23 цифры он бы молча отбросил
+	validate_env
+	local bad
+	for bad in 0 0042 99999999999999999999999 9007199254740992 12a '' ; do
+		[ -n "$bad" ] || continue
+		VPN_BOT_ADMIN_ID=$bad
+		! bot_validate || t_fail "принят id «$bad»"
+		t_has "числовой" "$BOT_ERR" "причина для «$bad»"
+	done
+	[ ! -s "$WORK/cf.calls" ] || t_fail "с негодным id пошёл в Cloudflare"
+	VPN_BOT_ADMIN_ID=9007199254740991
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
+	bot_validate || t_fail "годный id отвергнут: $BOT_ERR"
+}
+leftover_env() {  # воркер удалили в панели Cloudflare, а его хранилище (со списком админов) осталось
+	validate_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces?per_page=100" '{"success":true,"result":[{"id":"K1","title":"vpn-bot-state"}]}'
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
+}
+test_validate_leftover_storage_explicit_admin_gets_grant() {
+	leftover_env; VPN_BOT_ADMIN_ID=42
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq none "$BOT_EXISTING" "воркера нет"
+	t_eq 42 "$BOT_ADMIN_ID" "админ нового воркера"
+	t_eq 42 "$BOT_GRANT_ID" "и заявка: в хранилище может лежать прежний список — без неё бот слушал бы только его"
+}
+test_validate_leftover_storage_paired_admin_gets_grant() {
+	leftover_env
+	tg_push getUpdates '{"ok":true,"result":[]}'
+	tg_push getUpdates "{\"ok\":true,\"result\":[$(msg 10 42 Ann ann)]}"
+	answers y
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq 42 "$BOT_ADMIN_ID" "админ — кто подтвердил"
+	t_eq 42 "$BOT_GRANT_ID" "заявка"
+	t_eq Ann "$BOT_GRANT_NAME" "с именем"
+}
+test_validate_fresh_storage_no_grant() {  # хранилища не было — списка быть не может, заявка не нужна
+	validate_env; VPN_BOT_ADMIN_ID=42
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":""}}'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq "" "$BOT_GRANT_ID" "заявки нет"
+}
+test_validate_admins_list_skips_junk() {  # в списке бота мусор — берётся первый настоящий id
+	manual_bot_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins" '[{"id":"x"},{"id":-5},7,{"id":555,"name":"Оля"}]'
+	bot_validate || t_fail "не прошла: $BOT_ERR"
+	t_eq 555 "$BOT_ADMIN_ID" "первый настоящий"
+}
+test_deploy_grant_not_duplicated() {  # заявка на этого админа уже лежит — второй записи не будет
+	grant_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '[{"id":42,"name":""}]'
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_eq "42" "$(grant_body)" "одна заявка"
+}
+test_deploy_grant_carries_name() {  # имя того, кто подтвердил «это я», бот покажет в списке админов сразу
+	grant_env; BOT_GRANT_NAME='Аня "Я"'
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '{"success":false,"errors":[{"code":10009,"message":"key not found"}]}'
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_eq 'Аня "Я"' "$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))[0]["name"])' "$(ls "$WORK"/cap.*.grant.json | tail -1)")" "имя в заявке"
+}
+test_deploy_report_names_previous_admins() {  # свежий воркер поверх прежнего хранилища: прежние админы — не сюрприз
+	deploy_env; BOT_GRANT_ID=42
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '{"success":false,"errors":[{"code":10009,"message":"key not found"}]}'
+	echo '{"panel":{"ok":true,"clients":3},"dns":{"ok":true,"ip":"1.2.3.4"},"webhook":{"ok":true},"admin":{"ok":true,"ids":[555,42]}}' > "$WORK/st.base"
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_has "555" "$BOT_REPORT" "прежний админ назван"
+	t_has "«Админы»" "$BOT_REPORT" "где убрать лишнего"
+}
+test_deploy_report_admin_not_seen_yet() {  # заявка записана, а бот её ещё не прочитал (хранилище отдаёт новое не сразу) — сказать, не роняя установку
+	grant_env
+	cf_set "GET /accounts/A1/storage/kv/namespaces/K1/values/admins%3Agrant" '{"success":false,"errors":[{"code":10009,"message":"key not found"}]}'
+	echo '{"panel":{"ok":true,"clients":3},"dns":{"ok":true,"ip":"1.2.3.4"},"webhook":{"ok":true},"admin":{"ok":true,"ids":[555]}}' > "$WORK/st.base"
+	bot_deploy || t_fail "не развернул: $BOT_ERR"
+	t_has "⚠ бот пока не видит админа 42" "$BOT_REPORT" "сказано"
+}
+test_validate_foreign_webhook_question_tells_consequence() {  # вставили токен бота, который управляет другим VPN: «да» отбирает его — вопрос должен это сказать
+	validate_env; VPN_BOT_ADMIN_ID=42
+	tg_push getWebhookInfo '{"ok":true,"result":{"url":"https://vpn-bot-vpn-other-org.sub1.workers.dev/tg"}}'
+	answers y
+	bot_validate || t_fail "не прошла с согласием: $BOT_ERR"
+	t_has "останется без бота" "$(cat "$WORK/tty.out")" "последствие"
+	t_has "@BotFather" "$(cat "$WORK/tty.out")" "что делать вместо"
+}
+test_validate_worker_name_from_env_checked() {  # имя воркера из VPN_BOT_WORKER: негодное — сразу и понятно, а не «Cloudflare не отвечает»
+	base_env; good_cf; BOT_WORKER_AUTO=0
+	local bad
+	for bad in 'Мой Бот' 'my bot' 'VPN-Bot' '-vpn' 'vpn-' "$(printf 'a%.0s' $(seq 64))"; do
+		BOT_WORKER=$bad
+		! bot_validate || t_fail "принято имя «$bad»"
+		t_has "VPN_BOT_WORKER" "$BOT_ERR" "причина для «$bad»"
+	done
+	[ ! -s "$WORK/cf.calls" ] || t_fail "с негодным именем пошёл в Cloudflare"
+}
+test_other_server_refusal_hint_for_remembered_name() {  # имя воркера — из прошлой установки: совет «запустите без VPN_BOT_WORKER» ничего бы не изменил
+	other_server_env; BOT_WORKER_AUTO=0; unset VPN_BOT_WORKER
+	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.other.org" '{"success":true,"result":[{"id":"R2","content":"9.9.9.9","proxied":false}]}'
+	answers n
+	! bot_validate || t_fail "забрал бота другого сервера"
+	case $BOT_ERR in *"без VPN_BOT_WORKER"*) t_fail "совет не к месту: $BOT_ERR" ;; esac
+	t_has "VPN_BOT_WORKER=" "$BOT_ERR" "как задать другое имя"
+}
+test_other_server_refusal_hint_for_explicit_name() {
+	other_server_env; BOT_WORKER_AUTO=0; VPN_BOT_WORKER=vpn-bot
+	cf_set "GET /zones/Z2/dns_records?type=A&name=vpn.other.org" '{"success":true,"result":[{"id":"R2","content":"9.9.9.9","proxied":false}]}'
+	answers n
+	! bot_validate || t_fail "забрал бота другого сервера"
+	t_has "без VPN_BOT_WORKER" "$BOT_ERR" "совет"
+}
+test_validate_runs_out_of_worker_names() {  # все имена vpn-bot-<домен>[-N] заняты ботами других серверов — остановиться с понятным советом
+	second_env
+	local n w
+	for n in 1 2 3 4 5 6; do
+		w=$(bot_worker_name "$n")
+		cf_set "GET /accounts/A1/workers/scripts/$w/settings" '{"success":true,"result":{"bindings":[{"type":"plain_text","name":"VPN_BOT_INSTALLER","text":"1"},{"type":"plain_text","name":"DNS_NAME","text":"vpn.other.org"},{"type":"plain_text","name":"CF_ZONE_ID","text":"Z2"}]}}'
+	done
+	! bot_validate || t_fail "нашёл имя, которого нет"
+	t_has "VPN_BOT_WORKER=" "$BOT_ERR" "совет"
+}
+test_worker_name_cut_never_ends_with_dash() {  # обрезка до 63 знаков, попавшая на дефис, не оставляет его на краю
+	local n w
+	DOMAIN="$(printf 'x%.0s' $(seq 54)).b.example.com"   # 63-й знак имени — дефис на месте точки
+	w=$(bot_worker_name 1)
+	[[ $w =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] && [ "${#w}" -le 63 ] || t_fail "имя: $w"
+	for n in 2 12; do
+		DOMAIN="$(printf 'x%.0s' $(seq $((53 - ${#n})))).b.example.com"   # дефис — прямо перед местом для «-N»
+		w=$(bot_worker_name "$n")
+		[[ $w =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] && [ "${#w}" -le 63 ] || t_fail "имя с номером $n: $w"
+		case $w in *"--$n") t_fail "двойной дефис перед номером: $w" ;; *"-$n") ;; *) t_fail "номер не в конце: $w" ;; esac
+	done
+}
+test_worker_auto_flag_follows_env() {  # имя из VPN_BOT_WORKER или из прошлой установки скрипт молча не меняет
+	t_eq "1 vpn-bot" "$(env -u VPN_BOT_WORKER bash -c '. "$1"; echo "$BOT_WORKER_AUTO $BOT_WORKER"' _ "$ROOT/src/bot.sh")" "по умолчанию — можно сменить"
+	t_eq "0 my-bot" "$(VPN_BOT_WORKER=my-bot bash -c '. "$1"; echo "$BOT_WORKER_AUTO $BOT_WORKER"' _ "$ROOT/src/bot.sh")" "задано явно"
+	grep -qF '[ -z "${S_BOT_WORKER:-}" ] || BOT_WORKER_AUTO=0' "$ROOT/src/install-vpn.sh.in" || t_fail "воркер прошлой установки считается сменяемым"
+}
+test_decline_survives_state_reload() {  # «нет» и --no-bot сказаны до того, как установщик перечитывает прошлые настройки
+	S_BOT=''
+	bot_decline
+	t_eq 0 "$S_BOT" "отказ записан"
+	S_BOT=''   # «. $STATE»: в настройках прошлого запуска бота не было
+	bot_keep_decision
+	t_eq 0 "$S_BOT" "отказ пережил перечитывание настроек"
+	unset BOT_DECLINED; S_BOT=1
+	bot_keep_decision
+	t_eq 1 "$S_BOT" "без отказа — как в настройках"
+	local f=$ROOT/src/install-vpn.sh.in a b c
+	a=$(grep -n '^	\. "\$STATE"$' "$f" | head -1 | cut -d: -f1)
+	b=$(grep -n '^bot_keep_decision' "$f" | head -1 | cut -d: -f1)
+	c=$(awk -v a="${a:-0}" 'NR > a && /^save_state$/ {print NR; exit}' "$f")
+	[ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ] || t_fail "установщик не зовёт bot_keep_decision между чтением настроек и их записью (строки $a, $b, $c)"
+	! grep -nE '(^|[^_A-Z])S_BOT=0' "$f" || t_fail "отказ от бота записан мимо bot_decline"
+}
+test_summary_says_bot_not_updated() {  # бот есть, а обновить его в этот раз не вышло (нет токена) — итог не должен молчать
+	local out
+	S_BOT=1 S_BOT_USER=my_vpn_bot BOT_RESULT='' BOT_ERR='' BOT_SKIP="не дан токен Cloudflare" VPN_BOT_ADMIN_ID=42
+	out=$(bot_summary)
+	t_has "@my_vpn_bot" "$out" "бот назван"
+	t_has "не обновлён: не дан токен Cloudflare" "$out" "причина"
+	t_has "админ 42 не добавлен" "$out" "про админа"
+	BOT_SKIP='' VPN_BOT_ADMIN_ID=''
+	case $(bot_summary) in *"⚠"*) t_fail "предупреждение без причины" ;; esac
+	S_BOT='' BOT_SKIP="не дан токен Cloudflare"
+	t_has "не поставлен: не дан токен Cloudflare" "$(bot_summary)" "бота нет"
+	S_BOT='' BOT_SKIP='' BOT_RESULT=''
+	t_eq "" "$(bot_summary)" "бота не просили — ни строки"
+	grep -q '^	bot_summary$' "$ROOT/src/install-vpn.sh.in" || t_fail "итог установщика не зовёт bot_summary"
+}
+test_no_hidden_input_in_any_form() {  # решение владельца 11.11: скрытого ввода нет ни в каком написании
+	local f bad
+	hidden() { grep -nE '(^|[^[:alnum:]_])read[[:space:]]([^|;&]*[[:space:]])?-[a-zA-Z]*s[a-zA-Z]*([[:space:]]|$)|stty[[:space:]]([^|;&]*[[:space:]])?-echo' "$@"; }
+	# сам шаблон: что обязан поймать и чего не трогает
+	printf '%s\n' 'read -s x' 'read -rs x' 'read -r -s x' 'read -p "вопрос" -s x' 'IFS= read -t 5 -rs x < /dev/tty' 'stty -echo' 'stty -F /dev/tty -echo' > "$WORK/hidden.yes"
+	printf '%s\n' 'read -r x' 'while IFS= read -r -t 0.1 _ < /dev/tty; do :; done' 'bot_ask_secret "Токен: "' 'stty sane' 'read -r uid fid fname uname ctype' 'spread -s x' > "$WORK/hidden.no"
+	t_eq 7 "$(hidden "$WORK/hidden.yes" | wc -l)" "шаблон ловит все написания"
+	t_eq 0 "$(hidden "$WORK/hidden.no" | wc -l)" "и не трогает обычный ввод"
+	for f in "$ROOT/src/bot.sh" "$ROOT/src/install-vpn.sh.in" "$ROOT/install-passwall2.sh" "$ROOT/install-keenetic.sh" \
+		"$ROOT/src/kit/usr/local/bin/vpn-backup.sh" "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh"; do
+		bad=$(hidden "$f" || true)
+		[ -z "$bad" ] || t_fail "скрытый ввод в $(basename "$f"): $bad"
+	done
 }
 
 # ——— домен из Cloudflare (10.11): выбор на вопросах, запись — на шаге DNS ———
