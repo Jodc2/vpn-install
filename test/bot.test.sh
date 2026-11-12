@@ -1728,7 +1728,7 @@ test_inbound_ports_odd_row_keeps_the_rest() {  # settings или stream_settings
 # Шаг «Фаервол ufw» целиком: ufw — заглушка (ответ на status — $UFW_SAYS, код — $UFW_STATUS_RC; команды из $UFW_FAIL
 # не проходят), всё, что скрипт у неё просит, — построчно в $WORK/ufw.calls; правила ufw — файл $UFW_RULES.
 fw_env() {
-	eval "$(awk '/^(fw_step|fw_close|xui_inbound_ports|ufw_active|ufw_state|ufw_allows_tcp)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(fw_step|fw_close|xui_inbound_ports|ufw_active|ufw_state|ufw_allows)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	say() { :; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1905,7 +1905,7 @@ RULES_FIXTURE='### tuple ### allow tcp 2222 0.0.0.0/0 any 203.0.113.5 in
 ### tuple ### allow tcp 2083 0.0.0.0/0 any 0.0.0.0/0 in comment=76706e20706f7274
 ### tuple ### allow tcp 3000:3010 0.0.0.0/0 any 203.0.113.0/24 in
 ### tuple ### allow tcp 4000,4001 0.0.0.0/0 any 203.0.113.9 in'
-test_ufw_allows_tcp_reads_real_rules() {  # пункт 9а: есть ли для порта разрешающее входящее правило — любое, и только с одного адреса тоже
+test_ufw_allows_reads_real_rules() {  # пункт 9а: есть ли для порта разрешающее входящее правило — любое, и только с одного адреса тоже
 	local p
 	fw_env
 	printf '%s\n' "$RULES_FIXTURE" > "$UFW_RULES"
@@ -1921,15 +1921,25 @@ test_ufw_allows_tcp_reads_real_rules() {  # пункт 9а: есть ли для
 EOF
 	sed -i '/203.0.113.7 in$/d' "$UFW_RULES"   # правило «с этого адреса — на любой порт» проверяется отдельно, ниже
 	for p in 2222 2200 2022 80 443 6000 6003 6007 8080 9000 9001 7001 2083 3000 3010 4000 4001; do
-		ufw_allows_tcp "$p" || t_fail "порт $p: разрешающее правило есть, а функция его не видит"
+		ufw_allows "$p" tcp || t_fail "порт $p: разрешающее правило есть, а функция его не видит"
 	done
 	for p in 22 25 26 53 5000 60500 7000 9100 9200 6008 5999 44 3011 20 220 22222; do
-		! ufw_allows_tcp "$p" || t_fail "порт $p: разрешающего входящего правила TCP нет, а функция его нашла"
+		! ufw_allows "$p" tcp || t_fail "порт $p: разрешающего входящего правила TCP нет, а функция его нашла"
 	done
+	# То же для UDP (порты соседнего VPN): правило для TCP UDP-порт не разрешает, и наоборот; без протокола — TCP.
+	for p in 5000 60000 60500 61000 8080; do
+		ufw_allows "$p" udp || t_fail "порт $p/udp: разрешающее правило есть, а функция его не видит"
+	done
+	for p in 2222 80 6003 9001 26 53 59999 61001; do
+		! ufw_allows "$p" udp || t_fail "порт $p/udp: разрешающего входящего правила UDP нет, а функция его нашла"
+	done
+	! ufw_allows 5000 tcp || t_fail "правило для 5000/udp принято за разрешение TCP"
+	ufw_allows 2222 || t_fail "без протокола — TCP"
+	! ufw_allows 5000 || t_fail "без протокола — TCP, а не UDP"
 	echo '### tuple ### allow any any 0.0.0.0/0 any 203.0.113.7 in' >> "$UFW_RULES"
-	ufw_allows_tcp 22 || t_fail "правило «с адреса 203.0.113.7 на любой порт» разрешает и порт 22"
+	ufw_allows 22 tcp && ufw_allows 22 udp || t_fail "правило «с адреса 203.0.113.7 на любой порт» разрешает и порт 22"
 	UFW_RULES="$WORK/нет-такого $WORK/и-такого"
-	! ufw_allows_tcp 22 || t_fail "файлов правил нет — правил нет"
+	! ufw_allows 22 tcp || t_fail "файлов правил нет — правил нет"
 }
 test_fw_ssh_limited_by_source_is_not_reopened_to_all() {  # пункт 9а: ufw включён, SSH разрешён только с адреса админа — общее разрешение не добавлять
 	local rule
@@ -2026,6 +2036,40 @@ test_fw_failed_port_is_not_reported_open() {  # пункт 9б: порт, кот
 	fw_step
 	fw_called "--force enable" || t_fail "ufw не включён из-за порта панели: $(fw_calls)"
 	grep -q '^OK включён, открыто: 22/tcp 2083/tcp$' "$WORK/out" || t_fail "итог: $(cat "$WORK/out")"
+}
+
+# Порты соседнего VPN (WireGuard, Amnezia в Docker — detect_other_vpn): пункт 6 второй порции.
+test_fw_other_vpn_port_failure_leaves_ufw_off() {  # ufw выключен, порт соседнего VPN в нём не разрешился: включённый фаервол отрубил бы тот VPN.
+	# Раньше ufw включался, а сообщение говорило «открыл его порты»
+	fw_env; OTHER_VPN="WireGuard(wg0)" OTHER_VPN_PORTS="51820/udp" UFW_FAIL="allow 51820/udp"
+	fw_step
+	! fw_called "--force enable" || t_fail "ufw включён, хотя порт соседнего VPN в нём не разрешён: $(fw_calls)"
+	grep -q '^BAD ufw не включал.*51820/udp' "$WORK/out" || t_fail "не сказано, почему ufw не включён: $(cat "$WORK/out")"
+	! grep -q 'открыл его порты' "$WORK/out" || t_fail "сказано «открыл его порты», хотя порт не открылся: $(cat "$WORK/out")"
+}
+test_fw_other_vpn_ports_opened_and_named() {  # обычный случай: ufw выключен, порты соседнего VPN разрешаются до включения и названы
+	fw_env; OTHER_VPN="WireGuard(wg0), Docker:amnezia-awg" OTHER_VPN_PORTS="1194/tcp 51820/udp"
+	fw_step
+	fw_called "allow 1194/tcp" && fw_called "allow 51820/udp" && fw_called "--force enable" || t_fail "порты соседнего VPN или включение: $(fw_calls)"
+	grep -q '^WARN рядом работает WireGuard(wg0), Docker:amnezia-awg — открыл его порты в ufw (1194/tcp 51820/udp)' "$WORK/out" || t_fail "сообщение: $(cat "$WORK/out")"
+}
+test_fw_other_vpn_restricted_rule_not_widened() {  # ufw включён, порт соседнего VPN разрешён только с одной подсети — общее разрешение
+	# открыло бы его всем; «открыл его порты» — только про то, что открыл сам скрипт
+	fw_env; UFW_SAYS=$ACTIVE OTHER_VPN="WireGuard(wg0)" OTHER_VPN_PORTS="1194/tcp 51820/udp"
+	echo '### tuple ### allow udp 51820 0.0.0.0/0 any 198.51.100.0/24 in' > "$UFW_RULES"
+	fw_step
+	! fw_called "allow 51820/udp" || t_fail "правило «только с подсети» расширено общим: $(fw_calls)"
+	fw_called "allow 1194/tcp" || t_fail "для порта без правила — как раньше, разрешить: $(fw_calls)"
+	grep -q 'открыл его порты в ufw (1194/tcp)' "$WORK/out" || t_fail "в «открыл» не только то, что открыто: $(cat "$WORK/out")"
+	grep -q '^OK .*51820/udp.* уже разрешен' "$WORK/out" || t_fail "не сказано, что правило для 51820/udp оставлено: $(cat "$WORK/out")"
+	fw_env; UFW_SAYS=$ACTIVE OTHER_VPN="WireGuard(wg0)" OTHER_VPN_PORTS="51820/udp"
+	echo '### tuple ### allow tcp 51820 0.0.0.0/0 any 198.51.100.0/24 in' > "$UFW_RULES"
+	fw_step
+	fw_called "allow 51820/udp" || t_fail "правило для TCP на том же номере UDP-порт не разрешает — его надо открыть: $(fw_calls)"
+	fw_env; OTHER_VPN="WireGuard(wg0)" OTHER_VPN_PORTS="51820/udp"   # ufw выключен: включаем мы — разрешение обязательно
+	echo '### tuple ### allow udp 51820 0.0.0.0/0 any 198.51.100.0/24 in' > "$UFW_RULES"
+	fw_step
+	fw_called "allow 51820/udp" || t_fail "ufw включает скрипт — порт соседнего VPN должен быть разрешён: $(fw_calls)"
 }
 
 test_language_env_is_dropped_at_start() {  # пункт 5: LANGUAGE из окружения (sudo её сохраняет) переводит ответы ufw — в начале скрипта она снимается
