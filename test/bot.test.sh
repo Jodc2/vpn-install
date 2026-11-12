@@ -1726,17 +1726,18 @@ pw_sh() {
 $*"
 }
 test_passwall_tmp_room_is_free_memory() {  # /tmp роутера — в памяти: df показывает потолок tmpfs, а не свободную память
-	local sh df_mb
+	# «Место по df» в тесте задано (500 МБ): настоящее на живой машине меняется между двумя замерами, и сравнение с ним
+	# изредка расходилось на мегабайт.
+	local sh df='mb_free() { echo 500; }'
 	printf 'MemTotal:  250000 kB\nMemFree:  9000 kB\nMemAvailable:    40960 kB\n' > "$WORK/low"
 	printf 'MemTotal:  250000 kB\nMemAvailable: 999999999999 kB\n' > "$WORK/high"
 	printf 'MemTotal:  250000 kB\nMemFree:  9000 kB\n' > "$WORK/old-kernel"
 	for sh in dash "busybox ash"; do
-		df_mb=$(pw_sh "$sh" 'mb_free /tmp')
-		[ "$df_mb" -gt 40 ] || t_fail "$sh: в /tmp этой машины меньше 40 МБ — тест не о том"
-		t_eq 40 "$(pw_sh "$sh" "tmp_free '$WORK/low'")" "$sh: свободной памяти меньше, чем показывает df, — считаем по памяти"
-		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/high'")" "$sh: памяти больше, чем места в /tmp, — считаем по df"
-		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/old-kernel'")" "$sh: в meminfo нет MemAvailable — как раньше, по df"
-		t_eq "$df_mb" "$(pw_sh "$sh" "tmp_free '$WORK/нет-такого'")" "$sh: meminfo не прочитать — как раньше, по df"
+		[ "$(pw_sh "$sh" 'mb_free /tmp')" -ge 0 ] || t_fail "$sh: mb_free не выдала число"
+		t_eq 40 "$(pw_sh "$sh" "$df; tmp_free '$WORK/low'")" "$sh: свободной памяти меньше, чем показывает df, — считаем по памяти"
+		t_eq 500 "$(pw_sh "$sh" "$df; tmp_free '$WORK/high'")" "$sh: памяти больше, чем места в /tmp, — считаем по df"
+		t_eq 500 "$(pw_sh "$sh" "$df; tmp_free '$WORK/old-kernel'")" "$sh: в meminfo нет MemAvailable — как раньше, по df"
+		t_eq 500 "$(pw_sh "$sh" "$df; tmp_free '$WORK/нет-такого'")" "$sh: meminfo не прочитать — как раньше, по df"
 	done
 }
 
@@ -2336,19 +2337,22 @@ test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» �
 REALITY='{"network":"tcp","security":"reality"}'
 own_fns() {
 	eval "$(grep -m1 '^state_val() {' "$ROOT/src/install-vpn.sh.in")"
-	eval "$(awk '/^(own_inbound|find_own_inbound|own_inbound_late|own_to_settings|forget_failed_state|foreign_on_port|port_taken_check|service_ports|service_port_check|xui_inbound_ports|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(own_inbound|find_own_inbound|own_inbound_late|own_to_settings|forget_failed_state|on_exit|foreign_on_port|port_taken_check|service_ports|service_port_check|xui_inbound_ports|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
 	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG='' MODE=nodomain DOMAIN='' NO_DOMAIN=0 SUB_PORT=2096
-	S_INBOUND_ID='' OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_KNOWN=1 REALITY_PORT=2083
+	S_INBOUND_ID='' OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_PUB='' OWN_SIDS='' OWN_KNOWN=1 REALITY_PORT=2083
 	: > "$WORK/out"; rm -f "$DB" "$STATE" "$STATE".failed-*
 }
 # Ключи Reality в тестах — выдуманные строки: «наш» (из настроек установки) и чужой (подключение хозяина панели).
 KEY_OWN=OURkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 KEY_ALIEN=ALIENkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
-reality() {  # reality КЛЮЧ → stream_settings подключения с Reality и этим ключом
-	printf '{"network":"xhttp","security":"reality","realitySettings":{"privateKey":"%s","shortIds":["ab12"]}}' "$1"
+KEY_NEW=NEWkeyCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC   # ключ, который хозяин сервера поставил своему подключению в панели
+reality() {  # reality КЛЮЧ [nopub] → stream_settings подключения с Reality: закрытый ключ, открытый («PUB» + ключ) и shortIds
+	local pub="\"settings\":{\"publicKey\":\"PUB$1\",\"fingerprint\":\"chrome\"},"
+	[ "${2:-}" != nopub ] || pub=""
+	printf '{"network":"xhttp","security":"reality","realitySettings":{"privateKey":"%s",%s"shortIds":["ab12","cd34ef"]}}' "$1" "$pub"
 }
 state_put() {  # state_put "ИМЯ='значение'" … → настройки установки ($STATE) из этих строк
 	printf '%s\n' "$@" > "$STATE"
@@ -2370,88 +2374,176 @@ sql() { python3 -I -c 'import sqlite3, sys
 db = sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()' "$DB" "$1"; }
 own() { find_own_inbound; echo "id=$S_INBOUND_ID свой=$OWN_INBOUND_ID порт=$OLD_REALITY_PORT"; }
 
-test_own_inbound_is_the_one_with_our_key() {  # своё — подключение с ключом Reality из настроек установки; чужое VLESS + Reality своим не становится
+test_own_inbound_is_the_one_with_our_key() {  # (а) своё — подключение с ключом Reality из настроек, какой бы номер ни был записан;
+	# чужое VLESS + Reality своим не становится
 	own_fns
 	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" '8443||vmess|{}|{}|1'
 	t_eq "id=0 свой= порт=" "$(own)" "первый запуск поверх чужого 3x-ui (настроек установки нет)"
 	: > "$STATE.failed-20261112-000000"
 	t_eq "id=0 свой= порт=" "$(own)" "после сброшенной неудачной попытки (остался только след)"
 	rm -f "$STATE".failed-*
-	state_put "REALITY_PRIV=''" "S_INBOUND_ID='0'"
+	state_put "REALITY_PRIV=''" "S_INBOUND_ID='0'" "S_REALITY_PORT='2083'"
 	t_eq "id=0 свой= порт=" "$(own)" "прошлая попытка не дошла ни до ключей, ни до подключения"
-	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='0'"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='0'" "S_REALITY_PORT='2083'"
 	t_eq "id=0 свой= порт=" "$(own)" "ключи уже сгенерированы, подключение ещё не создано"
 	add_inbound 2083 "$KEY_OWN"
 	t_eq "id=3 свой=3 порт=2083" "$(own)" "подключение создано, а номер записать не успели — оно своё: в нём ключ из настроек"
-	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'" "S_REALITY_PORT='2083'"
 	t_eq "id=3 свой=3 порт=2083" "$(own)" "обычный повторный запуск"
 	state_put "REALITY_PRIV='$KEY_OWN'"
-	t_eq "id=3 свой=3 порт=2083" "$(own)" "настройки прежней версии (номера в них нет) — по ключу"
-	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='1'"
-	t_eq "id=3 свой=3 порт=2083" "$(own)" "под записанным номером чужое подключение — своё то, где ключ"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "в настройках только ключ — по ключу"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='1'" "S_REALITY_PORT='443'"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "под записанным номером и на записанном порту чужое подключение — своё всё равно то, где ключ"
 	sql "update inbounds set port=9443 where id=2; update inbounds set port=8443 where id=3"
-	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'" "S_REALITY_PORT='2083'"
 	t_eq "id=3 свой=3 порт=8443" "$(own)" "порт своего подключения поменяли в панели — берётся нынешний"
-	sql "insert into inbounds (port, protocol, stream_settings, enable) values (7001, 'vless', 'null', 1), (7002, 'vless', '[]', 1), (7003, 'vless', '{не json', 1), (7004, 'vless', '{\"security\":\"reality\",\"realitySettings\":[]}', 1)"
+	sql "insert into inbounds (port, protocol, stream_settings, enable) values (7001, 'vless', 'null', 1), (7002, 'vless', '[]', 1), (7003, 'vless', '{не json', 1), (7004, 'vless', '{\"security\":\"reality\",\"realitySettings\":[]}', 1), (null, 'vless', '{}', 1)"
 	t_eq "id=3 свой=3 порт=8443" "$(own)" "строки со странным содержимым поиску не мешают"
-	sql "update inbounds set stream_settings='$(reality "$KEY_ALIEN")' where id=3"
-	t_eq "id=0 свой= порт=" "$(own)" "под своим номером — подключение с другим ключом: оно не своё, номер сброшен"
 	sql "delete from inbounds where id=3"
 	t_eq "id=0 свой= порт=" "$(own)" "своё подключение удалили в панели — чужое вместо него своим не становится"
 }
-test_own_inbound_after_db_rollback_same_number_is_foreign() {  # первый запуск поверх чужой панели оборвался: база возвращена из снимка, а номер
-	# созданного подключения остался в настройках. Потом хозяин панели добавил своё подключение — оно получило тот же номер.
-	# Раньше оно становилось «своим»: скрипт не создавал своего, а с --port переносил чужое и закрывал его порт.
+test_own_inbound_by_number_and_port_when_keys_changed() {  # (б) ключи своего подключения сменили в панели — обычное обслуживание: оно остаётся
+	# своим по номеру и порту из настроек. А вот номер без порта (и без ключа) ничего не значит — под ним может быть чужое
+	own_fns
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" "2083||vless|{}|$(reality "$KEY_NEW")|1" '8443||vmess|{}|{}|1'
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='2'" "S_REALITY_PORT='2083'"
+	t_eq "id=2 свой=2 порт=2083" "$(own)" "ключ в подключении уже другой, номер и порт — те же: своё"
+	find_own_inbound
+	t_eq "$KEY_NEW|PUB$KEY_NEW|ab12,cd34ef" "$OWN_KEY|$OWN_PUB|$OWN_SIDS" "нынешние ключи и shortIds подключения прочитаны"
+	state_put "REALITY_PRIV=''" "S_INBOUND_ID='2'" "S_REALITY_PORT='2083'"
+	t_eq "id=2 свой=2 порт=2083" "$(own)" "номер без ключа: решает порт"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='2'" "S_REALITY_PORT='2084'"
+	t_eq "id=0 свой= порт=" "$(own)" "не совпали ни ключ, ни порт — подключение с этим номером чужое, номер сброшен"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='2'"
+	t_eq "id=0 свой= порт=" "$(own)" "порта в настройках нет — одного номера мало"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='3'" "S_REALITY_PORT='8443'"
+	t_eq "id=3 свой=3 порт=8443" "$(own)" "номер и порт решают и тогда, когда Reality в подключении уже нет"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='0'" "S_REALITY_PORT='2083'"
+	t_eq "id=0 свой= порт=" "$(own)" "номер «0» (ещё не создано): подключение на том же порту — не своё"
+	# То, что в подключении не похоже на ключ (в панель можно вписать что угодно), в настройки установки не переносится —
+	# и разбор ответа не ломает: подключение своё, ключи установки остаются прежними.
+	sql "update inbounds set stream_settings='{\"security\":\"reality\",\"realitySettings\":{\"privateKey\":\"не ключ, а текст\",\"settings\":{\"publicKey\":\"PUBx\"},\"shortIds\":[\"zz\",\"ab\"]}}' where id=2"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='2'" "S_REALITY_PORT='2083'"
+	find_own_inbound
+	t_eq "2|2083||PUBx|" "$OWN_INBOUND_ID|$OLD_REALITY_PORT|$OWN_KEY|$OWN_PUB|$OWN_SIDS" "своё найдено; негодные ключ и shortIds не прочитаны"
+	add_inbound 9000 "$KEY_OWN"
+	t_eq "id=4 свой=4 порт=9000" "$(own)" "есть подключение с ключом из настроек — оно главнее номера и порта"
+}
+test_keys_changed_in_panel_rerun_passes() {  # сменили ключи Reality в панели → повторный запуск проходит, а ключи в настройках обновляются:
+	# иначе при пересоздании подключения скрипт поставил бы прежние ключи
+	own_fns
+	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" "2083||vless|{}|$(reality "$KEY_NEW")|1"
+	state_put "REALITY_PRIV='$KEY_OWN'" "REALITY_PUB='PUB$KEY_OWN'" "SHORT_IDS='00,11'" "S_INBOUND_ID='2'" "S_REALITY_PORT='2083'"
+	find_own_inbound
+	REALITY_PORT=${OLD_REALITY_PORT:-2083}
+	( port_taken_check ) || t_fail "своё подключение со сменёнными ключами принято за чужое: $(cat "$WORK/out")"
+	REALITY_PRIV=$KEY_OWN REALITY_PUB=PUB$KEY_OWN SHORT_IDS=00,11   # как после «. $STATE»
+	own_to_settings
+	t_eq "$KEY_NEW|PUB$KEY_NEW|ab12,cd34ef|2" "$REALITY_PRIV|$REALITY_PUB|$SHORT_IDS|$S_INBOUND_ID" "ключи установки — нынешние ключи подключения"
+	t_has "сменили в панели" "$(cat "$WORK/out")" "об этом сказано"
+	MODE=nodomain DOMAIN='' PANEL_USER=u PANEL_PASS=p WEB_PORT=54321 WEB_PATH=/w/ SUB_PATH=/s/ CLASH_PATH=/c/ JSON_PATH=/j/ EXIT_MODE=direct
+	save_state
+	t_eq "$KEY_NEW" "$(state_val REALITY_PRIV)" "новый ключ записан в настройки"
+	sql "update inbounds set port=3000 where id=2"
+	t_eq "id=2 свой=2 порт=3000" "$(own)" "дальше подключение узнаётся уже по ключу — хоть на другом порту"
+}
+test_own_inbound_after_db_rollback_number_is_forgotten() {  # корень дыры с «тем же номером»: запуск создал своё подключение и оборвался, on_exit
+	# вернул прежнюю базу — номер в настройках должен сброситься. Иначе подключение, которое хозяин панели создаст следующим
+	# (оно получит тот же номер), на том же порту стало бы «своим».
+	local w=$WORK
 	own_fns
 	mkdb_tags "443||vless|{}|$(reality "$KEY_ALIEN")|1" '8443||vmess|{}|{}|1' '9000||trojan|{}|{}|1'
-	cp "$DB" "$WORK/db.before"   # снимок базы до первых изменений (xui_stop)
+	mkdir -p "$w/w"; cp "$DB" "$w/w/db.before"   # снимок базы до первых изменений (xui_stop)
 	add_inbound 2083 "$KEY_OWN"
 	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='4'" "S_REALITY_PORT='2083'"
-	t_eq "id=4 свой=4 порт=2083" "$(own)" "пока база не возвращена — подключение своё"
-	cp -f "$WORK/db.before" "$DB"   # обрыв: on_exit вернул базу, настройки остались
-	t_eq "id=0 свой= порт=" "$(own)" "после возврата базы своего подключения нет"
-	add_inbound 2083 "$KEY_ALIEN"   # хозяин панели
-	t_eq "1:443:in-443-tcp 2:8443:in-8443-tcp 3:9000:in-9000-tcp 4:2083:in-2083-tcp" "$(inbounds)" "подключение хозяина получило тот же номер 4"
-	t_eq "id=0 свой= порт=" "$(own)" "чужое подключение с «нашим» номером — не своё"
+	t_eq "id=4 свой=4 порт=2083" "$(own)" "подключение создано, номер записан"
+	(   # обрыв запуска ошибкой: настоящий on_exit; systemctl — заглушка
+		systemctl() { :; }
+		sqlite3() { :; }
+		WORK=$w/w CHK_OUT=$w/chk XUI_TOUCHED=1 XUI_WAS_ACTIVE=1 WD_WAS_ACTIVE=0 TOKEN_ID='' BOT_DIR='' OWN_CREATED=1
+		trap on_exit EXIT
+		exit 1
+	) 2> /dev/null || true
+	t_eq "1:443:in-443-tcp 2:8443:in-8443-tcp 3:9000:in-9000-tcp" "$(inbounds)" "база возвращена такой, как была до запуска"
+	t_eq "0|$KEY_OWN" "$(state_val S_INBOUND_ID)|$(state_val REALITY_PRIV)" "номер созданного подключения из настроек убран, ключи — на месте"
+	add_inbound 2083 "$KEY_ALIEN"   # хозяин панели: тот же номер 4 — и даже тот же порт
+	t_eq "4:2083:in-2083-tcp" "$(inbounds | tr ' ' '\n' | tail -1)" "подключение хозяина получило номер 4"
+	t_eq "id=0 свой= порт=" "$(own)" "чужое подключение с прежним «нашим» номером на том же порту — не своё"
 	find_own_inbound
 	REALITY_PORT=2083
-	! ( port_taken_check ) || t_fail "порт занят чужим подключением с «нашим» номером — должен остановиться"
-	t_has "2083" "$(cat "$WORK/out")" "какой порт занят"
+	! ( port_taken_check ) || t_fail "порт занят чужим подключением — должен остановиться"
+	t_has "ни то, ни другое" "$(cat "$WORK/out")" "сказано, по чему скрипт узнаёт своё"
 	REALITY_PORT=3000
 	( port_taken_check ) || t_fail "свободный порт из --port: $(cat "$WORK/out")"
 	t_eq "" "$OWN_INBOUND_ID$OLD_REALITY_PORT" "переносить на новый порт нечего: своего подключения нет"
+	# Базу заменили не через on_exit (сброс панели, импорт) — номер в настройках остался. Чужое подключение с тем же
+	# номером, но на другом порту — не своё: сценарий ревьюера.
+	sql "update inbounds set port=8444 where id=4"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='4'" "S_REALITY_PORT='2083'"
+	t_eq "id=0 свой= порт=" "$(own)" "тот же номер на другом порту и с другим ключом — чужое"
 }
-test_own_inbound_settings_without_key_as_before() {  # в настройках нет ни ключа, ни номера (самые первые версии): своё — первое VLESS + Reality,
-	# как раньше; его ключ становится ключом установки — иначе скрипт сгенерировал бы новый и на следующем запуске своё потерял
+test_db_rollback_keeps_number_of_inbound_that_was_there() {  # своё подключение было и до запуска — возврат базы его номер не трогает
+	local w=$WORK
 	own_fns
-	mkdb_tags '8443||vmess|{}|{}|1' "443||vless|{}|$(reality "$KEY_OWN")|1" "2083||vless|{}|$(reality "$KEY_ALIEN")|1"
+	mkdb_tags "2083||vless|{}|$(reality "$KEY_OWN")|1"
+	mkdir -p "$w/w"; cp "$DB" "$w/w/db.before"
+	state_put "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='1'" "S_REALITY_PORT='2083'"
+	(
+		systemctl() { :; }
+		sqlite3() { :; }
+		WORK=$w/w CHK_OUT=$w/chk XUI_TOUCHED=1 XUI_WAS_ACTIVE=1 WD_WAS_ACTIVE=0 TOKEN_ID='' BOT_DIR=''
+		trap on_exit EXIT
+		exit 1
+	) 2> /dev/null || true
+	t_eq 1 "$(state_val S_INBOUND_ID)" "номер прежнего своего подключения остался"
+}
+test_own_inbound_settings_without_number() {  # (в) настройки без номера (прежние версии): по ключу; иначе VLESS + Reality на порту из
+	# настроек; нет ни ключа, ни порта (самые первые версии) — первое VLESS + Reality, как раньше. Ключи найденного — в настройки
+	own_fns
+	mkdb_tags '8443||vmess|{}|{}|1' "443||vless|{}|$(reality "$KEY_NEW")|1" "2083||vless|{}|$(reality "$KEY_ALIEN")|1"
 	state_put "S_MODE='nodomain'" "S_DONE='1'"
-	t_eq "id=2 свой=2 порт=443" "$(own)" "прежняя версия без домена ставила 443 — второго подключения не будет"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "ни ключа, ни порта, ни номера — первое VLESS + Reality, как раньше"
 	state_put "S_MODE='nodomain'" "S_INBOUND_ID='мусор'"
 	t_eq "id=2 свой=2 порт=443" "$(own)" "нечисловой номер в настройках — как будто его нет"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV='$KEY_OWN'" "S_REALITY_PORT='443'"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "ключи сменили в панели: VLESS + Reality на порту из настроек — своё"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV='$KEY_OWN'" "S_REALITY_PORT='2083'"
+	t_eq "id=3 свой=3 порт=2083" "$(own)" "порт из настроек — 2083: своё то VLESS + Reality, что на нём"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV='$KEY_OWN'" "S_REALITY_PORT='8443'"
+	t_eq "id= свой= порт=" "$(own)" "на порту из настроек — не VLESS + Reality: без номера оно не своё"
+	state_put "S_MODE='nodomain'" "S_REALITY_PORT='3000'"
+	t_eq "id= свой= порт=" "$(own)" "порт в настройках есть, на нём пусто — «первое VLESS + Reality» не подбирается"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV='$KEY_OWN'"
+	t_eq "id= свой= порт=" "$(own)" "ключ в настройках есть, в базе его нет, порта нет — своего нет"
+	# Ключи найденного подключения становятся ключами установки — и на следующем запуске оно узнаётся уже по ключу.
+	state_put "S_MODE='nodomain'" "S_DONE='1'"
 	find_own_inbound
-	unset REALITY_PRIV S_INBOUND_ID   # как после «. $STATE», в котором этих строк нет
+	unset REALITY_PRIV REALITY_PUB SHORT_IDS S_INBOUND_ID   # как после «. $STATE», в котором этих строк нет
 	own_to_settings
-	t_eq "2|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "номер и ключ установки — найденного подключения"
-	state_put "S_MODE='nodomain'" "REALITY_PRIV='$REALITY_PRIV'" "S_INBOUND_ID='$S_INBOUND_ID'"   # так их запишет save_state
+	t_eq "2|$KEY_NEW|PUB$KEY_NEW" "$S_INBOUND_ID|$REALITY_PRIV|$REALITY_PUB" "номер и ключи установки — найденного подключения"
+	! grep -q 'сменили в панели' "$WORK/out" || t_fail "ключей в настройках не было — «сменили в панели» говорить не о чем"
+	state_put "S_MODE='nodomain'" "REALITY_PRIV='$REALITY_PRIV'" "S_INBOUND_ID='$S_INBOUND_ID'" "S_REALITY_PORT='443'"   # так их запишет save_state
 	sql "delete from inbounds where id=1; insert into inbounds (id, port, protocol, stream_settings, enable, tag) values (1, 7000, 'vless', '$(reality "$KEY_ALIEN")', 1, 'in-7000-tcp')"
-	t_eq "id=2 свой=2 порт=443" "$(own)" "следующий запуск узнаёт его уже по ключу, а не как «первое VLESS + Reality» (первое теперь — чужое #1)"
-	state_put "S_MODE='nodomain'" "REALITY_PRIV=''" "S_INBOUND_ID='2'"
-	t_eq "id=0 свой= порт=" "$(own)" "номер без ключа проверить нечем — своим подключение не считается"
+	t_eq "id=2 свой=2 порт=443" "$(own)" "следующий запуск узнаёт его по ключу, а не как «первое VLESS + Reality» (первое теперь — чужое #1)"
 	rm -f "$DB"; mkdb_tags '8443||vmess|{}|{}|1'
 	state_put "S_MODE='nodomain'"
 	t_eq "id= свой= порт=" "$(own)" "VLESS + Reality в базе нет — своего нет"
 }
-test_own_to_settings_takes_found_not_written() {  # после чтения настроек номер своего подключения — найденного по ключу, а не записанный
+test_own_to_settings_takes_found_not_written() {  # после чтения настроек: номер — найденного своего подключения, ключи — те, что в нём сейчас
 	own_fns
-	S_INBOUND_ID=4 OWN_INBOUND_ID='' OWN_KEY='' REALITY_PRIV=$KEY_OWN; own_to_settings
-	t_eq "0|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "записанный номер не подтвердился — сброшен; ключ установки прежний"
-	S_INBOUND_ID=4 OWN_INBOUND_ID=6 OWN_KEY=$KEY_OWN REALITY_PRIV=$KEY_OWN; own_to_settings
-	t_eq "6|$KEY_OWN" "$S_INBOUND_ID|$REALITY_PRIV" "номер — того подключения, в котором ключ"
-	S_INBOUND_ID='' OWN_INBOUND_ID='' OWN_KEY='' REALITY_PRIV=''; own_to_settings
-	t_eq "|" "$S_INBOUND_ID|$REALITY_PRIV" "ни номера, ни ключа, ни своего подключения — так и остаётся: ключ сгенерируется дальше"
-	S_INBOUND_ID=3 OWN_INBOUND_ID=3 OWN_KEY=$KEY_ALIEN REALITY_PRIV=$KEY_OWN; own_to_settings
-	t_eq "$KEY_OWN" "$REALITY_PRIV" "ключ из настроек найденным не подменяется"
+	S_INBOUND_ID=4 OWN_INBOUND_ID='' OWN_KEY='' OWN_PUB='' OWN_SIDS='' REALITY_PRIV=$KEY_OWN REALITY_PUB=PUB$KEY_OWN SHORT_IDS=00,11; own_to_settings
+	t_eq "0|$KEY_OWN|PUB$KEY_OWN|00,11" "$S_INBOUND_ID|$REALITY_PRIV|$REALITY_PUB|$SHORT_IDS" "своего нет: записанный номер сброшен, ключи установки прежние"
+	S_INBOUND_ID=4 OWN_INBOUND_ID=6 OWN_KEY=$KEY_OWN OWN_PUB=PUB$KEY_OWN OWN_SIDS=ab12 REALITY_PRIV=$KEY_OWN REALITY_PUB=PUB$KEY_OWN SHORT_IDS=00,11; own_to_settings
+	t_eq "6|$KEY_OWN|00,11" "$S_INBOUND_ID|$REALITY_PRIV|$SHORT_IDS" "найдено по ключу: номер — найденного, остальное не трогается"
+	[ ! -s "$WORK/out" ] || t_fail "ключ тот же, а что-то сказано: $(cat "$WORK/out")"
+	S_INBOUND_ID=6 OWN_INBOUND_ID=6 OWN_KEY=$KEY_NEW OWN_PUB=PUB$KEY_NEW OWN_SIDS=ab12 REALITY_PRIV=$KEY_OWN REALITY_PUB=PUB$KEY_OWN SHORT_IDS=00,11; own_to_settings
+	t_eq "$KEY_NEW|PUB$KEY_NEW|ab12" "$REALITY_PRIV|$REALITY_PUB|$SHORT_IDS" "ключи сменили в панели: закрытый, открытый и shortIds — все из подключения"
+	S_INBOUND_ID=6 OWN_INBOUND_ID=6 OWN_KEY=$KEY_NEW OWN_PUB=PUB$KEY_NEW OWN_SIDS='' REALITY_PRIV=$KEY_OWN REALITY_PUB=PUB$KEY_OWN SHORT_IDS=00,11; own_to_settings
+	t_eq "$KEY_NEW|00,11" "$REALITY_PRIV|$SHORT_IDS" "shortIds в подключении не прочитались — в настройках остаются прежние"
+	S_INBOUND_ID=6 OWN_INBOUND_ID=6 OWN_KEY=$KEY_NEW OWN_PUB='' OWN_SIDS=ab12 REALITY_PRIV=$KEY_OWN REALITY_PUB=PUB$KEY_OWN SHORT_IDS=00,11; own_to_settings
+	t_eq "6|$KEY_OWN|PUB$KEY_OWN|00,11" "$S_INBOUND_ID|$REALITY_PRIV|$REALITY_PUB|$SHORT_IDS" "открытого ключа в подключении нет — пару не разрываем: ключи установки прежние, подключение всё равно своё"
+	S_INBOUND_ID='' OWN_INBOUND_ID='' OWN_KEY='' OWN_PUB='' OWN_SIDS='' REALITY_PRIV='' REALITY_PUB='' SHORT_IDS=''; own_to_settings
+	t_eq "||" "$S_INBOUND_ID|$REALITY_PRIV|$REALITY_PUB" "ни номера, ни ключа, ни своего подключения — так и остаётся: ключи сгенерируются дальше"
 }
 test_own_inbound_read_once_python_is_there() {  # в начале запуска python3 может не быть — базу панели прочитать нечем. После его установки своё
 	# подключение читается заново: иначе оно сошло бы за чужое («порт занят») или переехало бы на порт из настроек
@@ -2511,6 +2603,7 @@ test_port_taken_check_own_and_foreign() {  # порт своего подклю�
 	S_INBOUND_ID=2 OWN_INBOUND_ID='' REALITY_PORT=2083
 	! ( port_taken_check ) || t_fail "номер из настроек без найденного своего подключения — не повод считать подключение своим"
 	t_has "по ключу Reality" "$(cat "$WORK/out")" "повторный запуск: сказано, по чему скрипт узнаёт своё"
+	t_has "ни то, ни другое" "$(cat "$WORK/out")" "и что у этого подключения не совпало ничего"
 	# Настройки прежних версий (номера в них нет): раньше проверка для них пропускалась, и подключение на своём порту усыновлялось.
 	S_INBOUND_ID='' OWN_INBOUND_ID='' REALITY_PORT=2083
 	! ( port_taken_check ) || t_fail "настройки без номера, на своём порту чужое — должен остановиться"
@@ -2806,6 +2899,7 @@ test_flow_created_inbound_known_by_key_and_saved() {  # своё подключ�
 	have=$(tl '^if \[ -n "\$OWN_INBOUND_ID" \]; then$' "$chk"); add=$(tl 'api POST inbounds/add ' "$have")
 	okl=$(tl 'api_ok <<<"\$RESP" \|\| die ' "$add"); find=$(tl '^\tfind_own_inbound( |$)' "$okl"); sid=$(tl '^S_INBOUND_ID=\$OWN_INBOUND_ID$' "$find")
 	in_order "создавать ли подключение, решает найденное своё; номер созданного — поиском по ключу" "$api" "$chk" "$have" "$add" "$okl" "$find" "$sid"
+	in_order "отметка «создано в этом запуске» (её читает on_exit при возврате базы) — сразу после создания" "$find" "$(tl '^\tOWN_CREATED=1( |$)' "$find")" "$sid"
 	t_eq "save_state" "$(sed -n "$((sid + 1))p" "$f")" "номер записывается в настройки сразу"
 	! grep -nE 'INBOUND_ID=.*select id from inbounds where port' "$f" || t_fail "номер подключения берётся запросом по порту — так своим становилось чужое"
 }
@@ -2835,12 +2929,12 @@ test_failed_attempt_is_forgotten() {  # смена варианта после �
 	own_fns
 	state_put "S_MODE='domain'" "REALITY_PRIV='$KEY_OWN'" "S_INBOUND_ID='4'"
 	S_MODE=domain S_DOMAIN_OLD=old.example.com S_EXIT=warp S_REALITY_PORT=2084 S_INBOUND_ID=4 CHAIN_IP=203.0.113.9 CHAIN_SSH_PORT=2222
-	OWN_INBOUND_ID=4 OLD_REALITY_PORT=2084 OWN_KEY=$KEY_OWN
+	OWN_INBOUND_ID=4 OLD_REALITY_PORT=2084 OWN_KEY=$KEY_OWN OWN_PUB=PUB$KEY_OWN OWN_SIDS=ab12
 	forget_failed_state
 	[ ! -e "$STATE" ] || t_fail "настройки неудачной попытки остались на месте"
 	compgen -G "$STATE.failed-*" > /dev/null || t_fail "от неудачной попытки не осталось следа — свой 3x-ui потом сойдёт за чужой"
 	t_eq "|||0||" "$S_MODE|$S_DOMAIN_OLD|$S_REALITY_PORT|$S_INBOUND_ID|$CHAIN_IP|$CHAIN_SSH_PORT" "прошлые настройки забыты, номер подключения — «ещё не создано»"
-	t_eq "||" "$OWN_INBOUND_ID|$OLD_REALITY_PORT|$OWN_KEY" "и своего подключения больше нет"
+	t_eq "||||" "$OWN_INBOUND_ID|$OLD_REALITY_PORT|$OWN_KEY|$OWN_PUB|$OWN_SIDS" "и своего подключения больше нет"
 	MODE=nodomain DOMAIN='' PANEL_USER=u PANEL_PASS=p WEB_PORT=54321 WEB_PATH=/w/ SUB_PATH=/s/ CLASH_PATH=/c/ JSON_PATH=/j/ EXIT_MODE=direct
 	save_state
 	t_eq 0 "$(state_val S_INBOUND_ID)" "в новые настройки номер прошлой попытки не попал"
@@ -2867,6 +2961,260 @@ test_every_ufw_status_is_asked_in_english() {  # «ufw status» читается
 	t_eq "" "$bad" "вызов «ufw status» без LANGUAGE=C LC_ALL=C"
 	calls=$(grep -c 'LANGUAGE=C LC_ALL=C ufw status' "$f")
 	[ "$calls" -ge 2 ] || t_fail "вызовов «LANGUAGE=C LC_ALL=C ufw status» в шаблоне: $calls — страж ничего не сторожит"
+}
+
+# Обрыв установки сигналом: Ctrl-C, обрыв SSH (терминал пропал), SIGTERM. README обещает, что база 3x-ui возвращается и VPN
+# работает как работал, — а bash после сигнала запускал on_exit с кодом 0 (код последней завершившейся команды), и отката не
+# было. Проверяется настоящим процессом в псевдотерминале: on_exit, ловушки и вывод через tee — строки шаблона как есть;
+# systemctl — заглушка, пишущая в $WORK/calls.
+exit_script() {  # сценарий $WORK/exit.sh: «установка», которая уже остановила x-ui и поменяла базу
+	local f=$ROOT/src/install-vpn.sh.in
+	{
+		echo 'set -euo pipefail'
+		echo "T='$WORK'"
+		cat <<'EOF'
+WORK=$T/w CHK_OUT=$T/chk DB=$T/x-ui.db LOG=$T/install.log STATE=$T/vpn-install.env
+mkdir -p "$WORK"; : > "$CHK_OUT"
+XUI_TOUCHED=1 XUI_WAS_ACTIVE=1 WD_WAS_ACTIVE=0 TOKEN_ID='' BOT_DIR=''
+systemctl() { echo "systemctl $*" >> "$T/calls"; [ "$1" != stop ] || sleep "${STOP_TAKES:-0}"; }
+sqlite3() { :; }
+echo "база до запуска" > "$WORK/db.before"
+echo "база, изменённая запуском" > "$DB"
+EOF
+		awk '/^on_exit\(\) \{/,/^}/' "$f"
+		grep -E "^trap (on_exit EXIT|'[^']*' (INT|HUP|TERM|PIPE))( |\$)" "$f"   # ловушки основного скрипта
+		grep -m1 '^exec > >(' "$f"                                          # вывод — на экран и в журнал
+		cat <<'EOF'
+echo "работаю"
+: > "$T/ready"
+for _ in $(seq 1 "${WORK_STEPS:-60}"); do [ -z "${CHATTY:-}" ] || echo "шаг"; sleep 0.5; done
+[ -z "${FAIL_AT_END:-}" ] || exit 1
+echo "дошёл до конца"
+EOF
+	} > "$WORK/exit.sh"
+	grep -q '^on_exit() {' "$WORK/exit.sh" && grep -q '^trap on_exit EXIT' "$WORK/exit.sh" && grep -q '^exec > >(' "$WORK/exit.sh" ||
+		t_fail "в шаблоне не нашлись on_exit, ловушка EXIT или вывод через tee"
+}
+sig_run() {  # sig_run ДЕЙСТВИЕ → код возврата $WORK/exit.sh. Действие — когда сценарий уже «работает»: int (Ctrl-C), int2 (ещё два
+	# Ctrl-C во время отката), hup (терминал пропал; сценарий — задание интерактивной оболочки, как при входе по SSH),
+	# termgrp (SIGTERM группе процессов), int_in_rollback (сценарий падает сам, а Ctrl-C приходит уже во время отката),
+	# tee_killed (tee убит, потом SIGTERM сценарию: печатать некуда вовсе), tee_killed_only (tee убит — и всё), none (не мешать)
+	python3 -I - "$WORK" "$1" <<'EOF'
+import os, pty, select, signal, sys, time
+work, action = sys.argv[1:3]
+script, ready, calls = (os.path.join(work, n) for n in ("exit.sh", "ready", "calls"))
+os.environ.update(HOME=work, HISTFILE="/dev/null")   # интерактивная оболочка — без чужих настроек и без записи истории
+pid, fd = pty.fork()
+if pid == 0:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # Python её игнорирует, и потомки это наследуют; у человека в терминале — как здесь
+    if action == "hup":
+        os.execvp("bash", ["bash", "--norc", "--noprofile", "-i"])
+    os.execvp("bash", ["bash", script])
+if action == "hup":
+    time.sleep(0.5)
+    os.write(fd, ("bash '%s'\n" % script).encode())
+
+
+def drain():
+    try:
+        while select.select([fd], [], [], 0)[0]:
+            if not os.read(fd, 65536):
+                break
+    except OSError:
+        pass
+
+
+def done():
+    try:
+        return "systemctl start x-ui" in open(calls).read()
+    except OSError:
+        return False
+
+
+end = time.time() + 15
+while not os.path.exists(ready) and time.time() < end:
+    drain()
+    time.sleep(0.05)
+if not os.path.exists(ready):
+    print("сценарий не запустился")
+    sys.exit(0)
+time.sleep(0.4)
+closed = False
+if action in ("int", "int2"):
+    os.write(fd, b"\x03")
+if action == "int2":   # откат уже идёт (заглушка «systemctl stop» медлит): человек жмёт Ctrl-C ещё и ещё
+    for _ in range(2):
+        time.sleep(0.4)
+        os.write(fd, b"\x03")
+elif action == "hup":
+    os.close(fd)
+    closed = True
+elif action == "termgrp":
+    os.killpg(pid, signal.SIGTERM)
+elif action == "int_in_rollback":
+    end = time.time() + 20
+    while time.time() < end:   # сценарий завершается ошибкой сам; ждём начала отката
+        drain()
+        try:
+            if "systemctl stop x-ui" in open(calls).read():
+                break
+        except OSError:
+            pass
+        time.sleep(0.05)
+    for _ in range(2):
+        time.sleep(0.3)
+        os.write(fd, b"\x03")
+elif action in ("tee_killed", "tee_killed_only"):
+    for d in os.listdir("/proc"):
+        try:
+            f = open("/proc/%s/stat" % d).read().rsplit(")", 1)
+            if d.isdigit() and f[0].endswith("(tee") and int(f[1].split()[1]) == pid:
+                os.kill(int(d), signal.SIGKILL)
+        except (OSError, ValueError, IndexError):
+            pass
+    time.sleep(0.3)
+    if action == "tee_killed":
+        os.kill(pid, signal.SIGTERM)
+status, end = None, time.time() + 45
+while time.time() < end:
+    if not closed:
+        drain()
+    got, st = os.waitpid(pid, os.WNOHANG)
+    if got:
+        status = st
+        break
+    time.sleep(0.05)
+if status is None:
+    os.killpg(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    print("завис")
+    sys.exit(0)
+if action == "hup":   # оболочка входа уже вышла; сценарий доделывает откат без терминала — дождаться
+    end = time.time() + 15
+    while time.time() < end and not done():
+        time.sleep(0.1)
+    print("hup")
+else:
+    print(os.waitstatus_to_exitcode(status))
+time.sleep(0.6)   # tee дописывает журнал
+EOF
+}
+exit_rolled_back() {  # exit_rolled_back 'что это было' — x-ui остановлен и запущен снова, база — как до запуска, в журнале — записи об этом
+	local calls
+	calls=$({ cat "$WORK/calls" 2> /dev/null || true; } | tr '\n' ';')
+	[[ $calls == *"systemctl stop x-ui;"*"systemctl start x-ui;"* ]] || t_fail "$1: x-ui не запущен снова (вызовы: ${calls:-нет})"
+	t_eq "база до запуска" "$(cat "$WORK/x-ui.db")" "$1: база 3x-ui возвращена такой, как была до запуска"
+	grep -q 'база 3x-ui возвращена' "$WORK/install.log" && grep -q 'x-ui запущен снова' "$WORK/install.log" ||
+		t_fail "$1: в журнале установки нет записи об откате: $(tr '\n' ';' < "$WORK/install.log")"
+}
+test_exit_ctrl_c_rolls_back() {  # Ctrl-C посреди установки: база возвращена, x-ui запущен снова, код 130
+	exit_script
+	t_eq 130 "$(sig_run int)" "код возврата после Ctrl-C"
+	exit_rolled_back "Ctrl-C"
+}
+test_exit_ssh_drop_rolls_back() {  # обрыв SSH: терминала уже нет, печатать некуда — откат всё равно доходит до конца, и в журнале он записан
+	exit_script
+	t_eq hup "$(sig_run hup)" "сценарий запущен из интерактивной оболочки, терминал закрыт"
+	exit_rolled_back "обрыв SSH"
+}
+test_exit_sigterm_rolls_back() {  # SIGTERM всей группе процессов (kill, остановка сеанса): то же
+	exit_script
+	t_eq 143 "$(sig_run termgrp)" "код возврата после SIGTERM"
+	exit_rolled_back "SIGTERM"
+}
+test_exit_second_ctrl_c_does_not_stop_rollback() {  # человек жмёт Ctrl-C ещё раз, пока идёт откат: откат не прерывается
+	exit_script
+	t_eq 130 "$(STOP_TAKES=1.5 sig_run int2)" "код возврата"
+	exit_rolled_back "повторный Ctrl-C во время отката"
+}
+test_exit_ctrl_c_during_rollback_after_error() {  # установка упала сама и уже откатывается — Ctrl-C в этот момент откат не прерывает
+	exit_script
+	t_eq 1 "$(WORK_STEPS=2 FAIL_AT_END=1 STOP_TAKES=1.5 sig_run int_in_rollback)" "код возврата — от ошибки, а не от Ctrl-C"
+	exit_rolled_back "Ctrl-C во время отката после ошибки"
+}
+test_exit_rolls_back_with_nowhere_to_print() {  # печатать некуда вовсе (tee убит): сообщения об откате пропадают, сам откат — нет
+	local calls
+	exit_script
+	t_eq 143 "$(sig_run tee_killed)" "код возврата"
+	calls=$({ cat "$WORK/calls" 2> /dev/null || true; } | tr '\n' ';')
+	[[ $calls == *"systemctl stop x-ui;"*"systemctl start x-ui;"* ]] || t_fail "x-ui не запущен снова (вызовы: ${calls:-нет})"
+	t_eq "база до запуска" "$(cat "$WORK/x-ui.db")" "база 3x-ui возвращена"
+}
+test_exit_signal_during_stop_still_restarts() {  # сигнал пришёл, пока x-ui останавливался: bash обрабатывает его сразу после этой команды —
+	# on_exit к этому моменту уже должен знать, что x-ui трогали, иначе VPN так и останется выключенным
+	local f=$ROOT/src/install-vpn.sh.in
+	{
+		echo 'set -euo pipefail'
+		echo "T='$WORK'"
+		cat <<'EOF'
+WORK=$T/w CHK_OUT=$T/chk DB=$T/x-ui.db LOG=$T/install.log STATE=$T/vpn-install.env
+mkdir -p "$WORK"; : > "$CHK_OUT"; echo "база" > "$DB"
+XUI_TOUCHED=0 XUI_WAS_ACTIVE=1 WD_WAS_ACTIVE=0 TOKEN_ID='' BOT_DIR=''
+systemctl() {
+	echo "systemctl $*" >> "$T/calls"
+	# «stop x-ui» отработал — и тут же срабатывает ловушка сигнала, пришедшего во время остановки: exit 130
+	if [ "$*" = "stop x-ui" ] && [ ! -e "$T/fired" ]; then : > "$T/fired"; exit 130; fi
+}
+sqlite3() { cp "$1" "$WORK/db.before"; }
+EOF
+		awk '/^(on_exit|xui_stop)\(\) \{/,/^}/' "$f"
+		echo 'trap on_exit EXIT'
+		echo 'xui_stop'
+		echo 'echo "сюда дойти не должны" >> "$T/calls"'
+	} > "$WORK/stop.sh"
+	set +e; bash "$WORK/stop.sh" > "$WORK/stop.out" 2>&1; set -e
+	t_eq "systemctl stop vpn-exit-watchdog;systemctl stop x-ui;systemctl stop x-ui;systemctl start x-ui;" "$(tr '\n' ';' < "$WORK/calls")" \
+		"x-ui остановлен — и запущен снова, хотя обрыв пришёлся на саму остановку"
+	t_eq "база" "$(cat "$WORK/x-ui.db")" "база не тронута (снимка ещё не было — возвращать нечего)"
+	# Без обрыва: снимок базы — при первой остановке, и только при первой (вторая остановка идёт уже по изменённой базе).
+	: > "$WORK/fired"; rm -f "$WORK/calls"
+	sed -i 's/^xui_stop$/xui_stop; echo "изменено" > "$DB"; xui_stop; cp "$WORK\/db.before" "$T\/snapshot"; exit 1/' "$WORK/stop.sh"
+	set +e; bash "$WORK/stop.sh" > "$WORK/stop.out" 2>&1; set -e
+	t_eq "база" "$(cat "$WORK/snapshot")" "снимок — база до первых изменений"
+	t_eq "база" "$(cat "$WORK/x-ui.db")" "при ошибке после изменений база возвращена из снимка"
+}
+test_exit_tee_gone_rolls_back() {  # tee, через который идёт весь вывод, убит: следующая же строка вывода убивала скрипт (SIGPIPE) — с кодом 0
+	# в on_exit и без отката. Теперь это такой же обрыв, как остальные
+	local calls
+	exit_script
+	t_eq 141 "$(CHATTY=1 sig_run tee_killed_only)" "код возврата"
+	calls=$({ cat "$WORK/calls" 2> /dev/null || true; } | tr '\n' ';')
+	[[ $calls == *"systemctl stop x-ui;"*"systemctl start x-ui;"* ]] || t_fail "x-ui не запущен снова (вызовы: ${calls:-нет})"
+	t_eq "база до запуска" "$(cat "$WORK/x-ui.db")" "база 3x-ui возвращена"
+}
+test_exit_output_reader_gone_install_goes_on() {  # запуск без терминала (ssh сервер 'bash install-vpn.sh …', бот), связь пропала: читать вывод
+	# некому, сигнала скрипту никто не шлёт. Раньше tee умирал на первой же строке, за ним — скрипт, посреди установки и без
+	# отката. Теперь установка идёт дальше и доходит до конца, а журнал пишется целиком
+	exit_script
+	(
+		set +e
+		WORK_STEPS=4 CHATTY=1 python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # как у человека и у sshd: Python её игнорирует, и потомки это наследуют
+os.execvp("bash", ["bash", sys.argv[1]])' "$WORK/exit.sh" 2>&1
+		echo "$?" > "$WORK/rc"
+	) | head -c 4 > /dev/null   # читатель вывода исчезает почти сразу
+	t_eq 0 "$(cat "$WORK/rc")" "сценарий доработал до конца"
+	grep -q 'дошёл до конца' "$WORK/install.log" || t_fail "журнал оборвался вместе с читателем вывода: $(tr '\n' ';' < "$WORK/install.log")"
+	t_eq 4 "$(grep -c '^шаг' "$WORK/install.log")" "в журнале — все шаги"
+	[ ! -e "$WORK/calls" ] || t_fail "установка не падала, а x-ui откатывали: $(tr '\n' ';' < "$WORK/calls")"
+	t_eq "база, изменённая запуском" "$(cat "$WORK/x-ui.db")" "база — новая"
+}
+test_exit_without_signal_as_before() {  # без сигнала — как раньше: успешный запуск ничего не откатывает, ошибка — откатывает
+	exit_script
+	t_eq 0 "$(WORK_STEPS=2 sig_run none)" "успешный запуск"
+	[ ! -e "$WORK/calls" ] || t_fail "успешный запуск, а x-ui трогали: $(tr '\n' ';' < "$WORK/calls")"
+	t_eq "база, изменённая запуском" "$(cat "$WORK/x-ui.db")" "после успешного запуска база — новая"
+	grep -q 'дошёл до конца' "$WORK/install.log" || t_fail "вывод не попал в журнал: $(cat "$WORK/install.log")"
+	rm -f "$WORK/ready" "$WORK/install.log"
+	t_eq 1 "$(WORK_STEPS=2 FAIL_AT_END=1 sig_run none)" "запуск с ошибкой"
+	exit_rolled_back "ошибка (код 1)"
+}
+test_flow_signal_traps_next_to_exit_trap() {  # ловушки сигналов стоят сразу за ловушкой выхода — раньше первого изменения системы
+	local a
+	a=$(tl '^trap on_exit EXIT$')
+	in_order "ловушки INT, HUP, TERM — сразу после «trap on_exit EXIT», до вывода через tee и «Проверки сервера»" \
+		"$a" "$(tl "^trap '.*exit 130' INT\$" "$a")" "$(tl "^trap '.*exit 129' HUP\$" "$a")" "$(tl "^trap '.*exit 143' TERM\$" "$a")" "$(tl "^trap '.*exit 141' PIPE\$" "$a")" \
+		"$(tl '^exec > >\(' "$a")" "$(tl '^say "Проверка сервера"$' "$a")"
 }
 
 # ——— запуск под sudo: SSH_CONNECTION стёрта, а знать о своём входе скрипту нужно ———
