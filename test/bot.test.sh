@@ -230,11 +230,26 @@ panel_env() {
 	DB=$WORK/x-ui.db
 	sqlite3 "$DB" "create table api_tokens (id integer primary key autoincrement, name text not null unique, token text not null, enabled numeric default 1, created_at integer);"
 	XUI=$WORK/x-ui
+	# Как x-ui 3.11.0 (проверено на настоящей панели): «-getApiToken» выдаёт токен с именем из -tokenName — новый или,
+	# если такой есть, перевыпущенный НА МЕСТЕ (id строки прежний); без имени это всегда одна строка «cli-fallback».
 	cat > "$XUI" <<'X'
 #!/bin/bash
 [ "$1 $2" = "setting -getApiToken" ] || exit 2
-sqlite3 "$DB" "insert into api_tokens (name, token) values ('cli-' || abs(random()), 'hash');"
-echo "apiToken: P$(sqlite3 "$DB" 'select max(id) from api_tokens;')"
+shift 2
+name=cli-fallback
+while [ $# -gt 0 ]; do
+	case $1 in
+		-tokenName) name=$2; shift 2 ;;
+		-tokenScope) shift 2 ;;
+		*) echo "flag provided but not defined: $1"; exit 2 ;;
+	esac
+done
+if [ "$(sqlite3 "$DB" "select count(*) from api_tokens where name='$name';")" = 0 ]; then
+	sqlite3 "$DB" "insert into api_tokens (name, token) values ('$name', 'hash');"
+else
+	sqlite3 "$DB" "update api_tokens set token='regen' where name='$name';"
+fi
+echo "apiToken: P$(sqlite3 "$DB" "select id from api_tokens where name='$name';")"
 X
 	chmod +x "$XUI"
 	export DB
@@ -262,6 +277,166 @@ test_panel_token_inherit() {
 	bot_panel_token
 	t_eq 0 "$BOT_PANEL_NEW" "унаследован"
 	t_eq old "$(sqlite3 "$DB" "select token from api_tokens where name='vpn-bot';")" "строка не тронута"
+}
+test_panel_token_leaves_other_tokens() {  # 3x-ui 3.11: токен без имени перевыпускается на месте — «последняя строка» была бы чужой
+	panel_env; BOT_EXISTING=none
+	sqlite3 "$DB" "insert into api_tokens (name, token) values ('cli-fallback', 'left'); insert into api_tokens (name, token) values ('other', 'keep');"
+	bot_panel_token || t_fail "не создал: $BOT_ERR"
+	t_eq 1 "$(sqlite3 "$DB" "select count(*) from api_tokens where name='vpn-bot';")" "строка vpn-bot"
+	t_eq keep "$(sqlite3 "$DB" "select token from api_tokens where name='other';")" "чужой токен цел"
+	t_eq left "$(sqlite3 "$DB" "select token from api_tokens where name='cli-fallback';")" "cli-fallback не перевыпущен"
+	t_eq "P$(sqlite3 "$DB" "select id from api_tokens where name='vpn-bot';")" "$(cat "$BOT_DIR/panel.token")" "открытый токен — от строки vpn-bot"
+}
+api_token_fns() {
+	panel_env
+	die() { echo "ОШИБКА: $*" >&2; exit 1; }
+	eval "$(sed -n '/^API_TOKEN_NAME=/p' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(api_open|api_close)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+}
+test_api_open_close_keep_bot_token() {  # одноразовый токен установщика не должен задевать токен бота и чужие
+	api_token_fns
+	sqlite3 "$DB" "insert into api_tokens (name, token) values ('cli-fallback', 'left'); insert into api_tokens (name, token) values ('vpn-bot', 'bot');"
+	api_open
+	[ -n "$API_TOKEN" ] || t_fail "токен не получен"
+	t_eq "$(sqlite3 "$DB" "select id from api_tokens where name='vpn-install';")" "$TOKEN_ID" "TOKEN_ID — строка своего токена"
+	t_eq "P$TOKEN_ID" "$API_TOKEN" "открытый токен — от своей строки"
+	api_close
+	t_eq 0 "$(sqlite3 "$DB" "select count(*) from api_tokens where name='vpn-install';")" "свой токен удалён"
+	t_eq bot "$(sqlite3 "$DB" "select token from api_tokens where name='vpn-bot';")" "токен бота цел"
+	t_eq left "$(sqlite3 "$DB" "select token from api_tokens where name='cli-fallback';")" "cli-fallback не тронут"
+	[ -z "$API_TOKEN$TOKEN_ID" ] || t_fail "переменные не очищены"
+}
+test_api_open_after_killed_run() {  # прошлый запуск убит между api_open и api_close: его токен остался в базе
+	api_token_fns
+	sqlite3 "$DB" "insert into api_tokens (name, token) values ('vpn-install', 'stale'); insert into api_tokens (name, token) values ('vpn-bot', 'bot');"
+	api_open
+	t_eq hash "$(sqlite3 "$DB" "select token from api_tokens where name='vpn-install';")" "токен выпущен заново, а не взят старый"
+	t_eq 1 "$(sqlite3 "$DB" "select count(*) from api_tokens where name='vpn-install';")" "своя строка одна"
+	api_close
+	t_eq "vpn-bot" "$(sqlite3 "$DB" "select group_concat(name) from api_tokens;")" "остался только токен бота"
+}
+test_no_xray_restart_on_client_disable() {
+	# На настоящей 3x-ui 3.11.0 проверено: с умолчанием restartXrayOnClientDisable=true выключение или удаление клиента
+	# через API (так делает бот) через ~30 с перезапускает Xray — связь рвётся у всех клиентов. С false — как в 3.3.1.
+	sed -n '/^COMMON_SETTINGS=(/,/)$/p' "$ROOT/src/install-vpn.sh.in" | grep -q '"restartXrayOnClientDisable=false"' ||
+		t_fail "в настройках панели нет restartXrayOnClientDisable=false"
+}
+# ——— запасной режим цепочки: метки правил (Xray 26.10+ не запускается при повторе ruleTag) ———
+fallback_env() {
+	base_env
+	DB=$WORK/x-ui.db
+	sqlite3 "$DB" "create table settings (id integer primary key autoincrement, key text, value text);"
+	eval "$(awk '/^(template_json|chain_activate)\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in")"
+	echo '{"tag": "warp", "protocol": "wireguard", "settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "domainStrategy": "ForceIPv4v6", "peers": [{"publicKey": "p", "endpoint": "192.0.2.1:2408"}], "noKernelTun": true}}' > "$WORK/warp.json"
+	echo '{"tag": "chain", "protocol": "vless", "settings": {"vnext": [{"address": "192.0.2.9", "port": 2087, "users": [{"id": "u", "encryption": "none", "flow": ""}]}]}}' > "$WORK/chain.json"
+	template_json chain "$WORK/warp.json" "$WORK/chain.json" > "$WORK/tpl.json"
+	sqlite3 "$DB" "insert into settings (key, value) values ('xrayTemplateConfig', readfile('$WORK/tpl.json'));"
+}
+tpl_rules() {  # правила шаблона из базы: «outboundTag ruleTag» построчно
+	sqlite3 "$DB" "select value from settings where key='xrayTemplateConfig';" |
+		python3 -I -c 'import json, sys; [print(r.get("outboundTag"), r.get("ruleTag") or "-") for r in json.load(sys.stdin)["routing"]["rules"]]'
+}
+dup_tags() { tpl_rules | awk '$2 != "-" {print $2}' | sort | uniq -d | tr '\n' ' '; }
+test_fallback_rule_tags_unique() {
+	fallback_env
+	chain_activate fallback
+	t_eq "" "$(dup_tags)" "повтор ruleTag в запасном режиме"
+	t_eq 2 "$(tpl_rules | grep -c '^warp ')" "правил «через WARP»"
+	t_eq "direct main" "$(tpl_rules | grep ' main$')" "главное правило — напрямую"
+}
+test_fallback_round_trip() {  # туда-обратно и снова туда: правила РФ не копятся, метки не повторяются
+	fallback_env
+	chain_activate fallback; chain_activate chain
+	t_eq 0 "$(tpl_rules | grep -c '^warp ')" "после возврата правил WARP нет"
+	t_eq "chain main" "$(tpl_rules | grep ' main$')" "главное правило — цепочка"
+	chain_activate fallback; chain_activate fallback
+	t_eq 2 "$(tpl_rules | grep -c '^warp ')" "правил WARP после двух переключений подряд"
+	t_eq "" "$(dup_tags)" "повтор ruleTag"
+}
+test_fallback_heals_old_template() {  # шаблон прежней версии: два правила с одной меткой — убираются, ставятся с разными
+	fallback_env
+	sqlite3 "$DB" "select value from settings where key='xrayTemplateConfig';" | python3 -I -c '
+import json, sys
+t = json.load(sys.stdin)
+r = t["routing"]["rules"]
+at = next(i for i, x in enumerate(r) if x.get("ruleTag") == "dns-out")
+r[at:at] = [{"type": "field", "ruleTag": "ru-via-warp", "outboundTag": "warp", "domain": ["geosite:category-ru"]},
+            {"type": "field", "ruleTag": "ru-via-warp", "outboundTag": "warp", "ip": ["geoip:ru"]}]
+open(sys.argv[1], "w").write(json.dumps(t))' "$WORK/old.json"
+	sqlite3 "$DB" "update settings set value=readfile('$WORK/old.json') where key='xrayTemplateConfig';"
+	chain_activate chain
+	t_eq 0 "$(tpl_rules | grep -c '^warp ')" "старые правила РФ убраны"
+	chain_activate fallback
+	t_eq "" "$(dup_tags)" "повтор ruleTag"
+}
+wd_fns() {  # state и switch из встроенного сторожа (vpn-exit-watchdog.sh)
+	fallback_env
+	systemctl() { :; }
+	sed -n "/^\tcat > \/usr\/local\/bin\/vpn-exit-watchdog.sh <<'VPN_WD'$/,/^VPN_WD$/p" "$ROOT/src/install-vpn.sh.in" | sed '1d;$d' > "$WORK/wd.sh"
+	[ -s "$WORK/wd.sh" ] || t_fail "сторож не найден в шаблоне"
+	eval "$(awk '/^(state|switch)\(\) \{/,/^}$/' "$WORK/wd.sh")"
+	CHAIN=chain
+}
+test_watchdog_fallback_rule_tags_unique() {
+	wd_fns
+	switch fallback || t_fail "switch fallback"
+	t_eq direct "$(state)" "главный выход в запасном режиме"
+	t_eq "" "$(dup_tags)" "повтор ruleTag у сторожа"
+	switch chain || t_fail "switch chain"
+	switch fallback || t_fail "switch fallback ещё раз"
+	t_eq 2 "$(tpl_rules | grep -c '^warp ')" "правил WARP у сторожа"
+	t_eq "" "$(dup_tags)" "повтор ruleTag у сторожа после круга"
+}
+test_watchdog_and_installer_switch_alike() {  # одна логика в двух местах — расходиться им нельзя
+	wd_fns
+	a=$(awk '/^chain_activate\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in" | sed -n "/^import json$/,/^db.commit()$/p" | sed 's/, timeout=30//')
+	b=$(awk '/^switch\(\) \{/,/^}$/' "$WORK/wd.sh" | sed -n "/^import json$/,/^db.commit()$/p" | sed 's/, timeout=30//')
+	[ -n "$a" ] && [ "$a" = "$b" ] || t_fail "переключение в установщике и в стороже разошлось: $(diff <(echo "$a") <(echo "$b") | head -6 | tr '\n' ' ')"
+}
+# ——— выход WARP в виде Xray 26.9.30+: settings.domainStrategy у WireGuard ядро молча игнорирует ———
+warp_shape() {  # warp_shape ШАБЛОН → «settings.domainStrategy|targetStrategy|sockopt.domainStrategy» у выхода warp
+	python3 -I -c '
+import json, sys
+w = next(o for o in json.load(open(sys.argv[1]))["outbounds"] if o["tag"] == "warp")
+print("%s|%s|%s" % (w["settings"].get("domainStrategy", "-"), w.get("targetStrategy", "-"), (w.get("streamSettings") or {}).get("sockopt", {}).get("domainStrategy", "-")))' "$1"
+}
+test_template_warp_modern_strategy() {  # сохранённая копия WARP прежней версии — в шаблон уходит уже в новом виде
+	fallback_env
+	for m in warp warp-ru; do
+		template_json "$m" "$WORK/warp.json" > "$WORK/t-$m.json"
+		t_eq "-|ForceIPv4v6|ForceIPv4v6" "$(warp_shape "$WORK/t-$m.json")" "выход warp в режиме $m"
+	done
+	t_eq "-|ForceIPv4v6|ForceIPv4v6" "$(warp_shape "$WORK/tpl.json")" "выход warp в цепочке"
+}
+test_template_warp_keeps_set_strategy() {  # уже новый вид не трогаем: своя стратегия человека остаётся
+	fallback_env
+	echo '{"tag": "warp", "protocol": "wireguard", "targetStrategy": "UseIPv4", "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4"}}, "settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "peers": [{"publicKey": "p", "endpoint": "192.0.2.1:2408"}]}}' > "$WORK/w2.json"
+	template_json warp "$WORK/w2.json" > "$WORK/t2.json"
+	t_eq "-|UseIPv4|UseIPv4" "$(warp_shape "$WORK/t2.json")" "своя стратегия"
+}
+test_warp_register_modern_shape() {  # новая регистрация WARP — сразу в новом виде
+	fallback_env
+	eval "$(awk '/^warp_register\(\) \{/,/^}$/' "$ROOT/src/install-vpn.sh.in")"
+	WARP_ENDPOINT=192.0.2.1:2408
+	save_warp() { cp "$1" "$WORK/saved.json"; }
+	api() {
+		python3 -I -c '
+import json
+cfg = {"config": {"config": {"interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700::2"}}, "client_id": "AAEC", "peers": [{"public_key": "pk"}]}}}
+print(json.dumps({"success": True, "obj": json.dumps(cfg)}))'
+	}
+	warp_register "$WORK/new.json" || t_fail "регистрация: $WARP_ERR"
+	python3 -I -c 'import json, sys; json.dump({"outbounds": [json.load(open(sys.argv[1]))]}, open(sys.argv[2], "w"))' "$WORK/new.json" "$WORK/t3.json"
+	t_eq "-|ForceIPv4v6|ForceIPv4v6" "$(warp_shape "$WORK/t3.json")" "выход warp после регистрации"
+}
+test_xui_migrate_before_first_start() {  # новая версия 3x-ui: база переносится командой, а не при первом запуске службы (как в update.sh 3x-ui)
+	tarl=$(tl '^\ttar -C /usr/local -xzf "\$TMP/x-ui.tgz"$')
+	[ -n "$tarl" ] || t_fail "не нашёл распаковку архива 3x-ui"
+	mig=$(tl '"\$XUI" migrate' "$tarl")
+	[ -n "$mig" ] || t_fail "после распаковки нет x-ui migrate"
+	first=$(tl 'systemctl (re)?start x-ui' "$tarl")
+	[ "$mig" -lt "$first" ] || t_fail "x-ui migrate (строка $mig) — после первого запуска службы (строка $first)"
+	sed -n "$((mig - 2)),$((mig + 2))p" "$ROOT/src/install-vpn.sh.in" | grep -q '\[ -s "\$DB" \]' || t_fail "migrate без проверки, что база есть (на чистом сервере её ещё нет)"
 }
 chain_env() {
 	base_env

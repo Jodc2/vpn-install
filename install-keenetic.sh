@@ -27,7 +27,7 @@ set -eu
 
 XKEEN_VER=${VPNK_XKEEN_VER:-2.1}
 XKEEN_SHA256=${VPNK_XKEEN_SHA256:-4b9350b11fab7fd3e4973db609db0fb780994f4b5ab0096f0549bc52acac8c73}
-XRAY_VER=${VPNK_XRAY_VER:-26.6.1}      # как на сервере из install-vpn.sh: клиент и сервер XHTTP — одной версии
+XRAY_VER=${VPNK_XRAY_VER:-26.10.21}    # как на сервере из install-vpn.sh: клиент и сервер XHTTP — одной версии
 P=${VPNK_PREFIX:-}                      # для проверки скрипта: корень поддельной системы
 OPT=$P/opt
 # Планировщик запускает скрипт с коротким PATH, а curl, jq и остальное лежат в Entware.
@@ -599,7 +599,7 @@ apply() {  # проверить настройки, запустить и убе
 }
 
 # Подписка 3x-ui на каждый запрос отдаёт другую ссылку: shortId — случайный из списка подключения, spiderX — случайный всегда
-# (проверено на 3x-ui 3.3.1). Сервер при этом тот же, и нынешние значения годятся: это не «подписка изменилась» — иначе
+# (проверено на 3x-ui 3.3.1; в 3.11.0 случайным остался shortId). Сервер при этом тот же, и нынешние значения годятся: это не «подписка изменилась» — иначе
 # каждая проверка перезапускала бы VPN.
 JQ_CORE='def core: del(.streamSettings.realitySettings.shortId, .streamSettings.realitySettings.spiderX);'
 link_core() { printf '%s' "$1" | jq -c "$JQ_CORE"' .outbound | core'; }   # подключение без случайных полей

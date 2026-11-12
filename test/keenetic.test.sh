@@ -321,7 +321,7 @@ EOF
 #!/bin/sh
 echo "xray $*" >> "$FAKE/calls"
 case "$*" in
-	version*) echo "Xray 26.6.1 (заглушка)" ;;
+	version*) echo "Xray 26.10.21 (заглушка)" ;;
 	*-test*)
 		[ ! -f "$FAKE/xray.test.fail" ] || { echo "Failed to start: infra/conf: bad outbound" >&2; exit 23; }
 		[ -z "${VPNK_TEST_XRAY:-}" ] || exec "$VPNK_TEST_XRAY" "$@" ;;
@@ -360,7 +360,7 @@ test_install_fresh_router() {
 	router
 	run "$SUB"
 	t_eq 0 "$RC" "установка: $OUT"
-	t_eq 1 "$(calls '^xkeen -i auto cores=xray xray=v26.6.1 geo=off geoipset=off cron=off$')" "XKeen — без вопросов, только ядро Xray нужной версии"
+	t_eq 1 "$(calls '^xkeen -i auto cores=xray xray=v26.10.21 geo=off geoipset=off cron=off$')" "XKeen — без вопросов, только ядро Xray нужной версии"
 	t_eq "vpn.example.com 2083 $U" "$(conf 04_outbounds.json '.outbounds[0].settings.vnext[0] | .address + " " + (.port | tostring) + " " + .users[0].id')" "сервер из подписки"
 	t_eq "vless-reality direct block" "$(conf 04_outbounds.json '[.outbounds[].tag] | join(" ")')" "подключения"
 	t_eq "socks 127.0.0.1" "$(conf 09_vpnk_selftest.json '.inbounds[0] | .protocol + " " + .listen')" "вход для самопроверки — только локальный"

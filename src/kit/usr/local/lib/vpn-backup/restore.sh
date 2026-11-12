@@ -80,6 +80,8 @@ release_sha() {  # release_sha ВЕРСИЯ АРХИТЕКТУРА → sha256 а
 	case $1/$2 in
 		3.3.1/amd64) echo 06adfff2b27af6d59225338a8112caca882d32d11136d962649826d42c24d12e ;;
 		3.3.1/arm64) echo 0f7907b56554eba624c51c6aed2a9ba4af1378c8134b30afa5cee622e3100209 ;;
+		3.11.0/amd64) echo 0ddfa4702f595442e2962acd81addc768fdacaa4ff2672c971a0463dae744916 ;;
+		3.11.0/arm64) echo f50b4c30fd919d018f2f4c3d8db53a4ca027503d581328727770afb116a79d90 ;;
 	esac
 }
 

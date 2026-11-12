@@ -715,10 +715,13 @@ bot_panel_token() {  # → BOT_PANEL_NEW; в api_tokens ровно одна ст
 		return 0
 	fi
 	sqlite3 "$DB" "delete from api_tokens where name='vpn-bot';" || { BOT_ERR="не записать базу 3x-ui"; return 1; }
-	out=$("$XUI" setting -getApiToken 2>&1) || true
+	# Имя — сразу при выпуске. С 3x-ui 3.7 «-getApiToken» без имени перевыпускает на месте одну и ту же строку
+	# «cli-fallback», и прежнее «переименовать последнюю строку» отдало бы боту чужой токен.
+	out=$("$XUI" setting -getApiToken -tokenName vpn-bot -tokenScope admin 2>&1) || true
 	t=$(sed -n 's/^apiToken: *//p' <<< "$out" | tail -1)
 	[ -n "$t" ] || { BOT_ERR="x-ui не выдал API-токен: $(head -c 200 <<< "$out")"; return 1; }
-	sqlite3 "$DB" "update api_tokens set name='vpn-bot' where id=(select max(id) from api_tokens);" || { BOT_ERR="не записать базу 3x-ui"; return 1; }
+	n=$(sqlite3 "$DB" "select count(*) from api_tokens where name='vpn-bot';") || { BOT_ERR="не прочитать базу 3x-ui"; return 1; }
+	[ "$n" = 1 ] || { BOT_ERR="x-ui выдал API-токен, но записи vpn-bot в его базе нет"; return 1; }
 	(umask 077 && printf '%s' "$t" > "$BOT_DIR/panel.token")
 	BOT_PANEL_NEW=1
 }

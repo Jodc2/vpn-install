@@ -8,7 +8,7 @@
 #     Нужна A-запись домена на IP сервера (в Cloudflare — серое облако, Proxy выключен).
 #   • Без домена: VLESS + XHTTP + Reality на порту 2083 под крупный чужой сайт (скрипт сам проверит
 #     и выберет подходящий). Ссылки привязаны к IP сервера, панель — https://IP:порт/секретный-путь/.
-# В обоих: 3x-ui 3.3.1 + Xray 26.6.1 (sha256 закреплены), BBR, IPv6 выключен, swap, фаервол ufw,
+# В обоих: 3x-ui 3.11.0 + Xray 26.10.21 (sha256 закреплены), BBR, IPv6 выключен, swap, фаервол ufw,
 # fail2ban против подбора пароля SSH, бэкап для переезда — вручную (vpn-backup.sh), сам не запускается.
 # До установки скрипт проверяет через check-host.net, не заблокирован ли IP сервера в России,
 # после установки — открыты ли порты VPN из России и Европы.
@@ -67,10 +67,10 @@ umask 022
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive
 unset LANGUAGE   # sudo её сохраняет, а программы на Python (ufw) переводят по ней ответы даже при LC_ALL=C
 
-XUI_VERSION=3.3.1
-XRAY_VERSION=26.6.1
-XUI_SHA256_AMD64=06adfff2b27af6d59225338a8112caca882d32d11136d962649826d42c24d12e
-XUI_SHA256_ARM64=0f7907b56554eba624c51c6aed2a9ba4af1378c8134b30afa5cee622e3100209
+XUI_VERSION=3.11.0
+XRAY_VERSION=26.10.21
+XUI_SHA256_AMD64=0ddfa4702f595442e2962acd81addc768fdacaa4ff2672c971a0463dae744916
+XUI_SHA256_ARM64=f50b4c30fd919d018f2f4c3d8db53a4ca027503d581328727770afb116a79d90
 ACME_TAG=v3.1.6
 ACME_SHA256=c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7
 SUB_PORT=2096
@@ -919,10 +919,13 @@ bot_panel_token() {  # → BOT_PANEL_NEW; в api_tokens ровно одна ст
 		return 0
 	fi
 	sqlite3 "$DB" "delete from api_tokens where name='vpn-bot';" || { BOT_ERR="не записать базу 3x-ui"; return 1; }
-	out=$("$XUI" setting -getApiToken 2>&1) || true
+	# Имя — сразу при выпуске. С 3x-ui 3.7 «-getApiToken» без имени перевыпускает на месте одну и ту же строку
+	# «cli-fallback», и прежнее «переименовать последнюю строку» отдало бы боту чужой токен.
+	out=$("$XUI" setting -getApiToken -tokenName vpn-bot -tokenScope admin 2>&1) || true
 	t=$(sed -n 's/^apiToken: *//p' <<< "$out" | tail -1)
 	[ -n "$t" ] || { BOT_ERR="x-ui не выдал API-токен: $(head -c 200 <<< "$out")"; return 1; }
-	sqlite3 "$DB" "update api_tokens set name='vpn-bot' where id=(select max(id) from api_tokens);" || { BOT_ERR="не записать базу 3x-ui"; return 1; }
+	n=$(sqlite3 "$DB" "select count(*) from api_tokens where name='vpn-bot';") || { BOT_ERR="не прочитать базу 3x-ui"; return 1; }
+	[ "$n" = 1 ] || { BOT_ERR="x-ui выдал API-токен, но записи vpn-bot в его базе нет"; return 1; }
 	(umask 077 && printf '%s' "$t" > "$BOT_DIR/panel.token")
 	BOT_PANEL_NEW=1
 }
@@ -3611,6 +3614,14 @@ import json, sys
 mode, warp_file, chain_file = sys.argv[1], sys.argv[2], sys.argv[3]
 warp = json.load(open(warp_file)) if warp_file != "-" else None
 chain = json.load(open(chain_file)) if chain_file != "-" else None
+# Xray 26.9.30+ у WireGuard settings.domainStrategy молча игнорирует: семейство адреса точки входа задаёт
+# streamSettings.sockopt.domainStrategy, разрешение имён назначения — targetStrategy. Копия WARP прежней версии
+# (и шаблон до обновления) — в старом виде; переводим так же, как миграция 3x-ui (WireguardDomainStrategyFix).
+if warp:
+    legacy = (warp.get("settings") or {}).pop("domainStrategy", None)
+    if legacy:
+        warp.setdefault("targetStrategy", legacy)
+        warp.setdefault("streamSettings", {}).setdefault("sockopt", {}).setdefault("domainStrategy", legacy)
 # Внутренние адреса (127.0.0.1, 10/8, 169.254/16, 192.168/16 …) клиентам закрыты и по имени: правило geoip:private
 # в routing ловит только IP, а «localhost» или имя, указывающее внутрь, freedom разрешает сам — без блокировки здесь
 # клиент VPN достучался бы до служб самого сервера (API Xray, метрики, панель на 127.0.0.1) и его сети.
@@ -3775,7 +3786,9 @@ import sqlite3
 import sys
 
 path, mode, chain = sys.argv[1:4]
-RU_TAG = "ru-via-warp"
+# У каждого правила своя метка: Xray 26.10+ не запускается, если у двух правил один ruleTag (прежние версии
+# проверяли повтор только при подгрузке правил через API). Метку «ru-via-warp» на двух правилах ставили версии до 3.11.
+RU_TAG, RU_TAG_IP = "ru-via-warp", "ru-via-warp-ip"
 db = sqlite3.connect(path, timeout=30)
 t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
 tags = {o.get("tag") for o in t.get("outbounds", [])}
@@ -3789,7 +3802,7 @@ tagged = any(r.get("ruleTag") in ("main", "dns-out") for r in all_rules)
 
 
 def is_ru(r):
-    return r.get("ruleTag") == RU_TAG or (r.get("outboundTag") == "warp" and (
+    return r.get("ruleTag") in (RU_TAG, RU_TAG_IP) or (r.get("outboundTag") == "warp" and (
         "geosite:category-ru" in (r.get("domain") or []) or "geoip:ru" in (r.get("ip") or [])))
 
 
@@ -3809,7 +3822,7 @@ if mode == "fallback" and "warp" in tags:
     rules[at:at] = [
         {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp",
          "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
-        {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp", "ip": ["geoip:ru"]},
+        {"type": "field", "ruleTag": RU_TAG_IP, "outboundTag": "warp", "ip": ["geoip:ru"]},
     ]
 t["routing"]["rules"] = rules
 # Основной выход первым, остальные в постоянном порядке — переключение туда-обратно даёт тот же шаблон.
@@ -4146,7 +4159,9 @@ import sqlite3
 import sys
 
 path, mode, chain = sys.argv[1:4]
-RU_TAG = "ru-via-warp"
+# У каждого правила своя метка: Xray 26.10+ не запускается, если у двух правил один ruleTag (прежние версии
+# проверяли повтор только при подгрузке правил через API). Метку «ru-via-warp» на двух правилах ставили версии до 3.11.
+RU_TAG, RU_TAG_IP = "ru-via-warp", "ru-via-warp-ip"
 db = sqlite3.connect(path, timeout=30)
 t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
 tags = {o.get("tag") for o in t.get("outbounds", [])}
@@ -4160,7 +4175,7 @@ tagged = any(r.get("ruleTag") in ("main", "dns-out") for r in all_rules)
 
 
 def is_ru(r):
-    return r.get("ruleTag") == RU_TAG or (r.get("outboundTag") == "warp" and (
+    return r.get("ruleTag") in (RU_TAG, RU_TAG_IP) or (r.get("outboundTag") == "warp" and (
         "geosite:category-ru" in (r.get("domain") or []) or "geoip:ru" in (r.get("ip") or [])))
 
 
@@ -4180,7 +4195,7 @@ if mode == "fallback" and "warp" in tags:
     rules[at:at] = [
         {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp",
          "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"]},
-        {"type": "field", "ruleTag": RU_TAG, "outboundTag": "warp", "ip": ["geoip:ru"]},
+        {"type": "field", "ruleTag": RU_TAG_IP, "outboundTag": "warp", "ip": ["geoip:ru"]},
     ]
 t["routing"]["rules"] = rules
 # Основной выход первым, остальные в постоянном порядке — переключение туда-обратно даёт тот же шаблон.
@@ -4419,14 +4434,23 @@ setup_chain_exit_try() {
 	return 0
 }
 
+# Свой токен — по имени. С 3x-ui 3.7 «-getApiToken» без имени не заводит новую строку, а перевыпускает на месте одну и
+# ту же, «cli-fallback»: «последняя строка таблицы» тогда чужая (токен бота), и api_close удалил бы её.
+API_TOKEN_NAME=vpn-install
 api_open() {  # одноразовый API-токен панели (x-ui должен работать); api_close его удаляет
 	local out
-	out=$("$XUI" setting -getApiToken 2>&1 || true)
+	sqlite3 "$DB" "delete from api_tokens where name='$API_TOKEN_NAME';" 2>/dev/null || true   # остаток оборванного запуска
+	out=$("$XUI" setting -getApiToken -tokenName "$API_TOKEN_NAME" -tokenScope admin 2>&1 || true)
 	API_TOKEN=$(sed -n 's/^apiToken: *//p' <<<"$out" | tail -1)
 	[ -n "$API_TOKEN" ] || die "x-ui не выдал API-токен: $out"
-	TOKEN_ID=$(sqlite3 "$DB" 'select max(id) from api_tokens;')
+	TOKEN_ID=$(sqlite3 "$DB" "select id from api_tokens where name='$API_TOKEN_NAME';")
+	[ -n "$TOKEN_ID" ] || die "x-ui выдал API-токен, но записи «$API_TOKEN_NAME» в его базе нет"
 }
-api_close() { sqlite3 "$DB" "delete from api_tokens where id=${TOKEN_ID:-0};" 2>/dev/null || true; API_TOKEN=; TOKEN_ID=; }
+api_close() {
+	sqlite3 "$DB" "delete from api_tokens where name='$API_TOKEN_NAME';" 2>/dev/null || true
+	API_TOKEN=
+	TOKEN_ID=
+}
 api() {  # api POST|GET ПУТЬ [аргументы curl] → тело ответа
 	local m=$1 p=$2
 	shift 2
@@ -4451,10 +4475,11 @@ if not d.get("success"):
 cfg = json.loads(d["obj"])["config"]["config"]
 addr = cfg["interface"]["addresses"]
 reserved = list(base64.b64decode(cfg["client_id"]))
-json.dump({"tag": "warp", "protocol": "wireguard", "settings": {
+json.dump({"tag": "warp", "protocol": "wireguard", "targetStrategy": "ForceIPv4v6",
+    "streamSettings": {"sockopt": {"domainStrategy": "ForceIPv4v6"}}, "settings": {
     "mtu": 1420, "secretKey": priv,
     "address": [a for a in (addr.get("v4") and addr["v4"] + "/32", addr.get("v6") and addr["v6"] + "/128") if a],
-    "reserved": reserved, "domainStrategy": "ForceIPv4v6",
+    "reserved": reserved,
     "peers": [{"publicKey": cfg["peers"][0]["public_key"], "endpoint": endpoint, "keepAlive": 10}],
     "noKernelTun": True}}, open(out, "w"))
 PY
@@ -4886,6 +4911,12 @@ else
 	chmod +x /usr/local/x-ui/x-ui /usr/local/x-ui/x-ui.sh /usr/local/x-ui/bin/xray-linux-*
 	chmod +x /usr/local/x-ui/bin/mtg-linux-* 2>/dev/null || true
 	ok "3x-ui $XUI_VERSION установлен из релиза GitHub (sha256 сошлась)"
+	# Прежняя версия: базу переносит команда, до первого запуска службы (так делает и update.sh 3x-ui) — а не панель
+	# при старте, где её может оборвать systemd. На чистом сервере базы ещё нет: её создаст «x-ui setting» ниже.
+	if [ -s "$DB" ]; then
+		"$XUI" migrate > "$WORK/xui-migrate.log" 2>&1 || die "x-ui migrate не прошёл: $(tail -3 "$WORK/xui-migrate.log" | tr '\n' ' ')"
+		ok "база 3x-ui перенесена на $XUI_VERSION"
+	fi
 fi
 install -m 755 /usr/local/x-ui/x-ui.sh /usr/bin/x-ui
 install -m 644 /usr/local/x-ui/x-ui.service.debian /etc/systemd/system/x-ui.service
@@ -5242,7 +5273,10 @@ fi
 COMMON_SETTINGS=("subEnable=true" "subListen=127.0.0.1" "subPort=$SUB_PORT" "subPath=$SUB_PATH" "subDomain="
 	"subUpdates=1" "subEncrypt=true" "subShowInfo=true" "subEmailInRemark=true" "subEnableRouting=true"
 	"subJsonEnable=false" "subJsonPath=$JSON_PATH" "subClashPath=$CLASH_PATH"
-	"remarkModel=-ieo" "timeLocation=Local" "trustedProxyCIDRs=127.0.0.1/32,::1/128" "webDomain=")
+	"remarkModel=-ieo" "timeLocation=Local" "trustedProxyCIDRs=127.0.0.1/32,::1/128" "webDomain="
+	# 3x-ui 3.8.5+: при «true» (умолчание) выключение или удаление клиента руками — а так делает бот — через полминуты
+	# перезапускает Xray, и связь рвётся у ВСЕХ. Оставляем как было в 3.3.1: клиента убирают на ходу.
+	"restartXrayOnClientDisable=false")
 if [ "$MODE" = domain ]; then
 	xui_set "${COMMON_SETTINGS[@]}" "webListen=127.0.0.1" "webCertFile=$CERT_DIR/fullchain.pem" "webKeyFile=$CERT_DIR/privkey.pem" \
 		"subCertFile=$CERT_DIR/fullchain.pem" "subKeyFile=$CERT_DIR/privkey.pem" "subURI=https://$DOMAIN$SUB_PATH" \
@@ -5955,6 +5989,8 @@ release_sha() {  # release_sha ВЕРСИЯ АРХИТЕКТУРА → sha256 а
 	case $1/$2 in
 		3.3.1/amd64) echo 06adfff2b27af6d59225338a8112caca882d32d11136d962649826d42c24d12e ;;
 		3.3.1/arm64) echo 0f7907b56554eba624c51c6aed2a9ba4af1378c8134b30afa5cee622e3100209 ;;
+		3.11.0/amd64) echo 0ddfa4702f595442e2962acd81addc768fdacaa4ff2672c971a0463dae744916 ;;
+		3.11.0/arm64) echo f50b4c30fd919d018f2f4c3d8db53a4ca027503d581328727770afb116a79d90 ;;
 	esac
 }
 
