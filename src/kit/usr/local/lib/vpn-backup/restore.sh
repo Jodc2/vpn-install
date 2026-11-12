@@ -676,7 +676,13 @@ else
 	warn "часовой пояс $TIMEZONE не выставлен"
 fi
 
-say "SSH"
+# Раздел «SSH»: заголовок печатается вместе с первым сообщением раздела. Нет в бэкапе ни ключей, ни настроек SSH,
+# ни fail2ban — сказать нечего, и пустой заголовок не нужен.
+SSH_SAID=0
+ssh_say() {
+	[ "$SSH_SAID" = 1 ] || say "SSH"
+	SSH_SAID=1
+}
 if [ -f "$F/root/.ssh/authorized_keys" ]; then
 	install -d -m 700 /root/.ssh
 	touch /root/.ssh/authorized_keys
@@ -688,11 +694,14 @@ if [ -f "$F/root/.ssh/authorized_keys" ]; then
 		[ -n "$k" ] || continue
 		grep -qxF -- "$k" /root/.ssh/authorized_keys || printf '%s\n' "$k" >> /root/.ssh/authorized_keys
 	done < "$F/root/.ssh/authorized_keys"
+	ssh_say
 	ok "ключи root из бэкапа добавлены ($(grep -c . /root/.ssh/authorized_keys) шт.)"
 fi
 if ! command -v sshd >/dev/null; then
+	ssh_say
 	warn "sshd не установлен — настройки SSH пропущены"
 elif [ "$HARDEN_SSH" = 1 ] && [ -s /root/.ssh/authorized_keys ] && [ -f "$F/etc/ssh/sshd_config.d/00-disable-password.conf" ]; then
+	ssh_say
 	install -m 644 "$F/etc/ssh/sshd_config.d/00-disable-password.conf" /etc/ssh/sshd_config.d/00-disable-password.conf
 	if sshd -t; then
 		systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
@@ -704,6 +713,7 @@ elif [ "$HARDEN_SSH" = 1 ] && [ -s /root/.ssh/authorized_keys ] && [ -f "$F/etc/
 fi
 # fail2ban (ставит install-vpn.sh) — если был на старом сервере.
 if [ -f "$F/etc/fail2ban/jail.d/vpn-sshd.local" ] && command -v sshd >/dev/null; then
+	ssh_say
 	if "${APT[@]}" install fail2ban python3-systemd >/dev/null; then
 		install -d -m 755 /etc/fail2ban/jail.d
 		install -m 644 "$F/etc/fail2ban/jail.d/vpn-sshd.local" /etc/fail2ban/jail.d/vpn-sshd.local

@@ -2020,6 +2020,28 @@ EOF
 	t_eq 1 "$(grep -c 'подключения и клиенты останутся' "$WORK/log.txt")" "и в файле (журнале) — тоже, один раз"
 }
 
+# restore.sh, раздел «SSH» (пункт 11). Раздел исполняется как есть, но с пустым каталогом бэкапа и без выключения входа
+# по паролю: ни ключей, ни настроек sshd, ни fail2ban он при этом не трогает. restore_ssh есть|нет — есть ли в системе sshd.
+restore_ssh() {
+	local code
+	code=$(awk '/^(# Раздел «SSH»|say "SSH"$)/,/^say "Фаервол ufw"$/' "$ROOT/src/kit/usr/local/lib/vpn-backup/restore.sh" | sed '$d')
+	[ -n "$code" ] || t_fail "раздел «SSH» в restore.sh не найден"
+	(
+		say() { echo "== $*"; }
+		ok() { echo "OK $*"; }
+		warn() { echo "WARN $*"; }
+		bad() { echo "BAD $*"; }
+		command() { if [ "$1" = -v ] && [ "$2" = sshd ]; then [ "$HAVE_SSHD" = есть ]; else builtin command "$@"; fi; }
+		F=$WORK/empty-backup HARDEN_SSH=0 HAVE_SSHD=$1 APT=(false)
+		mkdir -p "$F"
+		eval "$code"
+	)
+}
+test_restore_ssh_header_only_with_content() {  # заголовок «SSH» без единой строки под ним — когда в бэкапе нет ни ключей, ни настроек SSH
+	t_eq "" "$(restore_ssh есть)" "печатать нечего — нет и заголовка"
+	t_eq $'== SSH\nWARN sshd не установлен — настройки SSH пропущены' "$(restore_ssh нет)" "есть что сказать — заголовок один раз, перед сообщением"
+}
+
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
 # («КОД|СТРОКА_STDERR|STDOUT»), каждый вызов дописывает в $WORK/ssh.calls имя и то, что пришло на stdin.
