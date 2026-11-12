@@ -438,6 +438,13 @@ test_xui_migrate_before_first_start() {  # новая версия 3x-ui: баз
 	[ "$mig" -lt "$first" ] || t_fail "x-ui migrate (строка $mig) — после первого запуска службы (строка $first)"
 	sed -n "$((mig - 2)),$((mig + 2))p" "$ROOT/src/install-vpn.sh.in" | grep -q '\[ -s "\$DB" \]' || t_fail "migrate без проверки, что база есть (на чистом сервере её ещё нет)"
 }
+test_fingerprints_pass_new_reality() {
+	# Reality в Xray 26.9.9+ отклоняет приветствие без ключа X25519MLKEM768 перед X25519 (xtls/reality: «reject outdated/strange
+	# Client Hello»). Проверено на 26.10.21: chrome, firefox, safari проходят; ios, edge, qq, randomized — никогда, random — через раз.
+	bad=$(grep -noE '"fingerprint": *"[a-zA-Z0-9_]*"' "$ROOT/src/install-vpn.sh.in" | grep -vE '"(chrome|firefox|safari)"$' || true)
+	[ -z "$bad" ] || t_fail "отпечаток, который новый Reality не пропустит: $bad"
+	[ "$(grep -cE '"fingerprint": *"chrome"' "$ROOT/src/install-vpn.sh.in")" -ge 2 ] || t_fail "не нашёл отпечатки ссылки клиента и цепочки"
+}
 chain_env() {
 	base_env
 	EXIT_MODE=chain CHAIN_IP=5.6.7.8 CHAIN_PORT=2087 CHAIN_SSH_USER=ubuntu CHAIN_SSH_PORT=22 CHAIN_FW=iptables
