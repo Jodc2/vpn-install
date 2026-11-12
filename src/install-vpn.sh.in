@@ -1404,7 +1404,7 @@ foreign_db_copy() {  # копия базы чужого 3x-ui рядом с не
 	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
 }
 xui_stop() {  # остановить x-ui на время правки базы; вотчдог цепочки — тоже, чтобы не перезапустил x-ui посреди правки
-	local first=0
+	local first=0 snap=$WORK/db.before
 	[ "$XUI_TOUCHED" != 0 ] || first=1
 	# Отметка «x-ui трогали» — раньше самой остановки: сигнал (Ctrl-C, обрыв SSH), пришедший во время остановки, bash
 	# обрабатывает сразу после неё, и on_exit уже должен знать, что x-ui надо запустить снова.
@@ -1413,8 +1413,14 @@ xui_stop() {  # остановить x-ui на время правки базы;
 	systemctl stop x-ui 2>/dev/null || true
 	# Первая остановка работавшего VPN — снимок базы: оборвётся установка — база вернётся как была до запуска.
 	# (Пока снимка нет, база ещё не менялась: возвращать нечего, on_exit только запустит x-ui.)
+	# Своё имя снимок получает, только когда записан целиком: обрыв SSH убивает и sqlite3 (сигнал получает вся группа
+	# процессов), и on_exit вернул бы в базу панели обрывок снимка — а она к этому моменту ещё не менялась.
 	if [ "$first" = 1 ] && [ "$XUI_WAS_ACTIVE" = 1 ] && [ -f "$DB" ]; then
-		sqlite3 "$DB" ".backup '$WORK/db.before'" 2>/dev/null || cp -a "$DB" "$WORK/db.before" 2>/dev/null || true
+		rm -f "$snap.part"
+		if { sqlite3 "$DB" ".backup '$snap.part'" 2>/dev/null && [ -s "$snap.part" ]; } ||
+			{ cp -a "$DB" "$snap.part" 2>/dev/null && [ -s "$snap.part" ]; }; then
+			mv -f "$snap.part" "$snap" 2>/dev/null || true
+		fi
 	fi
 }
 xui_set() {  # xui_set КЛЮЧ=ЗНАЧЕНИЕ… — строки таблицы settings (x-ui должен быть остановлен)

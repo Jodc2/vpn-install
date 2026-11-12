@@ -3155,7 +3155,7 @@ systemctl() {
 	# «stop x-ui» отработал — и тут же срабатывает ловушка сигнала, пришедшего во время остановки: exit 130
 	if [ "$*" = "stop x-ui" ] && [ ! -e "$T/fired" ]; then : > "$T/fired"; exit 130; fi
 }
-sqlite3() { cp "$1" "$WORK/db.before"; }
+sqlite3() { local d=${2#*\'}; cp "$1" "${d%\'*}"; }   # «.backup 'ПУТЬ'»
 EOF
 		awk '/^(on_exit|xui_stop)\(\) \{/,/^}/' "$f"
 		echo 'trap on_exit EXIT'
@@ -3172,6 +3172,62 @@ EOF
 	set +e; bash "$WORK/stop.sh" > "$WORK/stop.out" 2>&1; set -e
 	t_eq "база" "$(cat "$WORK/snapshot")" "снимок — база до первых изменений"
 	t_eq "база" "$(cat "$WORK/x-ui.db")" "при ошибке после изменений база возвращена из снимка"
+}
+snap_script() {  # snap_script 'заглушка sqlite3' → $WORK/snap.sh: настоящие xui_stop, on_exit и ловушки сигналов; первая остановка x-ui
+	local f=$ROOT/src/install-vpn.sh.in
+	{
+		echo 'set -euo pipefail'
+		echo "T='$WORK'"
+		cat <<'EOF'
+WORK=$T/w CHK_OUT=$T/chk DB=$T/x-ui.db LOG=$T/install.log STATE=$T/vpn-install.env
+mkdir -p "$WORK"; : > "$CHK_OUT"; echo "целая база" > "$DB"
+XUI_TOUCHED=0 XUI_WAS_ACTIVE=1 WD_WAS_ACTIVE=0 TOKEN_ID='' BOT_DIR=''
+systemctl() { echo "systemctl $*" >> "$T/calls"; }
+snap_dst() { local d=${1#*\'}; echo "${d%\'*}"; }   # «.backup 'ПУТЬ'» → ПУТЬ
+EOF
+		echo "$1"
+		awk '/^(on_exit|xui_stop)\(\) \{/,/^}/' "$f"
+		grep -E "^trap (on_exit EXIT|'[^']*' (INT|HUP|TERM|PIPE))( |\$)" "$f"
+		cat <<'EOF'
+xui_stop
+echo "после снимка" >> "$T/calls"
+echo "изменено установкой" > "$DB"
+exit 1
+EOF
+	} > "$WORK/snap.sh"
+	grep -q "exit 129' HUP" "$WORK/snap.sh" || t_fail "в шаблоне не нашлась ловушка HUP"
+}
+test_exit_signal_during_snapshot_keeps_db() {  # обрыв SSH пришёлся на снимок базы: sqlite3 убит на середине записи (сигнал получает вся
+	# группа процессов). Недописанный снимок не должен вернуться в базу панели — она ещё не менялась, возвращать нечего
+	snap_script 'sqlite3() { printf "полбазы" > "$(snap_dst "$2")"; kill -HUP $$; return 129; }'
+	set +e; bash "$WORK/snap.sh" > "$WORK/snap.out" 2>&1; local rc=$?; set -e
+	t_eq 129 "$rc" "код возврата — обрыв терминала"
+	t_eq "целая база" "$(cat "$WORK/x-ui.db")" "база панели цела: обрывок снимка в неё не попал"
+	t_eq "systemctl stop vpn-exit-watchdog;systemctl stop x-ui;systemctl stop x-ui;systemctl start x-ui;" "$(tr '\n' ';' < "$WORK/calls")" \
+		"x-ui запущен снова, до изменений дело не дошло"
+	# То же, когда оборвана запасная копия (sqlite3 не сработал, cp убит на середине).
+	rm -rf "$WORK/calls" "$WORK/w"
+	snap_script 'sqlite3() { return 1; }
+cp() { if [ "$1" = -a ]; then printf "полбазы" > "$3"; kill -HUP $$; return 129; fi; command cp "$@"; }'
+	set +e; bash "$WORK/snap.sh" > "$WORK/snap.out" 2>&1; rc=$?; set -e
+	t_eq 129 "$rc" "запасная копия: код возврата — обрыв терминала"
+	t_eq "целая база" "$(cat "$WORK/x-ui.db")" "запасная копия: база панели цела"
+}
+test_exit_snapshot_restores_db_after_failure() {  # без обрыва снимок работает, как раньше: и через sqlite3, и запасной копией
+	snap_script 'sqlite3() { command cp "$1" "$(snap_dst "$2")"; }'
+	set +e; bash "$WORK/snap.sh" > "$WORK/snap.out" 2>&1; local rc=$?; set -e
+	t_eq 1 "$rc" "код возврата — от ошибки установки"
+	t_eq "целая база" "$(cat "$WORK/x-ui.db")" "sqlite3: после ошибки база возвращена из снимка"
+	grep -qx 'после снимка' "$WORK/calls" || t_fail "sqlite3: установка не пошла дальше снимка"
+	rm -rf "$WORK/calls" "$WORK/w"
+	snap_script 'sqlite3() { return 1; }'
+	set +e; bash "$WORK/snap.sh" > "$WORK/snap.out" 2>&1; rc=$?; set -e
+	t_eq "целая база" "$(cat "$WORK/x-ui.db")" "sqlite3 не сработал: снимок сделан копированием, база возвращена"
+	# sqlite3 «отработал», но снимка не оставил (пустой файл) — в дело идёт копирование, а не пустышка.
+	rm -rf "$WORK/calls" "$WORK/w"
+	snap_script 'sqlite3() { : > "$(snap_dst "$2")"; }'
+	set +e; bash "$WORK/snap.sh" > "$WORK/snap.out" 2>&1; rc=$?; set -e
+	t_eq "целая база" "$(cat "$WORK/x-ui.db")" "пустой снимок sqlite3: база возвращена из копии"
 }
 test_exit_tee_gone_rolls_back() {  # tee, через который идёт весь вывод, убит: следующая же строка вывода убивала скрипт (SIGPIPE) — с кодом 0
 	# в on_exit и без отката. Теперь это такой же обрыв, как остальные

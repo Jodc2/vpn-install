@@ -65,6 +65,7 @@
 set -euo pipefail
 umask 022
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive
+unset LANGUAGE   # sudo её сохраняет, а программы на Python (ufw) переводят по ней ответы даже при LC_ALL=C
 
 XUI_VERSION=3.3.1
 XRAY_VERSION=26.6.1
@@ -79,6 +80,7 @@ LOG=/root/vpn-install.log
 DB=/etc/x-ui/x-ui.db
 XUI=/usr/local/x-ui/x-ui
 F2B_JAIL=/etc/fail2ban/jail.d/vpn-sshd.local
+UFW_RULES="/etc/ufw/user.rules /etc/ufw/user6.rules"   # правила ufw, как он сам их хранит (IPv4 и IPv6)
 WARP_ENDPOINT=162.159.192.8:2408   # engage.cloudflareclient.com по IP: имя через DNS дало бы петлю
 # Без домена Reality маскируется под один из этих сайтов: берётся самый быстрый с этого сервера из тех,
 # что держат TLS 1.3 + X25519 + HTTP/2 с верным сертификатом и не стоят за Cloudflare.
@@ -689,11 +691,13 @@ bot_pair() {  # bot_pair [СЕКУНД=300] → BOT_ADMIN_ID BOT_ADMIN_NAME: к�
 			sleep "${BOT_TG_PAUSE:-3}"
 			continue
 		fi
-		while IFS=$'\t' read -r uid fid fname uname ctype; do
+		# Поля — через символ-разделитель 0x1f, а не табуляцию: пустое поле между табуляциями read выбрасывает,
+		# и у человека без @имени тип чата оказывался на месте имени — привязка его не узнавала вовсе.
+		while IFS=$'\x1f' read -r uid fid fname uname ctype; do
 			offset=$((uid + 1))
 			[ "$ctype" = private ] || continue
 			# Ответ отдаёт полное управление VPN — только явное «да» (Enter — «нет»).
-			bot_ask "Это ты: $fname${uname:+ (@$uname)}, id $fid? [y/N]: " || continue
+			bot_ask "Это ты: ${fname:+$fname}${uname:+ (@$uname)}, id $fid? [y/N]: " || continue
 			case $BOT_ANSWER in y | Y | yes | Yes | д | Д | да | Да | ДА) ;; *) continue ;; esac
 			BOT_ADMIN_ID=$fid
 			BOT_ADMIN_NAME=$fname
@@ -704,10 +708,11 @@ bot_pair() {  # bot_pair [СЕКУНД=300] → BOT_ADMIN_ID BOT_ADMIN_NAME: к�
 for u in json.load(sys.stdin).get("result") or []:
     m = u.get("message") or {}
     f = m.get("from") or {}
-    clean = lambda v: str(v or "").replace("\t", " ").replace("\n", " ")
-    print("\t".join([str(u.get("update_id", 0)), str(f.get("id", "")), clean(f.get("first_name")), clean(f.get("username")), clean((m.get("chat") or {}).get("type"))]))' <<< "$body" 2> /dev/null)
+    # имя приходит из Телеграма и печатается на терминал: управляющие символы — в пробел
+    clean = lambda v: "".join(c if c.isprintable() else " " for c in str(v or "")).strip()
+    print("\x1f".join([str(u.get("update_id", 0)), str(f.get("id", "")), clean(f.get("first_name")), clean(f.get("username")), clean((m.get("chat") or {}).get("type"))]))' <<< "$body" 2> /dev/null)
 	done
-	BOT_ERR="не дождался сообщения боту @$BOT_USERNAME"
+	BOT_ERR="не дождался сообщения боту @$BOT_USERNAME (писать нужно ему в личный чат). Можно и без переписки: VPN_BOT_ADMIN_ID=<ваш числовой id в Телеграме> bash $0 --bot — id подскажет @userinfobot"
 	return 1
 }
 
@@ -733,7 +738,11 @@ bot_other_server() {  # наш воркер управляет VPN другог�
 bot_other_server_ok() {  # имя воркера задано явно, а он управляет VPN другого сервера — забрать только с «да»
 	bot_other_server || return 0
 	bot_consent "Воркер $BOT_WORKER в этом аккаунте Cloudflare управляет VPN на $BOT_OTHER_DN${BOT_OTHER_IP:+ ($BOT_OTHER_IP)} — перенастроить его на этот сервер? Тот VPN останется без бота, а его бэкап в Cloudflare заменится бэкапом этого" && return 0
-	BOT_ERR="воркер $BOT_WORKER уже управляет VPN на $BOT_OTHER_DN — не трогаю. Для этого сервера запустите без VPN_BOT_WORKER: скрипт заведёт отдельный воркер"
+	if [ -n "${VPN_BOT_WORKER:-}" ]; then
+		BOT_ERR="воркер $BOT_WORKER уже управляет VPN на $BOT_OTHER_DN — не трогаю. Для этого сервера запустите без VPN_BOT_WORKER: скрипт заведёт отдельный воркер"
+	else   # имя запомнено прошлой установкой: без переменной оно останется тем же
+		BOT_ERR="воркер $BOT_WORKER уже управляет VPN на $BOT_OTHER_DN — не трогаю. Для этого сервера задайте другое имя воркера: VPN_BOT_WORKER=$(bot_worker_name 1) bash $0 --bot"
+	fi
 	return 1
 }
 bot_worker_name() {  # bot_worker_name N → имя отдельного воркера для этого домена: vpn-bot-<домен>[-N], до 63 символов
@@ -744,6 +753,9 @@ bot_worker_name() {  # bot_worker_name N → имя отдельного вор�
 	printf '%s' "$w"
 }
 
+bot_id_ok() {  # id в Телеграме, как его понимает бот: обычное положительное целое (до 2^53 − 1), без ведущих нулей
+	[[ $1 =~ ^[1-9][0-9]{0,15}$ ]] && [ "$1" -le 9007199254740991 ]
+}
 bot_kv_admin() {  # админ из KV нашего воркера: первый из списка admins (его ведёт бот) или admin:id (бот, поставленный руками) → id или пусто
 	local v
 	[ "${BOT_EXISTING:-}" = ours ] && [ -n "${BOT_KV_ID:-}" ] || return 0
@@ -758,7 +770,7 @@ except Exception:
 	v=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admin%3Aid" 2> /dev/null) || return 0
 	if [[ $v =~ ^[0-9]+$ ]]; then printf '%s' "$v"; fi
 }
-bot_kv_grant() {  # VPN_BOT_ADMIN_ID у бота, где админ уже есть, — заявкой admins:grant: бот вольёт её в список сам, не заменяя прежних
+bot_kv_grant() {  # админ заявкой admins:grant (BOT_GRANT_ID, имя — BOT_GRANT_NAME): бот вольёт её в свой список сам, не заменяя прежних
 	local body
 	[ -n "${BOT_GRANT_ID:-}" ] && [ -n "${BOT_KV_ID:-}" ] || return 0
 	body=$(cf_api GET "/accounts/$BOT_ACC/storage/kv/namespaces/$BOT_KV_ID/values/admins%3Agrant" 2> /dev/null) || body=
@@ -777,8 +789,8 @@ if isinstance(v, dict):
 if not isinstance(v, list):
     sys.exit(2)
 if not any(isinstance(x, dict) and x.get("id") == uid for x in v):
-    v.append({"id": uid, "name": ""})
-print(json.dumps(v))' "$body" "$BOT_GRANT_ID" > "$BOT_DIR/grant.json"; then
+    v.append({"id": uid, "name": sys.argv[3][:80]})
+print(json.dumps(v, ensure_ascii=False))' "$body" "$BOT_GRANT_ID" "${BOT_GRANT_NAME:-}" > "$BOT_DIR/grant.json"; then
 		BOT_REPORT+="⚠ админа $BOT_GRANT_ID не добавил: Cloudflare не отдал заявки бота (повторить: VPN_BOT_ADMIN_ID=$BOT_GRANT_ID bash $0 --bot)"$'\n'
 		return 0
 	fi
@@ -792,7 +804,17 @@ print(json.dumps(v))' "$body" "$BOT_GRANT_ID" > "$BOT_DIR/grant.json"; then
 bot_validate() {  # всё, что проверяется до установки: токены, чужой воркер и вебхук, бот другого сервера, владелец
 	local had=''
 	local n=0 was why
-	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ADMIN_ID='' BOT_ADMIN_NAME='' BOT_GRANT_ID=''
+	BOT_USERNAME='' BOT_HOOK_URL='' BOT_ADMIN_ID='' BOT_ADMIN_NAME='' BOT_GRANT_ID='' BOT_GRANT_NAME='' BOT_ERR=''
+	# То, что проверяется без сети, — сразу: негодное имя воркера Cloudflare отверг бы только при загрузке, после
+	# всей установки (а с пробелом в имени запрос не уходит вовсе — и это выглядело как «Cloudflare не отвечает»).
+	if ! [[ $BOT_WORKER =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+		BOT_ERR="VPN_BOT_WORKER: имя воркера — строчные латинские буквы, цифры и дефис (не с краю), до 63 знаков; сейчас «$BOT_WORKER»"
+		return 1
+	fi
+	if [ -n "${VPN_BOT_ADMIN_ID:-}" ] && ! bot_id_ok "$VPN_BOT_ADMIN_ID"; then
+		BOT_ERR="VPN_BOT_ADMIN_ID — числовой id в Телеграме (вида 123456789, без нулей в начале), а не @имя; сейчас «$VPN_BOT_ADMIN_ID»"
+		return 1
+	fi
 	bot_cf_check || return 1
 	# Имя не задано явно, а воркер с ним — чужой или управляет VPN другого сервера: этому серверу — свой воркер.
 	while [ "${BOT_WORKER_AUTO:-0}" = 1 ]; do
@@ -818,7 +840,7 @@ bot_validate() {  # всё, что проверяется до установк�
 	if [ -s "$BOT_DIR/tg.token" ]; then
 		bot_tg_check || return 1
 		# Чужой вебхук (вставили токен рабочего бота) — только с явного «да», будет привязка или нет.
-		if ! bot_hook_is_ours && ! bot_consent "Бот @$BOT_USERNAME сейчас подключён к $(bot_hook_host) — перенастроить его на этот сервер?"; then
+		if ! bot_hook_is_ours && ! bot_consent "Бот @$BOT_USERNAME сейчас подключён к $(bot_hook_host) — похоже, он управляет другим VPN. Перенастроить его на этот сервер? Тот VPN останется без бота: команды и кнопки пойдут сюда, а его уведомления, пока жив его воркер, будут приходить с кнопками, которые уже не про него. Для второго сервера заводят второго бота: @BotFather → /newbot"; then
 			BOT_ERR="бот @$BOT_USERNAME подключён к другому адресу ($(bot_hook_host)) — его не трогаю; для этого VPN нужен отдельный бот: @BotFather → /newbot"
 			return 1
 		fi
@@ -827,10 +849,6 @@ bot_validate() {  # всё, что проверяется до установк�
 		return 1
 	fi
 	if [ -n "${VPN_BOT_ADMIN_ID:-}" ]; then
-		if ! [[ $VPN_BOT_ADMIN_ID =~ ^[0-9]+$ ]]; then
-			BOT_ERR="VPN_BOT_ADMIN_ID — числовой id в Телеграме (вида 123456789), а не @имя"
-			return 1
-		fi
 		had=$(bot_kv_admin)
 		if bot_has_binding ADMIN_ID || [ -n "$had" ]; then
 			# У бота уже есть админ: этот добавится к нему (заявкой admins:grant, bot_kv_grant), а не заменит его.
@@ -838,6 +856,7 @@ bot_validate() {  # всё, что проверяется до установк�
 			bot_has_binding ADMIN_ID || BOT_ADMIN_ID=$had   # бот, поставленный руками: прежний админ — в ADMIN_ID
 		else
 			BOT_ADMIN_ID=$VPN_BOT_ADMIN_ID
+			bot_grant_if_storage_kept "$VPN_BOT_ADMIN_ID" ''
 		fi
 	elif bot_has_binding ADMIN_ID; then
 		:   # админ прежний
@@ -848,7 +867,12 @@ bot_validate() {  # всё, что проверяется до установк�
 		return 1
 	else
 		bot_pair || return 1
+		bot_grant_if_storage_kept "$BOT_ADMIN_ID" "$BOT_ADMIN_NAME"
 	fi
+}
+bot_grant_if_storage_kept() {  # ID ИМЯ — хранилище бота уже было (воркер удаляли, список админов остался или не прочитался):
+	# бот слушает свой список, а не ADMIN_ID, пока список не пуст, — назначенного админа туда впишет заявка
+	[ -z "${BOT_KV_ID:-}" ] || { BOT_GRANT_ID=$1; BOT_GRANT_NAME=$2; }
 }
 
 bot_plain() {  # bot_plain ИМЯ → значение plain_text прежней версии нашего воркера (нет — пусто)
@@ -937,7 +961,7 @@ bot_alive() { [ "$(curl -sS --max-time 15 "$1/healthz" 2> /dev/null)" = ok ]; } 
 bot_wipe() {  # стереть секреты из $BOT_DIR (они уже в воркере или больше не нужны)
 	local f
 	for f in id id.pub panel.token tg.token cf.token cf.hdr metadata.json webhook.secret selftest.secret selftest.hdr \
-		admin.id hook.json req.json exit.fpr fpr.json backup.meta bindings.list settings.json; do
+		admin.id req.json exit.fpr fpr.json backup.meta bindings.list settings.json grant.json; do
 		rm -f "${BOT_DIR:?}/$f"
 	done
 }
@@ -960,8 +984,26 @@ bot_deploy() {  # → BOT_ORIGIN BOT_REPORT; 1 и BOT_ERR. Секреты из $
 	return "$rc"
 }
 
+bot_bindings_list() {  # строки привязок воркера → stdout; 1 и BOT_ERR, если новому боту чего-то не хватает
+	local kfpr
+	printf 'plain %s %s\n' PANEL_ORIGIN "https://$DOMAIN" PANEL_BASE "$WEB_PATH" SUB_PREFIX "https://$DOMAIN$SUB_PATH" \
+		CF_ZONE_ID "$BOT_ZONE" DNS_NAME "$DOMAIN" ENTRY_USER root ENTRY_SSH_PORT "$SSH_PORT" SELF_ORIGIN "$BOT_ORIGIN" \
+		VPN_BOT_INSTALLER 1
+	kfpr=$(bot_key_fpr)   # отпечаток ключа, который воркер получит в этой же загрузке (см. bot_keys)
+	[ -z "$kfpr" ] || printf 'plain ENTRY_SSH_KEY_FPR %s\n' "$kfpr"
+	printf 'secret CF_API_TOKEN @%s\nsecret SELFTEST_SECRET @%s\n' "$BOT_DIR/cf.token" "$BOT_DIR/selftest.secret"
+	# Каждая строка проверяется: в «{ …; } > файл || return» виден был только итог последней команды, и новый бот
+	# без админа (его забрал бы первый, кто напишет /start) загружался бы как ни в чём не бывало.
+	bot_secret_or_inherit BOT_TOKEN tg.token || return 1
+	bot_secret_or_inherit WEBHOOK_SECRET webhook.secret || return 1
+	bot_secret_or_inherit ADMIN_ID admin.id || return 1
+	bot_secret_or_inherit PANEL_TOKEN panel.token || return 1
+	bot_secret_or_inherit ENTRY_SSH_KEY id || return 1
+	cat "$BOT_DIR/exit.list"
+}
+
 bot_deploy_steps() {
-	local body sub f p kb res kfpr subnew=0 tries=15
+	local body sub f p kb res subnew=0 tries=15
 	BOT_ERR='' BOT_REPORT=''
 	if [ -z "${BOT_KV_ID:-}" ]; then
 		printf '{"title":"%s-state"}' "$BOT_WORKER" > "$BOT_DIR/req.json"
@@ -982,25 +1024,14 @@ bot_deploy_steps() {
 		subnew=1
 	fi
 	BOT_ORIGIN=https://$BOT_WORKER.$BOT_SUBDOMAIN.workers.dev
-	# Секреты этого развёртывания: самопроверка — всегда новый; вебхук — новый, если есть токен бота.
+	# Секреты этого развёртывания: самопроверка — всегда новый. Секрет вебхука у работающего бота не меняем:
+	# сменить — значит заглушить его, пока воркер не переставит вебхук (а любой сбой до того оставил бы глухим);
+	# новый — только когда секрета ещё нет. Вебхук воркер ставит себе сам (ниже, part=hook).
 	bot_put_secret selftest.secret "$(bot_rand)"
 	(umask 077 && printf 'X-Selftest-Secret: %s\n' "$(cat "$BOT_DIR/selftest.secret")" > "$BOT_DIR/selftest.hdr")
-	if [ -s "$BOT_DIR/tg.token" ]; then bot_put_secret webhook.secret "$(bot_rand)"; fi
+	if ! bot_has_binding WEBHOOK_SECRET; then bot_put_secret webhook.secret "$(bot_rand)"; fi
 	if [ -n "${BOT_ADMIN_ID:-}" ]; then bot_put_secret admin.id "$BOT_ADMIN_ID"; fi
-	{
-		printf 'plain %s %s\n' PANEL_ORIGIN "https://$DOMAIN" PANEL_BASE "$WEB_PATH" SUB_PREFIX "https://$DOMAIN$SUB_PATH" \
-			CF_ZONE_ID "$BOT_ZONE" DNS_NAME "$DOMAIN" ENTRY_USER root ENTRY_SSH_PORT "$SSH_PORT" SELF_ORIGIN "$BOT_ORIGIN" \
-			VPN_BOT_INSTALLER 1
-		kfpr=$(bot_key_fpr)   # отпечаток ключа, который воркер получит в этой же загрузке (см. bot_keys)
-		[ -z "$kfpr" ] || printf 'plain ENTRY_SSH_KEY_FPR %s\n' "$kfpr"
-		printf 'secret CF_API_TOKEN @%s\nsecret SELFTEST_SECRET @%s\n' "$BOT_DIR/cf.token" "$BOT_DIR/selftest.secret"
-		bot_secret_or_inherit BOT_TOKEN tg.token
-		bot_secret_or_inherit WEBHOOK_SECRET webhook.secret
-		bot_secret_or_inherit ADMIN_ID admin.id
-		bot_secret_or_inherit PANEL_TOKEN panel.token
-		bot_secret_or_inherit ENTRY_SSH_KEY id
-		cat "$BOT_DIR/exit.list"
-	} > "$BOT_DIR/bindings.list" || return 1
+	bot_bindings_list > "$BOT_DIR/bindings.list" || return 1
 	(umask 077 && python3 -I -c '
 import json, sys
 lst, kv, settings, managed, out = sys.argv[1:6]
@@ -1053,6 +1084,35 @@ for x in (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or [
 	echo '{"enabled":true,"previews_enabled":false}' > "$BOT_DIR/req.json"
 	body=$(cf_api POST "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER/subdomain" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
 	cf_ok <<< "$body" || { BOT_ERR="не включить адрес workers.dev — $(cf_err <<< "$body")"; return 1; }
+	# Воркер отвечает? Только что заведённый адрес workers.dev Cloudflare включает около минуты (до того — 523),
+	# поэтому ждём дольше — и до вебхука, иначе Телеграм получит ошибку на первом же обновлении. Вебхук — сразу
+	# за этим, до расписания, отпечатков и бэкапа: сбой на любом из них не должен оставить бота без вебхука.
+	if [ "$subnew" = 1 ]; then
+		tries=90
+		printf '  …     адрес %s заведён только что — Cloudflare включает такой около минуты, жду до 3 мин\n' "$BOT_ORIGIN"
+	fi
+	for f in $(seq 1 "$tries"); do
+		[ "$(bot_http /healthz 10 2> /dev/null)" = ok ] && break
+		[ "$f" = "$tries" ] && { BOT_ERR="воркер не отвечает на $BOT_ORIGIN/healthz"; return 1; }
+		sleep "${BOT_HEALTH_SLEEP:-2}"
+	done
+	# Вебхук воркер ставит себе сам — на свой адрес, со своим секретом, — и при каждом развёртывании: так повтор
+	# чинит и вебхук, оставшийся от оборванного запуска. Очередь стираем только у бота без прежнего вебхука:
+	# чужой (перенастроенный с согласия) и наш её хранят.
+	f='/selftest?part=hook'
+	if [ -z "${BOT_HOOK_URL:-}" ] && [ "${BOT_EXISTING:-none}" = none ]; then f+='&drop=1'; fi
+	# Ответ без «ok» — отвечает ещё прежняя версия воркера (её секрет самопроверки другой: 404): новая расходится
+	# по сети Cloudflare несколько секунд после загрузки. Ждём её — заодно дальше работаем уже точно с новой.
+	tries=${BOT_HOOK_TRIES:-20}
+	for p in $(seq 1 "$tries"); do
+		body=$(bot_http "$f" 2> /dev/null) || body=
+		case $(jget ok <<< "$body") in
+			true) break ;;
+			false) BOT_ERR="Телеграм не принял вебхук — $(jget error <<< "$body")"; return 1 ;;
+		esac
+		[ "$p" != "$tries" ] || { BOT_ERR="воркер не поставил вебхук: новая версия так и не ответила (ответ: $(head -c 80 <<< "$body" | tr -d '\n'))"; return 1; }
+		sleep "${BOT_HEALTH_SLEEP:-2}"
+	done
 	printf '[{"cron":"%s"}]' "$BOT_CRON" > "$BOT_DIR/req.json"
 	body=$(cf_api PUT "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER/schedules" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
 	cf_ok <<< "$body" || { BOT_ERR="не поставить расписание — $(cf_err <<< "$body")"; return 1; }
@@ -1074,26 +1134,6 @@ for x in (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or [
 			BOT_REPORT+="⚠ первый бэкап в хранилище не лёг — бот снимет его сам ночью или по кнопке «Бэкап»"$'\n'
 		fi
 	fi
-	# Воркер отвечает? Только что заведённый адрес workers.dev Cloudflare включает около минуты (до того — 523),
-	# поэтому ждём дольше — и до вебхука, иначе Телеграм получит ошибку на первом же обновлении.
-	if [ "$subnew" = 1 ]; then
-		tries=90
-		printf '  …     адрес %s заведён только что — Cloudflare включает такой около минуты, жду до 3 мин\n' "$BOT_ORIGIN"
-	fi
-	for f in $(seq 1 "$tries"); do
-		[ "$(bot_http /healthz 10 2> /dev/null)" = ok ] && break
-		[ "$f" = "$tries" ] && { BOT_ERR="воркер не отвечает на $BOT_ORIGIN/healthz"; return 1; }
-		sleep "${BOT_HEALTH_SLEEP:-2}"
-	done
-	if [ -s "$BOT_DIR/tg.token" ]; then
-		# Очередь стираем только у бота без прежнего вебхука: чужой (перенастроенный с согласия) и наш её хранят.
-		(umask 077 && python3 -I -c 'import json, sys
-print(json.dumps({"url": sys.argv[1] + "/tg", "secret_token": open(sys.argv[2]).read(), "allowed_updates": ["message", "callback_query"],
-                  "drop_pending_updates": sys.argv[3] == "1"}))' "$BOT_ORIGIN" "$BOT_DIR/webhook.secret" \
-			"$([ -z "${BOT_HOOK_URL:-}" ] && [ "${BOT_EXISTING:-none}" = none ] && echo 1 || echo 0)" > "$BOT_DIR/hook.json")
-		body=$(tg_api setWebhook "$BOT_DIR/hook.json") || { BOT_ERR="Телеграм не отвечает"; return 1; }
-		[ "$(jget ok <<< "$body")" = true ] || { BOT_ERR="Телеграм не принял вебхук — $(jget description <<< "$body")"; return 1; }
-	fi
 	res=$(python3 -I -c '
 import json, sys
 def load(s):
@@ -1114,7 +1154,19 @@ d = base.get("dns") or {}
 line(d.get("ok"), "A-запись: %s ✓" % d.get("ip"), "бот не видит A-запись: %s" % d.get("error"))
 w = base.get("webhook") or {}
 line(w.get("ok"), "вебхук Телеграма ✓" + (" (последняя ошибка доставки: %s)" % w["error"] if w.get("error") else ""), "вебхук Телеграма не стоит: %s" % w.get("error"))
-line((base.get("admin") or {}).get("ok"), "админ бота назначен ✓", "у бота нет админа")
+adm = base.get("admin") or {}
+line(adm.get("ok"), "админ бота назначен ✓", "у бота нет админа")
+cron = base.get("cron")
+if cron and cron != sys.argv[7]:
+    out.append("⚠ расписание воркера (%s) не то, на которое рассчитан бот (%s): суточный бэкап может не сниматься — возьмите свежий install-vpn.sh" % (sys.argv[7], cron))
+want, fresh = sys.argv[5], sys.argv[6] == "1"
+ids = [str(i) for i in adm.get("ids") or []]
+if want and ids:
+    if want not in ids:
+        # не роняем: хранилище Cloudflare отдаёт новую запись не сразу, заявка могла ещё не дочитаться
+        out.append("⚠ бот пока не видит админа %s — обычно он появляется в течение минуты; не появился — повторите: VPN_BOT_ADMIN_ID=%s bash install-vpn.sh --bot" % (want, want))
+    elif fresh and len(ids) > 1:
+        out.append("⚠ в хранилище бота остались прежние админы (id %s) — %s добавлен к ним; лишних уберите в боте: «Админы»" % (", ".join(i for i in ids if i != want), want))
 line(entry.get("ok"), "вход по SSH на этот сервер ✓", "вход по SSH на этот сервер не прошёл: %s" % entry.get("error"))
 if ex.get("ok"):
     out.append("выход по SSH ✓")
@@ -1124,27 +1176,64 @@ elif ex.get("skipped"):
 else:
     out.append("⚠ выход по SSH не прошёл (%s) — при переезде порт новому входу открывать руками" % ex.get("error"))
 print("\n".join(out))
-print("RESULT " + ("; ".join(bad) if bad else "ok"))' "$(bot_http '/selftest?part=base')" "$(bot_http '/selftest?part=entry')" "$(bot_http '/selftest?part=exit')" "${EXIT_MODE:-}")
+print("RESULT " + ("; ".join(bad) if bad else "ok"))' "$(bot_http '/selftest?part=base')" "$(bot_http '/selftest?part=entry')" "$(bot_http '/selftest?part=exit')" "${EXIT_MODE:-}" \
+		"${BOT_GRANT_ID:-${BOT_ADMIN_ID:-}}" "$([ "${BOT_EXISTING:-none}" = none ] && echo 1 || echo 0)" "$BOT_CRON")
 	BOT_REPORT+=$(grep -v '^RESULT ' <<< "$res")
 	res=$(sed -n 's/^RESULT //p' <<< "$res")
 	[ "$res" = ok ] || { BOT_ERR=$res; return 1; }
 }
 
-bot_decide() {  # → BOT_DO (разворачивать сейчас), BOT_KEEP (бот есть — не трогать), BOT_STALE, BOT_ASK (спросить [y/N])
-	BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_ASK=0
+# «Нет» на вопрос о боте и --no-bot запоминаются. Говорятся они до того, как установщик перечитывает настройки
+# прошлого запуска («. $STATE»), а те затирали S_BOT прежним значением — отказ забывался, и вопрос задавался снова.
+# Работающего бота отказ не забывает: «--no-bot» при нём значит «в этот раз не трогать» — воркер жив, и установщик
+# должен о нём помнить (и предупредить, если бот знает прежние настройки).
+bot_decline() { BOT_DECLINED=1; [ "${S_BOT:-}" = 1 ] || S_BOT=0; }
+bot_keep_decision() { [ "${BOT_DECLINED:-0}" != 1 ] || [ "${S_BOT:-}" = 1 ] || S_BOT=0; }   # после перечитывания настроек — вернуть отказ
+
+bot_summary() {  # строки итога установки про бота (в файл с данными доступа)
+	if [ "${S_BOT:-}" = 1 ]; then
+		echo
+		echo "Телеграм-бот для управления VPN: @${S_BOT_USER:-?} — https://t.me/${S_BOT_USER:-}"
+		echo "  клиенты, статистика, проверка блокировки раз в 3 часа, бэкапы, переезд на новый сервер кнопкой"
+		[ "${BOT_RESULT:-}" != fail ] || echo "  ⚠ в этот раз бот не обновился: ${BOT_ERR:-} (повторить: bash install-vpn.sh --bot)"
+		[ -z "${BOT_SKIP:-}" ] || echo "  ⚠ в этот раз бот не обновлён: $BOT_SKIP (повторить: bash install-vpn.sh --bot)"
+		# Бот не обновлён, а то, на что он опирается, сменилось: при переезде он пошёл бы не туда.
+		if [ "${BOT_OUTDATED:-0}" = 1 ] && [ "${BOT_RESULT:-}" != ok ] && [ -z "${BOT_SKIP:-}" ]; then
+			echo "  ⚠ бот знает прежние настройки (домен, выход или порт SSH) — обновите его: bash install-vpn.sh --bot"
+		fi
+		if { [ -n "${BOT_SKIP:-}" ] || [ "${BOT_RESULT:-}" = fail ]; } && [ -n "${VPN_BOT_ADMIN_ID:-}" ]; then
+			echo "  ⚠ админ $VPN_BOT_ADMIN_ID не добавлен"
+		fi
+	elif [ -n "${BOT_SKIP:-}" ] || [ "${BOT_RESULT:-}" = fail ]; then
+		echo
+		echo "Телеграм-бот не поставлен: ${BOT_ERR:-$BOT_SKIP}"
+		echo "  повторить: bash install-vpn.sh --bot — токены скрипт спросит сам"
+	fi
+}
+
+bot_decide() {  # → BOT_DO (разворачивать сейчас), BOT_KEEP (бот есть — не трогать), BOT_STALE (предложить обновить),
+	# BOT_OUTDATED (бот знает прежние настройки — сказать в итоге), BOT_ASK (спросить [y/N])
+	BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_OUTDATED=0 BOT_ASK=0
 	[ "${MODE:-}" = domain ] || return 0
 	[ "${DNS_NOT_CF:-0}" != 1 ] || return 0   # домен не в Cloudflare — боту не на чем работать
-	[ "${BOT_ARG:-}" != 0 ] || return 0
 	if [ "${S_BOT:-}" = 1 ]; then
 		# Повтор меняет то, на что бот опирается, — без обновления он открыл бы при переезде порт не там.
 		if [ "${DOMAIN:-}" != "${S_DOMAIN_OLD:-}" ] || [ "${EXIT_MODE:-}" != "${S_EXIT:-}" ] ||
 			{ [ -n "${EXIT_HOST:-}" ] && [ "$EXIT_HOST" != "${CHAIN_IP:-}" ]; } ||
 			{ [ -n "${EXIT_PORT_ARG:-}" ] && [ "$EXIT_PORT_ARG" != "${CHAIN_PORT:-}" ]; } ||
 			{ [ -n "${S_BOT_SSH_PORT:-}" ] && [ -n "${SSH_PORT_NOW:-}" ] && [ "$S_BOT_SSH_PORT" != "$SSH_PORT_NOW" ]; }; then
-			BOT_STALE=1
+			BOT_OUTDATED=1
 		fi
+		if [ "${BOT_ARG:-}" = 0 ]; then
+			BOT_KEEP=1   # --no-bot: бота в этот раз не трогаем и токен не спрашиваем, но о нём помним
+			return 0
+		fi
+		BOT_STALE=$BOT_OUTDATED
 		if [ -n "${BOT_CF_TOKEN:-}" ] || [ "${BOT_ARG:-}" = 1 ]; then BOT_DO=1; else BOT_KEEP=1; fi
-	elif [ "${BOT_ARG:-}" = 1 ]; then
+		return 0
+	fi
+	[ "${BOT_ARG:-}" != 0 ] || return 0
+	if [ "${BOT_ARG:-}" = 1 ]; then
 		BOT_DO=1
 	elif [ -z "${S_BOT:-}" ] && bot_tty_ok; then
 		BOT_ASK=1
@@ -1204,980 +1293,1088 @@ bot_retry() {  # после неудачной проверки: «ещё раз
 	[ -z "$BOT_ANSWER" ] || BOT_TG_TOKEN=$BOT_ANSWER
 	bot_init_secrets
 }
-bot_extract_bundle() {  # код бота (vpn-bot 137315e) → $BOT_DIR/worker.js
+bot_extract_bundle() {  # код бота (vpn-bot 035973f) → $BOT_DIR/worker.js
 	base64 -d <<'VPN_BOT_BUNDLE_EOF' | gzip -dc > "$BOT_DIR/worker.js"
-H4sIAAAAAAAC/+S9W5McR5Ym9s5fEczmcDKJrKy4Z0SBIKZQKJA1BAEMqkD2DBqNiotHVQ6yMpMZ
-mQWg0SmbmTVp12xWkslMMpPpQQ960IteWrvbq9npnR6z/QXgX9hfou/4JcI9IrKqwGbLxkxsa1RG
-hF+Pn8t3jt92d61yme0W8+VFshqtyo+K9SxbTeYzK327YmV/NrDefWRZk8Lqf/xofZGy5WhSPpjM
-JitG3379a2tmfX7HsgfWkq3Wy5nVs61frG3fcXq3kS+bz8qVtbbuWM978vXQEr/2G88HjWfPfHbd
-xvcH8vkF1TNlK2uCWmz1cImHGT28Pp9MmdW/tL64Yzm261uffoqUn1vr0ZTNzlbn1o7liD5ayLQr
-Et3mj5Nbt+jHpupHiUJlQTZ1HTXeQZ3WXeubZHU+Ws7Xs7x/ORit5ser5WR21h9Ye9YlHh9M3rBc
-tQHJHbx3B1S4pNrpJ+/KjfXJu/XzyYvN6e2PNvU45Otlv2RoQF6KdtZt4bVeJG/69lD8LqbzeZ16
-UI9ArlLLFNauFYW+bWtJzptJ/kQkQVIvNFJetFNSCiQMRTLiltz6QuOKc3pCx9HPfMMZxPPR3XPx
-2x+fgiD6t1NVzLlRzEVdTJUVxVzIbJyFvIj/e18WWVehirwwijzdlr01OrwYxxyc5GzevygPF/Ps
-fGjN5q9BmfvJio3wsz/QREemIaZRP02pEZVqDeDi4R3yfz1BFP6vrclVPikKcyz61IYdVccAQ+Iw
-rx4TSv95s1rf1aq6x98c6E2Q9NOT9holhj9RkTW9ieup8IEcG0Eam/871n775niwN4vJ8u2PHRIu
-zY0xcfi/gRh87V+77qHoiGxiTZtqoFtlPtCp4GrF8X99v8kGvtcu9A71rVFupLWPFxuI1u9rPDNl
-xarBM6rMHVFkzTPmcFBONRyHzZrkcNxrfT0wByibThb9EgOj67IEDdpfLpO3o2I5v+iXeuWJ0tNf
-wNLcxWM5nWSMNN5sMPrr+WTW7/VIzZYmH5RZX6pLWY7UyOVgtGSLaYIidj/dPYMx+TS5WNzuaa8/
-F6+nK+PtF+LtGb2lqj7aFZZzxabsbJlcGLZzXbLlo+SC9dd6N2d4Q5ZwPSomy3L1kp6HZIgS+fAC
-H6Yrtuzfm8+nLKk6aKEhaP5Fnxvc00lOlmI0yTe6kuKUXY+oal4R15L0a2P1/4zSqy+bAalGUXlk
-Dwy6XSTLV+tF/1WqCQo9yDou56jb1ioVdnMym05m7OUr9jadJ8t8z3qVwiwt+vyjZfWXxFZ3vrDw
-l7/vp/wxHa2XU7TznbVib1Z7eKa/oMhyuic/btDS5ucsmU7TJHv1Mk9WCb2mv9ZmwGujfzfUpctk
-aZ3IsQHRMxC5rMdiuc5WYH02u1S2f3U+KUd4Rlr8q+x+Ur6dZbzG/gVbnc/zoZXO87cqkxjXJSsX
-yJa8TiYrq2Cr7Lx/er5aLcq93d1kMRlVLDJfnu2m89Un71Rlo3uPT16ePP768NFmF3aI17A5HcrS
-LUu82bN6Tx4fn/SG8u05S3K2LIkyvYP5bMVmq52TtwvWQ8JksYB8JDSYu39dzmc9a6OyUcP3rD8/
-fvxoVHJhmBRv+7w3PMFmcFvrE+Wt+kQdHNGb/mCEstG/Ph/A/rvNQObinEJJRvNXAxATQ23N2Gvr
-cLkEnU9XZ1bVvz385ClzSOlysuCMB77mtZSrZLUuN6eyWMlmPDm+ryGUcmRKBqyVnSdgCMEWimer
-TJzIfOh6lPgbVpbJGevV1KXcLycgLy9GvuSFyd+LZFmylxfznIGyX51887AaAvD7q5eLJbucsNcv
-57wLfDwm5ct8UibplKFYcBmryU+a5O1LIWB7mqBpxKd+sXyykv26EC0+ym/SRconu3iCxNd1U5bN
-39f1/AuhAVTr+//1/X/+4X+03v/f73//w9+9/431X//mf7be/4f3v8O7H/4W//v79797/4/v/2Hn
-/T//8Dfv/+H9v8fjb374N+9/+/6f3v8D0qxGF2z3c3xAIV/cBVMtV3f+69/8nx9Rx/vbiXjGQEMi
-ndmW/+2Hf4W6f2O9/z9Qwe/w/3+PSn/z/j9bqPF3P/xPP/yd9f73aOk/4d9/x7+LRrz/B7SftxRZ
-f0dPv0eGf0DKf6Q3/wGPf0udQyZ0xepX/aOyURZ1jUr8Lf4iwWBE7gxLz+fzV0ezYn51P76rE7Y7
-9L+jWioXDf8nagr+ef8fQcC/Q+t+a6Ey6so/81ZxwqPxP/ybH/6t9V/+rx/+NZL9LZLh23/5nfXD
-v7J4l3+DtoM0P/zbH/67978ZWe//F4zI76nc3wrSUTZ08P9BQt6rH/7WEn3/4W9o1Kz/xgnwYiib
-98/UbXz9/Q9/Q8X/FlT8b1EOqDbgZXLaodb/KFoP2qOYv0dK9ACtVAS0eKP+E6/o37V6NqrUezIr
-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
-JlsaFJJ9EvPduuWarJz4bMx7nvtlW6wsUBj2QsOYcCZpQ9qX1Q9HS0d0YIqtGlDbFOXjsbC9WPar
-sbg9VV2bCUrbobxa4nykmQF9EwlSc70G9dbl5eqI1qQ+I6PR2udR16Kwjpv08ujg+LxSqu0Axdt2
-/mvultoHjUalUt7aaVaqtWatubVV2dnfKR00y82DcmW3VKm1Sjs7ja3tZnO7VqqU9vdbja3qfrm6
-u1+pbJZrjdLO9u5Oq1or1Q4OWu3dzfLufrV5UG3UquX9aqmyX2psHbQrm+1yrbpda7fK1c2tg62D
-zXKzUtts1XY29ze3RZ+bre1Wc6tdE0OotHZFD9utg6390n67vdncF+9LW/viTatV3dnab+9vNnZ2
-d9uNzUZrt12plcvbzdp+ud3aqu1Wdra2NsutZqu2uV89aFZKpe3m/k6jLIbcLm3u7hw0IC9qubm5
-eVAV3eyKD+3GTvugUmu2N9vik/hQERUb1cbBrii3VWmLAVdKO5ublf393dbBpliT7e3S7tbulpjH
-dqlZ3ay1ao395u5OqdYub9e2mqWdZqO8UxGjqorCYpJblVZ1q9mq7requ63t7UqzvFNq7WyVYA23
-d6qNSqtZ2m5UdsTEYGDtkphwc7PS3D1oVfab++2t3c3NnfJ2eae6u7tZ291uthq7m1uN1mZZDLay
-Vd7Z3Wk3SpvlUnlzu7LTEqvTaDQbja0dd78lE4QwAclc/zdM/P8KJhpiIQ8aB9Vqebt0UKptig6q
-1QZMo9zYP2iXm/uNrVqr2d7f2RRfdw72W+2SqNdqbItGNg9KW6Xm9sF+dXe71N7ZbGy1yq1ac7ux
-3xZrvtM82C/tVqsH22Xxe1cASK0hbsHy7kFTbBCOqHFQabXETpUrbTGyrYPdHQEnW7WDne2tUmW7
-Wm01d7ZE/2Iw7cp+Wcxte19sVVMAl9jMze3txpaY2lYTFnpnp1naF5tR22qJbWhVaqLB7ZqY5H5V
-gNTB/uZ+u9kSYFwWH2v7OxUBtaXGbkU8lsrlxnal2ixXGts7262tg+2dne3ybqNc2j/Yb2zuV7Z2
-d8UWiXXdarRrLSjZEN3sVGv7ontRSMxqp9rabTYqjQMBmS2xSvv7zYqYfe2gtSOAvQL/Nsu1cnu/
-BYewsrPd3NytieFt7TdLmwe7YoN3t2DEuwJQxDmrVvcFaAgI3dwXAH9Qbm+JMyaAqNWqHGw3xGaU
-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
-za/dom0aWkQ/646K34GB9wcU+vMoWP4CAA==
+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
+vr23Xd1v1Vr7tfpOtd5oV7e3m5tbrdZWo1qv7u21m5vre7X1nb16faPWaFa3t3a22+uNamN/v32w
+s1Hb2Vtv7a83G+u1vfVqfa/a3Nw/qG8c1BrrW42Ddm19Y3N/c3+j1qo3NtqN7Y29jS3oc6O91W5t
+HjRgCPX2DvSw1d7f3KvuHRxstPbgfXVzD9602+vbm3sHexvN7Z2dg+ZGs71zUG/Ualutxl7toL3Z
+2Klvb25u1NqtdmNjb32/Va9Wt1p7280aDPmgurGzvd/EBKm11sbG/jp0swMfDprbB/v1Rutg4wA+
+wYc6VGyuN/d3oNxm/QAGXK9ub2zU9/Z22vsbsCZbW9WdzZ1NmMdWtbW+0Wg3mnutne1q46C21dhs
+Vbdbzdp2HUa1DoVhkpv19vpmq72+117faW9t1Vu17Wp7e7OKa7i1vd6st1vVrWZ9GyaGAzuowoRb
+G/XWzn67vtfaO9jc2djYrm3Vttd3djYaO1utdnNnY7PZ3qjBYOubte2d7YNmdaNWrW1s1bfbsDrN
+ZqvZ3NwO91uYIIIJzOr632Hi/1cw0YSF3G/ur6/Xtqr71cYGdLC+3sRp1Jp7+we11l5zs9FuHext
+b8DX7f299kEV6rWbW9DIxn51s9ra2t9b39mqHmxvNDfbtXajtdXcO4A1327t71V31tf3t2rwewcA
+pNGEW7C2s9+CDaIRNffr7TbsVK1+ACPb3N/ZBjjZbOxvb21W61vr6+3W9ib0D4M5qO/VYG5be7BV
+LQAu2MyNra3mJkxts4ULvb3dqu7BZjQ227AN7XoDGtxqwCT31gGk9vc29g5abQDjGnxs7G3XAWqr
+zZ06PFZrteZWfb1Vqze3trfam/tb29tbtZ1mrbq3v9fc2Ktv7uzAFsG6bjYPGm0s2YRuttcbe9A9
+FIJZba+3d1rNenMfILMNq7S316rD7Bv77W0A9jr+26o1agd7bTyE9e2t1sZOA4a3udeqbuzvwAbv
+bOKIdwBQ4Jytr+8BaACEbuwBwO/XDjbhjAEQtdv1/a0mbEZtb39/axNgB7A4nMBqFUC0vrW/sVfd
+aDZ3dtb3GrD329v7ALJwRLc3Dw72tvbhGDcR7A4a+weN9Y3WDpzGzfUaHJEYJ3zaLQPEub1kjr4x
+2ZyBmdh/+Joz7a1Xy/bN8/azR7+CV5Sq7hvgOL55/vTFM/1C6tTNs6mx7l78Dy/aR1imYVTg+Hrv
+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
+AwA=
 VPN_BOT_BUNDLE_EOF
 }
-BOT_SOURCE=137315e
+BOT_SOURCE=035973f
 
 # Токены — сразу из окружения: токен Cloudflare нужен уже на первом вопросе (домен выбирается из списка).
 BOT_CF_TOKEN=${CF_API_TOKEN:-}
@@ -2207,13 +2404,105 @@ exit_ssh_defaults
 DO_UFW=${DO_UFW:-$(state_val S_DO_UFW || true)}; DO_UFW=${DO_UFW:-1}
 DO_F2B=${DO_F2B:-$(state_val S_DO_F2B || true)}; DO_F2B=${DO_F2B:-1}
 TZ_NAME=${TZ_NAME:-$(state_val S_TZ || true)}; TZ_NAME=${TZ_NAME:-Europe/Moscow}
+foreign_on_port() {  # foreign_on_port ПОРТ [СВОЙ_ID] → id другого подключения панели на этом порту (включённого или нет:
+	# панель не даст создать на нём второе); пусто — порт в панели свободен или базу нечем прочитать
+	[ -f "$DB" ] || return 0
+	python3 -I -c 'import sqlite3, sys
+r = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute(
+    "select id from inbounds where port=? and id<>? order by id limit 1", (int(sys.argv[2]), int(sys.argv[3]))).fetchone()
+print(r[0] if r else "")' "$DB" "$1" "${2:-0}" 2> /dev/null ||
+		sqlite3 -readonly "$DB" "select id from inbounds where port=$((10#$1)) and id<>$((10#${2:-0})) order by id limit 1;" 2> /dev/null || true
+}
+xui_inbound_ports() {  # xui_inbound_ports [local] → «порт/протокол» включённых подключений панели, которые слушают не только
+	# localhost (это нужно фаерволу); с «local» — и тех, что слушают только localhost (это нужно сверке портов).
+	# Код 1 — база есть, а прочитать её не вышло: «подключений нет» и «не знаю» — разные ответы.
+	[ -f "$DB" ] || return 0
+	python3 -I - "$DB" "${1:-}" <<'PY' 2>/dev/null
+import json, sqlite3, sys
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+local = sys.argv[2] == "local"
+
+
+def obj(text):  # JSON-объект из поля базы; всё остальное (null, список, строка, не JSON) — пустой объект
+    try:
+        v = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def kinds_of(proto, st, ss):  # что слушает подключение: tcp, udp или оба
+    proto = str(proto or "").lower()
+    net = str(ss.get("network") or "tcp").lower()
+    tls = ss.get("tlsSettings")
+    alpn = (tls.get("alpn") if isinstance(tls, dict) else None) or []
+    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
+        return {"udp"}
+    if net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
+        return {"tcp", "udp"}
+    if proto in ("shadowsocks", "dokodemo-door", "tunnel"):
+        n = str(st.get("network") or "tcp").lower()
+        return {k for k in ("tcp", "udp") if k in n} or {"tcp"}
+    if proto in ("mixed", "socks"):
+        return {"tcp", "udp"} if st.get("udp") else {"tcp"}
+    return {"tcp"}
+
+
+out = set()
+for port, listen, proto, settings, stream, enable in db.execute(
+        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
+    listen = str(listen or "").strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        continue
+    if not enable or port <= 0 or listen.startswith(("/", "@")):   # выключено; unix-сокет порта не занимает
+        continue
+    if not local and (listen.startswith("127.") or listen in ("::1", "[::1]", "localhost")):
+        continue
+    try:
+        kinds = kinds_of(proto, obj(settings), obj(stream))
+    except Exception:   # строку не разобрать — порт всё равно не терять (считаем его TCP), остальные строки читаем дальше
+        kinds = {"tcp"}
+    out.update((port, k) for k in kinds)
+for port, kind in sorted(out):
+    print("%d/%s" % (port, kind))
+PY
+}
+service_ports() {  # service_ports РЕЖИМ → «порт|зачем он скрипту»: порты, которые скрипт занимает сам (кроме порта своего подключения)
+	echo "$SUB_PORT|под подписку (её отдаёт сама панель)"
+	[ "$1" = domain ] || return 0
+	echo "80|под nginx — выпуск и продление сертификата"
+	echo "443|под nginx — сайт, панель и подписка по адресу домена"
+	echo "8443|под nginx — внутренний порт сайта, под который маскируется VPN"
+}
+service_port_check() {  # service_port_check РЕЖИМ [ХВОСТ] — на порту, который скрипт займёт сам, у панели есть включённое подключение:
+	# остановиться, пока ничего не изменено. Иначе (проверено на настоящих x-ui и Xray) не поднимается либо Xray — и не
+	# работает ни одно подключение, чужое и своё, — либо сама панель.
+	local p why busy
+	busy=$(xui_inbound_ports local) || return 0   # базу не прочитать — сверить не с чем
+	[ -n "$busy" ] || return 0
+	while IFS='|' read -r p why; do
+		! grep -qx "$p/tcp" <<<"$busy" ||
+			die "в панели есть включённое подключение на порту $p, а этот порт нужен скрипту $why. Вдвоём на одном порту они не уживутся: не поднимется либо Xray со всеми подключениями, либо сама панель. Перенесите то подключение на другой порт (в панели) и запустите скрипт ещё раз — или ставьте VPN на чистый сервер.${2:+ $2}"
+	done < <(service_ports "$1")
+}
 foreign_xui_check() {  # 3x-ui здесь ставили без этого скрипта: сказать, что будет, и спросить сразу — до любых вопросов и изменений
-	local n
+	local n msg p=${PORT_ARG:-2083}
 	[ -f "$DB" ] && [ ! -f "$STATE" ] || return 0
 	! compgen -G "$STATE.failed-*" > /dev/null || return 0   # следы неудачной попытки этого скрипта — 3x-ui его
+	# Своё подключение скрипт создаёт сам, на своём порту, а чужие не трогает. Порт занят чужим — сказать сразу.
+	if [[ $p =~ ^[0-9]{1,5}$ ]] && [ -n "$(foreign_on_port "$p")" ]; then
+		die "здесь уже есть 3x-ui, поставленный не этим скриптом, и на порту $p у него есть подключение. Своё подключение скрипт создаёт на этом порту, а чужие не трогает — запустите с другим портом: bash $0 --port N. Ничего не менял"
+	fi
+	# То же — для портов, которые скрипт займёт сам: подписка, а с доменом (если он уже назван опцией) — ещё и nginx.
+	service_port_check "$([ -n "$DOMAIN" ] && [ "$NO_DOMAIN" != 1 ] && echo domain || echo nodomain)" "Ничего не менял."
 	n=$(python3 -I -c 'import sqlite3, sys; print(sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select count(*) from inbounds").fetchone()[0])' "$DB" 2> /dev/null ||
 		sqlite3 -readonly "$DB" 'select count(*) from inbounds;' 2> /dev/null || echo '?')
-	warn "здесь уже есть 3x-ui, поставленный не этим скриптом (подключений: $n). Удалять его скрипт не будет: подключения и клиенты останутся, их порты фаервол не закроет. Заменятся логин, пароль, порт и путь панели, шаблон Xray (маршрутизация), адреса подписок и сама программа — на 3x-ui $XUI_VERSION. Копия базы останется рядом с ней"
+	msg="здесь уже есть 3x-ui, поставленный не этим скриптом (подключений: $n). Удалять его скрипт не будет: подключения и клиенты останутся, их порты фаервол не закроет. Заменятся логин, пароль, порт и путь панели, шаблон Xray (маршрутизация), адреса подписок и сама программа — на 3x-ui $XUI_VERSION. Копия базы останется рядом с ней"
+	warn "$msg"
+	# Вопрос задаётся в терминале, а вывод скрипта могли перенаправить (> файл): тогда объяснение — и туда, где вопрос.
+	[ -t 1 ] || ! bot_tty_ok || bot_say "$msg"
 	bot_tty_ok || die "здесь уже есть 3x-ui, поставленный не этим скриптом: запустите скрипт в терминале (он спросит) или поставьте VPN на чистый сервер"
 	bot_consent "Продолжить?" || die "ничего не менял. Для нового VPN лучше чистый сервер"
 	FOREIGN_XUI=1
@@ -2287,24 +2576,136 @@ else
 	fi
 fi
 # Порт подключения Reality — как у основного сервера, 2083, с доменом и без (--port меняет).
-# Повторный запуск берёт порт уже созданного подключения из базы: иначе установка прежней версией
-# (без домена ставила 443) получила бы второе подключение.
-existing_reality_port() {
-	[ -f "$DB" ] && command -v python3 >/dev/null 2>&1 || return 0
-	python3 - "$DB" <<'PY' 2>/dev/null || true
-import json, sqlite3, sys
+# Своё подключение скрипт узнаёт по настройкам установки ($STATE), по порядку:
+#  а) в подключении стоит ключ Reality из настроек (REALITY_PRIV) — какой бы номер ни был записан: ключ скрипт генерирует
+#     сам и хранит только там, так что подключение с этим ключом создано им;
+#  б) иначе — подключение с записанным номером (S_INBOUND_ID), если оно стоит на записанном порту (S_REALITY_PORT): ключи
+#     ему сменили в панели — это обычное обслуживание, и повторный запуск от него ломаться не должен;
+#  в) в настройках прежних версий номера нет: по ключу, иначе — VLESS + Reality на записанном порту; нет ни ключа, ни
+#     порта (самые первые версии) — первое VLESS + Reality в базе, как тогда;
+#  г) во всех остальных случаях своего нет. Номер совпал, а ни ключ, ни порт — нет: это чужое подключение, которому
+#     достался тот же номер (базу панели сбросили, заменили или вернули из копии).
+# Подключения, которые были в панели до скрипта, своими не считаются никогда: он их не переносит и не трогает.
+# Ключи найденного подключения становятся ключами установки (own_to_settings): иначе на следующем запуске оно узнавалось
+# бы хуже, а при пересоздании получило бы прежние ключи.
+own_inbound() {  # own_inbound КЛЮЧ НОМЕР ПОРТ → «номер порт ключ открытый_ключ shortIds» своего подключения (чего нет — «-»);
+	# «-» — своего нет; пусто — базу не прочитать
+	[ -f "$DB" ] || { echo -; return 0; }
+	command -v python3 >/dev/null 2>&1 || return 0
+	# Ключ — через окружение, а не аргументом: аргументы процесса видны всем пользователям сервера (ps).
+	OWN_KEY_WANT=$1 python3 -I - "$DB" "$2" "$3" <<'PY' 2>/dev/null || true
+import json, os, re, sqlite3, sys
+key, want, port = os.environ.get("OWN_KEY_WANT", ""), sys.argv[2], sys.argv[3]
 db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-for port, ss in db.execute("select port, stream_settings from inbounds where protocol='vless' order by id"):
+
+
+def b64(v):  # ключ Reality — base64url; всё остальное в настройки установки не переносится
+    return v if isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_-]+", v) else ""
+
+
+rows = []   # все подключения: (номер, порт, это VLESS + Reality?, ключ, открытый ключ, shortIds)
+for iid, p, proto, ss in db.execute("select id, port, protocol, stream_settings from inbounds order by id"):
     try:
-        if json.loads(ss or "{}").get("security") == "reality":
-            print(port)
-            break
-    except ValueError:
+        iid, p = int(iid), int(p)
+    except (TypeError, ValueError):
+        continue
+    vr, priv, pub, sids = False, "", "", ""
+    try:
+        s = json.loads(ss or "{}")
+        if s.get("security") == "reality":
+            vr = str(proto or "").lower() == "vless"
+            rs = s.get("realitySettings") or {}
+            priv, pub = b64(rs.get("privateKey")), b64((rs.get("settings") or {}).get("publicKey"))
+            ids = rs.get("shortIds")
+            if isinstance(ids, list) and all(isinstance(i, str) and re.fullmatch(r"[0-9A-Fa-f]*", i) for i in ids):
+                sids = ",".join(ids)
+    except (TypeError, ValueError, AttributeError):   # не JSON, не объект — подключение без Reality
         pass
+    rows.append((iid, p, vr, priv, pub, sids))
+mine = None
+if key:   # а) ключ из настроек (если таких подключений несколько — то, чей номер записан)
+    mine = next(iter(sorted((r for r in rows if r[3] == key), key=lambda r: str(r[0]) != want)), None)
+if mine is None and want.isdigit() and int(want) > 0 and port.isdigit():   # б) записанный номер на записанном порту
+    mine = next((r for r in rows if r[0] == int(want) and r[1] == int(port)), None)
+if mine is None and not want:   # в) настройки без номера
+    if port.isdigit():
+        mine = next((r for r in rows if r[2] and r[1] == int(port)), None)
+    elif not key:
+        mine = next((r for r in rows if r[2]), None)
+print(" ".join(str(v) if v != "" else "-" for v in (mine[0], mine[1], mine[3], mine[4], mine[5])) if mine else "-")
 PY
 }
-OLD_REALITY_PORT=$(existing_reality_port)
+find_own_inbound() {  # → OWN_INBOUND_ID и OLD_REALITY_PORT (номер и нынешний порт своего подключения; пусто — его нет),
+	# OWN_KEY, OWN_PUB, OWN_SIDS (его нынешние ключи Reality и shortIds), S_INBOUND_ID (номер для настроек: найденного
+	# подключения; 0 — записанный не подтвердился), OWN_KNOWN (0 — базу панели было нечем прочитать: своё не найдено,
+	# но и «не своим» ничего не объявлено)
+	local got
+	S_INBOUND_ID=$(state_val S_INBOUND_ID || true)
+	[[ $S_INBOUND_ID =~ ^[0-9]+$ ]] || S_INBOUND_ID=
+	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_PUB='' OWN_SIDS='' OWN_KNOWN=1
+	# Настроек установки нет — чистый сервер, чужой 3x-ui или сброшенная неудачная попытка: своего подключения ещё нет.
+	if [ ! -f "$STATE" ]; then S_INBOUND_ID=0; return 0; fi
+	got=$(own_inbound "$(state_val REALITY_PRIV || true)" "$S_INBOUND_ID" "$(state_val S_REALITY_PORT || true)")
+	if [ -z "$got" ]; then OWN_KNOWN=0; return 0; fi
+	read -r OWN_INBOUND_ID OLD_REALITY_PORT OWN_KEY OWN_PUB OWN_SIDS <<<"$got" || true
+	if [[ $OWN_INBOUND_ID =~ ^[1-9][0-9]*$ ]] && [[ $OLD_REALITY_PORT =~ ^[0-9]+$ ]]; then
+		S_INBOUND_ID=$OWN_INBOUND_ID
+		[ "$OWN_KEY" != - ] || OWN_KEY=''
+		[ "$OWN_PUB" != - ] || OWN_PUB=''
+		[ "$OWN_SIDS" != - ] || OWN_SIDS=''
+	else
+		OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_PUB='' OWN_SIDS=''
+		S_INBOUND_ID=${S_INBOUND_ID:+0}   # записанный номер не подтвердился — он больше ничей; не было номера — так и нет
+	fi
+}
+own_inbound_late() {  # python3 только что поставлен: если в начале запуска базу панели было нечем прочитать — прочитать сейчас.
+	# Иначе своё подключение сошло бы за чужое («порт занят») или переехало бы на порт из настроек.
+	[ "$OWN_KNOWN" != 1 ] || return 0
+	find_own_inbound
+	[ -n "$PORT_ARG" ] || REALITY_PORT=${OLD_REALITY_PORT:-$REALITY_PORT}
+}
+own_to_settings() {  # сразу после чтения настроек ($STATE): номер своего подключения — подтверждённый (find_own_inbound), а не
+	# просто записанный; ключи установки — те, что стоят в нём сейчас. Их могли сменить в панели, а в настройках самых
+	# первых версий их не было вовсе. Переносится пара целиком (закрытый и открытый): нет в подключении открытого ключа —
+	# ключи установки остаются прежними, иначе пересозданное подключение получило бы несогласованную пару.
+	S_INBOUND_ID=${OWN_INBOUND_ID:-${S_INBOUND_ID:+0}}
+	[ -n "$OWN_KEY" ] && [ -n "$OWN_PUB" ] && [ "$OWN_KEY" != "${REALITY_PRIV:-}" ] || return 0
+	[ -z "${REALITY_PRIV:-}" ] || ok "ключи Reality своего подключения сменили в панели — запомнил нынешние"
+	REALITY_PRIV=$OWN_KEY REALITY_PUB=$OWN_PUB
+	[ -z "$OWN_SIDS" ] || SHORT_IDS=$OWN_SIDS
+}
+port_taken_check() {  # порт своего подключения или порт, который скрипт занимает сам, занят в панели другим подключением —
+	# остановиться, пока ничего не изменено
+	local other why=""
+	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-0}")
+	if [ -n "$other" ]; then
+		# Повторный запуск: подсказать, почему подключение на своём же порту могло оказаться «другим».
+		[ ! -f "$STATE" ] || why=" Своё подключение скрипт узнаёт по ключу Reality из $STATE или по записанным там же номеру и порту — у этого не совпало ни то, ни другое."
+		die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N.$why"
+	fi
+	service_port_check "$MODE"   # и порты, которые скрипт занимает сам: подписка, с доменом — nginx
+}
+inbound_move() {  # inbound_move ID СТАРЫЙ_ПОРТ НОВЫЙ_ПОРТ — перенести своё подключение, и только его (x-ui остановлен)
+	# Имя подключения 3x-ui содержит порт (in-2083-tcp, в старых версиях inbound-2083) — заменить в нём номер.
+	python3 - "$DB" "$1" "$2" "$3" <<'PY'
+import re, sqlite3, sys
+path, iid, old, new = sys.argv[1:5]
+db = sqlite3.connect(path)
+for iid, tag in db.execute("select id, tag from inbounds where id=?", (int(iid),)).fetchall():
+    newtag = re.sub(r"(?<![0-9])%s(?![0-9])" % re.escape(old), new, tag or "") or "in-%s-tcp" % new
+    db.execute("update inbounds set port=?, listen='0.0.0.0', tag=? where id=?", (int(new), newtag, iid))
+db.commit()
+PY
+}
+find_own_inbound
 S_REALITY_PORT=$(state_val S_REALITY_PORT || true)
+forget_failed_state() {  # настройки неудачной попытки — в сторону (по этому следу foreign_xui_check потом узнает свой 3x-ui),
+	# а в памяти от них не остаётся ничего: дальше установка идёт как на чистом сервере. В том числе номер подключения —
+	# иначе он попал бы в новые настройки, хотя своего подключения ещё нет.
+	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"
+	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' S_INBOUND_ID=0 CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
+	OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_PUB='' OWN_SIDS=''
+}
 reset_failed_attempt() {  # смена варианта после неудачной первой установки: убрать то, что успела сделать прошлая попытка
 	local d=$S_DOMAIN_OLD ip
 	ip=$(state_val S_IP_CERT_IP || true)
@@ -2319,8 +2720,7 @@ reset_failed_attempt() {  # смена варианта после неудач�
 		[ ! -x /root/.acme.sh/acme.sh ] || /root/.acme.sh/acme.sh --remove -d "$ip" --ecc >/dev/null 2>&1 || true
 		rm -rf "/root/.acme.sh/${ip}_ecc" /etc/x-ui/ip-cert
 	fi
-	mv -f "$STATE" "$STATE.failed-$(date +%Y%m%d-%H%M%S)"   # по этому следу foreign_xui_check потом узнает свой 3x-ui
-	S_MODE='' S_DOMAIN_OLD='' S_EXIT='' S_REALITY_PORT='' CHAIN_IP='' CHAIN_PORT='' CHAIN_UUID='' CHAIN_PUB='' CHAIN_PRIV='' CHAIN_SID='' CHAIN_SNI='' CHAIN_SSH_USER='' CHAIN_SSH_PORT=''
+	forget_failed_state
 	exit_ssh_defaults
 }
 if [ "${MODE_CHANGED:-0}" = 1 ]; then
@@ -2466,7 +2866,7 @@ SSH_PORT_NOW=$(sshd -T 2> /dev/null | awk '$1 == "port" {print $2; exit}' || tru
 BOT_DO=0 BOT_KEEP=0 BOT_STALE=0 BOT_SKIP='' BOT_RESULT=''
 if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
 	bot_decide
-	[ "$BOT_ARG" != 0 ] || S_BOT=0   # --no-bot запоминается
+	[ "$BOT_ARG" != 0 ] || bot_decline   # --no-bot запоминается
 	if [ "$BOT_ASK" = 1 ]; then
 		cat > /dev/tty <<'EOF'
 
@@ -2475,7 +2875,7 @@ if [ "$CHECK_ONLY" = 0 ] && [ -z "$WARP_CMD" ]; then
 и несколько админов (приглашение ссылкой).
 Бесплатно, на вашем аккаунте Cloudflare. Нужны домен в Cloudflare и бот от @BotFather.
 EOF
-		if bot_consent "Поставить бота?"; then BOT_DO=1; else S_BOT=0; fi
+		if bot_consent "Поставить бота?"; then BOT_DO=1; else bot_decline; fi
 	fi
 	if [ "$BOT_DO" = 1 ] || { [ "$BOT_KEEP" = 1 ] && [ "$BOT_STALE" = 1 ]; }; then bot_read_tokens; fi
 fi
@@ -2493,10 +2893,35 @@ case $WARP_CMD in
 esac
 
 # --- Общие проверки и мелочи ---
-ufw_active() {  # ufw включён? Вывод — через переменную: «ufw status | grep -q» под pipefail путает «включён» с «выключен»
+ufw_state() {  # → active | inactive | unknown. «Выключен» — только когда ufw сам так ответил: не ответил или ответил
+	# непонятно (сломан, нет iptables) — unknown, и по такому ответу нельзя ни открывать лишнее, ни закрывать.
+	# Ответ — через переменную («ufw status | grep -q» под pipefail путает «включён» с «выключен») и на английском.
 	local s
-	s=$(ufw status 2>/dev/null) || return 1
-	[[ $s == "Status: active"* ]]
+	s=$(LANGUAGE=C LC_ALL=C ufw status 2>/dev/null) || s=
+	case $s in
+		"Status: active"*) echo active ;;
+		"Status: inactive"*) echo inactive ;;
+		*) echo unknown ;;
+	esac
+}
+ufw_allows() {  # ufw_allows ПОРТ [tcp|udp] — в правилах ufw уже есть разрешение (allow или limit) входящих на этот порт по
+	# этому протоколу (не назван — TCP), пусть и только с одного адреса. Правила — из файлов ufw: «ufw status» у правила по имени приложения (OpenSSH) порт
+	# не называет, а в файле он есть всегда. Строка правила (ufw 0.36, проверено на настоящем):
+	#   ### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 in
+	# — действие, протокол, порты («22», «80,443», «6000:6007», «any»), куда, порты источника, откуда, [приложения,] направление.
+	# Файлов нет или они другого вида — «правила нет», и скрипт разрешит порт сам, как делал всегда.
+	# shellcheck disable=SC2086  # файлов два — по словам
+	{ cat $UFW_RULES 2>/dev/null || true; } | awk -v p="$1" -v proto="${2:-tcp}" '
+		$1 == "###" && $2 == "tuple" && $4 ~ /^(allow|limit)/ && ($5 == proto || $5 == "any") {
+			dir = ($NF ~ /^comment=/) ? $(NF - 1) : $NF
+			if (dir != "in" && (dir !~ /^in_/ || dir == "in_lo")) next   # исходящие, пересылка и «только на lo» — не про вход снаружи
+			n = split($6, a, ",")
+			for (i = 1; i <= n; i++) {
+				m = split(a[i], r, ":")
+				if (a[i] == "any" || (m == 1 && r[1] == p) || (m == 2 && p + 0 >= r[1] + 0 && p + 0 <= r[2] + 0)) found = 1
+			}
+		}
+		END { exit !found }'
 }
 in_container() {
 	if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -cq 2>/dev/null; then return 0; fi
@@ -2651,23 +3076,65 @@ detect_ips() {  # LISTEN_IP — адрес на интерфейсе, PUBLIC_IP 
 	fi
 }
 
-root_has_own_key() {  # у root в authorized_keys есть ключ человека; ключ бота («… vpn-bot») не в счёт
+root_has_own_key() {  # у root в authorized_keys есть ключ человека. Не в счёт: ключ бота («… vpn-bot») и ключи с
+	# принудительной командой — такова заглушка облачных образов («Please login as the user ubuntu…»): войти по ней нельзя
 	local f=${1:-/root/.ssh/authorized_keys}
-	[ -f "$f" ] && grep -qvE -e ' vpn-bot$' -e '^[[:space:]]*(#|$)' "$f"
+	[ -f "$f" ] && grep -qvE -e ' vpn-bot$' -e '^[[:space:]]*(#|$)' -e 'command="' "$f"
+}
+ssh_connection() {  # SSH_CONNECTION этого входа («адрес_клиента порт адрес_сервера порт»); пусто — вошли не по SSH.
+	# sudo и «su -» её стирают — тогда она берётся из окружения родительских процессов (оболочки, из которой запущен
+	# sudo). Читать переменную напрямую нельзя: под sudo скрипт не знал бы ни как вошёл человек (--ssh-key-only
+	# выключал пароль тому, кто вошёл по паролю), ни откуда (IPv6, исключения fail2ban), ни через какой порт.
+	local c=${SSH_CONNECTION:-} pid=$$ n=0
+	while [ -z "$c" ] && [ "${pid:-0}" -gt 1 ] && [ "$n" -lt 32 ]; do
+		c=$({ tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^SSH_CONNECTION=//p'; } 2>/dev/null || true)
+		pid=$(awk '$1 == "PPid:" {print $2}' "/proc/$pid/status" 2>/dev/null || true)
+		n=$((n + 1))
+	done
+	echo "${c%%$'\n'*}"
 }
 
 ssh_login_method() {  # как вошли в эту SSH-сессию: publickey | password | keyboard-interactive | пусто (не узнать)
 	local cip cport rest
-	read -r cip cport rest <<<"${SSH_CONNECTION:-}" || true
+	read -r cip cport rest <<<"$(ssh_connection)" || true
 	[ -n "${cport:-}" ] || return 0
 	{ journalctl -q --no-pager -o cat -t sshd -t sshd-session 2>/dev/null || true; cat /var/log/auth.log 2>/dev/null || true; } |
 		{ grep -oE "Accepted [a-z-]+ for [^ ]+ from ${cip//./\\.} port $cport( |\$)" || true; } | tail -1 | awk '{print $2}'
 }
 
-ssh_ports() {  # TCP-порты sshd (обычно 22)
+ssh_conn_port() {  # порт сервера, через который человек вошёл сейчас (из ssh_connection); пусто — вошли не по SSH
+	local c
+	c=$(ssh_connection)
+	echo "${c##* }"
+}
+ssh_socket_ports() {  # порты из ListenStream у ssh.socket / sshd.socket: когда sshd запускает systemd по обращению к порту,
+	# порт задан там (в том числе в drop-in), и sshd -T его не знает. Сокет, который не включён и не работает, — не в счёт.
+	local u
+	for u in ssh.socket sshd.socket; do
+		systemctl -q is-active "$u" 2>/dev/null || systemctl -q is-enabled "$u" 2>/dev/null || continue
+		{ systemctl show -p Listen --value "$u" 2>/dev/null || true; } | sed -n 's/.*:\([0-9][0-9]*\) (Stream)$/\1/p'
+	done
+}
+sshd_listen_ports() {  # порты, которые сам sshd слушает на деле (не только на localhost). Порт, проброшенный сеансом
+	# («ssh -R», X11), тоже слушает процесс sshd — но у него и родитель sshd, а у самого sshd — нет.
+	local port pid ppid
+	{ ss -Htlnp 2>/dev/null || true; } | awk 'match($0, /\("sshd",pid=[0-9]+/) && $4 !~ /^(127\.|\[::1\])/ {
+			n = split($4, a, ":"); print a[n], substr($0, RSTART + 12, RLENGTH - 12) }' |
+		while read -r port pid; do
+			ppid=$(awk '$1 == "PPid:" {print $2}' "/proc/$pid/status" 2>/dev/null || true)
+			[ "$(cat "/proc/${ppid:-0}/comm" 2>/dev/null || true)" = sshd ] || echo "$port"
+		done
+}
+ssh_ports() {  # TCP-порты SSH из всех источников, без повторов; первым — как раньше, порт из sshd -T (обычно 22).
+	# Одного sshd -T мало: порт, через который человек вошёл, может быть задан не в sshd_config, и фаервол его закрыл бы.
 	local p
-	p=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -un | tr '\n' ' ' || true)
-	[ -n "$p" ] || p=${SSH_CONNECTION:+${SSH_CONNECTION##* }}
+	p=$( {
+		sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -un || true
+		ssh_conn_port
+		ssh_socket_ports
+		sshd_listen_ports
+	} | awk '/^[0-9]+$/ && $1 >= 1 && $1 <= 65535 && !seen[$1]++' | tr '\n' ' ')
+	p=${p% }
 	echo "${p:-22}"
 }
 
@@ -2942,6 +3409,17 @@ sub_list() {  # «подпись|subId» включённых клиентов; 
 	sqlite3 -readonly -separator '|' "$DB" "select replace(coalesce(nullif(comment, ''), email), '|', '/'), sub_id from clients where enable=1 and sub_id<>'' order by id;"
 }
 
+check_sub_id() {  # subId клиента, по ссылке которого проверяется туннель: первый включённый клиент своего подключения.
+	# У чужих подключений панели свои клиенты и свои адреса в ссылках — проверка по ним была бы не о том. Своё подключение
+	# неизвестно (настройки прежних версий) или клиентов у него нет — первый включённый клиент панели, как раньше.
+	local sid=""
+	if [[ ${OWN_INBOUND_ID:-} =~ ^[1-9][0-9]*$ ]]; then
+		sid=$(sqlite3 -readonly "$DB" "select c.sub_id from clients c join client_inbounds ci on ci.client_id = c.id where ci.inbound_id = $OWN_INBOUND_ID and c.enable = 1 and c.sub_id <> '' order by c.id limit 1;" 2>/dev/null || true)
+	fi
+	[ -n "$sid" ] || sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;" 2>/dev/null || true)
+	echo "$sid"
+}
+
 sub_fetch() {  # sub_fetch SUBID → строки подписки (ссылки) с сервера подписок
 	local raw
 	if [ "$MODE" = domain ]; then
@@ -3027,7 +3505,7 @@ local_checks() {
 			fi
 		fi
 	fi
-	sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;" 2>/dev/null || true)
+	sid=$(check_sub_id)
 	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" = 1 ] && [ -n "$sid" ]; then
 		# Как приложение: по адресу IP, с проверкой сертификата.
 		code=$(curl -s $IPK -o /dev/null -w '%{http_code}' --max-time 15 --connect-to "$PUBLIC_IP:$SUB_PORT:$LISTEN_IP:$SUB_PORT" "https://$PUBLIC_IP:$SUB_PORT$SUB_PATH$sid" || true)
@@ -3056,14 +3534,65 @@ local_checks() {
 	fi
 }
 
+db_ok() {  # db_ok ФАЙЛ — это целая база SQLite? (открывается на запись: заодно дочитывает журнал -wal, если копия с ним)
+	[ -s "$1" ] || return 1
+	[ "$(sqlite3 "$1" 'pragma integrity_check;' 2>/dev/null || true)" = ok ] ||
+		python3 -I -c 'import sqlite3, sys
+sys.exit(0 if sqlite3.connect(sys.argv[1]).execute("pragma integrity_check").fetchone()[0] == "ok" else 1)' "$1" 2>/dev/null
+}
+db_copy() {  # db_copy БАЗА КОПИЯ — согласованная копия базы, в которую прямо сейчас может писать x-ui; 1 — копии нет
+	# 3x-ui держит базу в режиме WAL: свежие изменения лежат в x-ui.db-wal, и «cp x-ui.db» их не захватывает — у недавно
+	# запущенной панели в самом x-ui.db нет ещё ничего. Поэтому копия — средствами SQLite (sqlite3, нет его — python3),
+	# и только если не вышло — cp вместе с журналом. Каждая попытка проверяется: копия должна быть целой базой.
+	local src=$1 dst=$2 how
+	[ -f "$src" ] || return 1   # sqlite3 несуществующую базу молча создал бы пустой — и «скопировал»
+	for how in sqlite3 python3 cp; do
+		rm -f "$dst" "$dst-wal" "$dst-shm" "$dst-journal"
+		case $how in
+			sqlite3) sqlite3 "$src" ".backup '$dst'" >/dev/null 2>&1 || continue ;;
+			python3)
+				python3 -I -c 'import sqlite3, sys
+src = sqlite3.connect(sys.argv[1])
+dst = sqlite3.connect(sys.argv[2])
+src.backup(dst)
+dst.close()' "$src" "$dst" 2>/dev/null || continue ;;
+			cp)
+				cp -a "$src" "$dst" 2>/dev/null || continue
+				[ ! -f "$src-wal" ] || cp -a "$src-wal" "$dst-wal" 2>/dev/null || true ;;
+		esac
+		if db_ok "$dst"; then
+			chmod --reference="$src" "$dst" 2>/dev/null || true
+			return 0
+		fi
+	done
+	rm -f "$dst" "$dst-wal" "$dst-shm" "$dst-journal"
+	return 1
+}
+foreign_db_copy() {  # копия базы чужого 3x-ui рядом с ней. Панель ещё работает и пишет в базу; другой копии не будет —
+	# не получилась эта, дальше не идём.
+	db_copy "$DB" "$DB.before-install-$(date +%Y%m%d-%H%M%S)" ||
+		die "не получилась копия базы прежнего 3x-ui ($DB), а другой копии не будет — 3x-ui и его базу не трогаю. Проверьте базу (sqlite3 $DB 'pragma integrity_check;') и запустите скрипт ещё раз"
+	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
+}
 xui_stop() {  # остановить x-ui на время правки базы; вотчдог цепочки — тоже, чтобы не перезапустил x-ui посреди правки
+	local first=0 snap=$WORK/db.before
+	[ "$XUI_TOUCHED" != 0 ] || first=1
+	# Отметка «x-ui трогали» — раньше самой остановки: сигнал (Ctrl-C, обрыв SSH), пришедший во время остановки, bash
+	# обрабатывает сразу после неё, и on_exit уже должен знать, что x-ui надо запустить снова.
+	XUI_TOUCHED=1
 	systemctl stop vpn-exit-watchdog 2>/dev/null || true
 	systemctl stop x-ui 2>/dev/null || true
 	# Первая остановка работавшего VPN — снимок базы: оборвётся установка — база вернётся как была до запуска.
-	if [ "$XUI_TOUCHED" = 0 ] && [ "$XUI_WAS_ACTIVE" = 1 ] && [ -f "$DB" ]; then
-		sqlite3 "$DB" ".backup '$WORK/db.before'" 2>/dev/null || cp -a "$DB" "$WORK/db.before" 2>/dev/null || true
+	# (Пока снимка нет, база ещё не менялась: возвращать нечего, on_exit только запустит x-ui.)
+	# Своё имя снимок получает, только когда записан целиком: обрыв SSH убивает и sqlite3 (сигнал получает вся группа
+	# процессов), и on_exit вернул бы в базу панели обрывок снимка — а она к этому моменту ещё не менялась.
+	if [ "$first" = 1 ] && [ "$XUI_WAS_ACTIVE" = 1 ] && [ -f "$DB" ]; then
+		rm -f "$snap.part"
+		if { sqlite3 "$DB" ".backup '$snap.part'" 2>/dev/null && [ -s "$snap.part" ]; } ||
+			{ cp -a "$DB" "$snap.part" 2>/dev/null && [ -s "$snap.part" ]; }; then
+			mv -f "$snap.part" "$snap" 2>/dev/null || true
+		fi
 	fi
-	XUI_TOUCHED=1
 }
 xui_set() {  # xui_set КЛЮЧ=ЗНАЧЕНИЕ… — строки таблицы settings (x-ui должен быть остановлен)
 	python3 - "$DB" "$@" <<'PY'
@@ -3151,6 +3680,7 @@ S_DO_F2B='${DO_F2B:-1}'
 S_TZ='${TZ_NAME:-}'
 S_DONE='${S_DONE:-0}'
 S_REALITY_PORT='$REALITY_PORT'
+S_INBOUND_ID='${S_INBOUND_ID:-}'
 CHAIN_IP='${CHAIN_IP:-}'
 CHAIN_PORT='${CHAIN_PORT:-}'
 CHAIN_UUID='${CHAIN_UUID:-}'
@@ -3428,6 +3958,7 @@ case $STAGE in */.vpn-exit-stage) trap 'rm -rf "$STAGE"' EXIT ;; esac
 . "$STAGE/exit.env"
 [ "$(id -u)" = 0 ] || { echo "EXIT_RESULT=FAIL настройка старого сервера запущена не от root"; exit 1; }
 export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive
+unset LANGUAGE   # sudo её сохраняет, а ufw (Python) переводит по ней ответы даже при LC_ALL=C
 command -v apt-get >/dev/null || { echo "EXIT_RESULT=FAIL нужен Ubuntu/Debian на старом сервере"; exit 1; }
 case $(uname -m) in
 	x86_64 | amd64) A=amd64; SHA=$XUI_SHA_AMD64 ;;
@@ -3542,8 +4073,8 @@ if [ "$ok" != 1 ]; then
 fi
 rm -f "$DIR/config.bak.json"
 # Фаервол: если ufw активен — пустить новый сервер на порт цепочки (ssh не трогаем). Неактивный ufw не включаем, чтобы не запереть.
-# Состояние ufw — через переменную: «ufw status | grep -q» под pipefail путает «включён» с «выключен».
-UFW_STATUS=$(command -v ufw >/dev/null && ufw status 2>/dev/null || true)
+# Ответ ufw — в переменную и на английском: по нему видно «включён», «выключен» и «понять не удалось» (ufw не ответил).
+UFW_STATUS=$(command -v ufw >/dev/null && LANGUAGE=C LC_ALL=C ufw status 2>/dev/null || true)
 if [[ $UFW_STATUS == "Status: active"* ]]; then
 	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
 	echo "EXIT_UFW=restricted"
@@ -3558,6 +4089,11 @@ elif command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -qE 
 		iptables-save > /etc/iptables/rules.v4 2>/dev/null && saved=1
 	fi
 	if [ -n "$saved" ]; then echo "EXIT_UFW=iptables"; else echo "EXIT_UFW=iptables-unsaved"; fi
+elif command -v ufw >/dev/null && [[ $UFW_STATUS != "Status: inactive"* ]]; then
+	# ufw есть, а включён ли он — понять не удалось: правило новому серверу добавляем (больше оно никому ничего не
+	# открывает), ufw не включаем и «порт открыт всем» не говорим.
+	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
+	echo "EXIT_UFW=unknown"
 else
 	echo "EXIT_UFW=open"
 fi
@@ -3861,6 +4397,7 @@ setup_chain_exit_try() {
 	is_host "$CHAIN_SNI" || { CHAIN_ERR="старый сервер не выбрал сайт для маскировки"; return 1; }
 	case $(sed -n 's/^EXIT_UFW=//p' <<<"$out" | tail -1) in
 		open) warn "на старом сервере ufw выключен — порт $CHAIN_PORT открыт всем; включи там ufw и оставь доступ только новому серверу" ;;
+		unknown) warn "на старом сервере не удалось понять, включён ли ufw («ufw status» не ответил): правило для нового сервера на порт $CHAIN_PORT добавлено, но работает ли там фаервол — проверь сам: ufw status" ;;
 		iptables) ok "на старом сервере фаервол iptables (как у Oracle): порт $CHAIN_PORT открыт новому серверу, правило сохранено" ;;
 		iptables-unsaved) warn "на старом сервере фаервол iptables: порт $CHAIN_PORT открыт новому серверу, но правило не переживёт перезагрузку — поставь там iptables-persistent" ;;
 	esac
@@ -3971,9 +4508,20 @@ acme_cron() {  # строка cron acme.sh: acme_cron 1 — раз в сутки
 	rm -f /root/.crontab.new
 }
 
+ip_cert_port80() {  # перед выпуском сертификата на IP: Let's Encrypt приходит на порт 80 — во включённом ufw он должен быть разрешён.
+	# → OPENED80=1, если правило добавил скрипт (сертификат не выдадут — он же его и уберёт)
+	OPENED80=0
+	[ "$(ufw_state)" = active ] || return 0
+	! ufw_allows 80 tcp || return 0   # разрешён — пусть и не отдельным правилом «80/tcp» (80,443/tcp, профиль приложения)
+	if [ "$DO_UFW" != 1 ]; then   # --no-ufw: фаервол скрипт не трогает — и здесь тоже. Сказать, чтобы открыли сами
+		warn "ufw включён, а порт 80 в нём не разрешён: по нему Let's Encrypt проверяет сервер, без него сертификат на IP не выдадут и не продлят. Фаервол скрипт не трогает (--no-ufw) — откройте порт сами: ufw allow 80/tcp"
+		return 0
+	fi
+	if ufw allow 80/tcp >/dev/null 2>&1; then OPENED80=1; fi
+}
 issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCERT_DIR; ошибка → IPCERT_ERR
 	IPCERT_ERR=
-	local rc=0 ca=letsencrypt log=$WORK/acme-ip.log opened80=0 have
+	local rc=0 ca=letsencrypt log=$WORK/acme-ip.log have
 	[ "$ACME_STAGING" = 1 ] && ca=letsencrypt_test
 	"${APT[@]}" install socat >/dev/null 2>&1 || { IPCERT_ERR="не установился socat (им acme.sh отвечает Let's Encrypt на :80)"; return 1; }
 	ensure_acme || { IPCERT_ERR="не скачался или не установился acme.sh $ACME_TAG"; return 1; }
@@ -3993,9 +4541,7 @@ issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCER
 		fi
 	fi
 	[ -z "$(port_users 80)" ] || { IPCERT_ERR="порт 80 занят ($(port_users 80)) — Let's Encrypt не сможет проверить сервер"; return 1; }
-	if ufw_active && ! grep -qE '^80/tcp +ALLOW' <<<"$(ufw status 2>/dev/null || true)"; then
-		ufw allow 80/tcp >/dev/null 2>&1 && opened80=1
-	fi
+	ip_cert_port80
 	# Let's Encrypt проверяет сервер по http://IP/ — на время проверки acme.sh сам слушает :80 (socat).
 	# Сертификат на IP бывает только коротким (профиль shortlived, ~160 ч): продление через 2–3 дня.
 	"$ACME" --issue -d "$PUBLIC_IP" --standalone --httpport 80 --server "$ca" --cert-profile shortlived --days 3 \
@@ -4005,7 +4551,7 @@ issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCER
 		2) ok "сертификат на IP $PUBLIC_IP уже есть, продлевать рано" ;;
 		*)
 			IPCERT_ERR=$(grep -vE '^\s*$' "$log" | tail -3 | sed -E 's/^\[[^]]*\] //' | tr '\n' ' ' | cut -c1-320)
-			[ "$opened80" = 0 ] || ufw delete allow 80/tcp >/dev/null 2>&1 || true
+			[ "$OPENED80" = 0 ] || ufw delete allow 80/tcp >/dev/null 2>&1 || true
 			return 1
 			;;
 	esac
@@ -4091,12 +4637,20 @@ WD_WAS_ACTIVE=0; systemctl is-active -q vpn-exit-watchdog 2>/dev/null && WD_WAS_
 XUI_TOUCHED=0
 on_exit() {
 	local rc=$?
+	# Откат — до конца, что бы ни случилось: повторный сигнал (второй Ctrl-C) его не прерывает; сообщение, которое некуда
+	# напечатать (терминал пропал, tee уже нет — SIGPIPE), тоже: под set -e первый же неудавшийся printf оборвал бы ловушку
+	# между «x-ui остановлен» и «x-ui запущен».
+	trap '' INT HUP TERM PIPE
+	set +e
 	[ -z "${TOKEN_ID:-}" ] || sqlite3 "$DB" "delete from api_tokens where id=$TOKEN_ID;" 2>/dev/null || true
 	if [ "$rc" != 0 ] && [ "$XUI_TOUCHED" = 1 ] && [ "${INSTALL_DONE:-0}" != 1 ]; then
 		if [ "$XUI_WAS_ACTIVE" = 1 ]; then
 			systemctl stop x-ui >/dev/null 2>&1 || true
 			if [ -s "$WORK/db.before" ] && cp -f "$WORK/db.before" "$DB"; then
 				rm -f "$DB-wal" "$DB-shm"
+				# Своё подключение создано в этом запуске и исчезло вместе с возвращённой базой: его номер в настройках
+				# больше ничей — под ним окажется подключение, которое хозяин панели создаст следующим. Номер — «ещё не создано».
+				if [ "${OWN_CREATED:-0}" = 1 ] && [ -f "$STATE" ]; then sed -i "s/^S_INBOUND_ID='[^']*'\$/S_INBOUND_ID='0'/" "$STATE" 2>/dev/null; fi
 				printf '  база 3x-ui возвращена такой, как была до запуска\n' >&2
 			fi
 			{ systemctl start x-ui >/dev/null 2>&1 && printf '  x-ui запущен снова — VPN работает, как до запуска скрипта\n' >&2; } || true
@@ -4107,6 +4661,14 @@ on_exit() {
 	[ -z "${BOT_DIR:-}" ] || rm -rf "$BOT_DIR"   # каталог токенов с вопросов (вне $WORK)
 }
 trap on_exit EXIT
+# Сигнал — тоже обрыв: Ctrl-C, пропавший терминал (обрыв SSH), kill. Без этих ловушек bash запускает on_exit с кодом
+# последней завершившейся команды, то есть 0, — и ни база не возвращается, ни x-ui не запускается заново. Подействует
+# сигнал, когда закончится текущая внешняя команда (она получает его от терминала сама и обычно завершается сразу).
+# SIGPIPE — когда выводить стало некуда (tee, через который идёт весь вывод, убит): такой же обрыв.
+trap 'trap "" INT HUP TERM; exit 130' INT
+trap 'trap "" INT HUP TERM; exit 129' HUP
+trap 'trap "" INT HUP TERM; exit 143' TERM
+trap 'trap "" INT HUP TERM; exit 141' PIPE
 
 # --- Только проверка ---
 if [ "$CHECK_ONLY" = 1 ]; then
@@ -4166,7 +4728,7 @@ if [ -n "$WARP_CMD" ]; then
 	apply_exit "$TARGET_EXIT" "$WARP_FILE" || warn "x-ui долго поднимается после смены выхода"
 	# Настоящий туннель по ссылке первого клиента: на проверочном адресе (не российском) WARP должен
 	# включиться только в режиме on.
-	sid=$(sqlite3 -readonly "$DB" "select sub_id from clients where enable=1 and sub_id<>'' order by id limit 1;")
+	sid=$(check_sub_id)
 	link=$(sub_fetch "$sid" | grep -m1 '^vless://' || true)
 	read -r code exit_ip exit_warp log <<<"$(tunnel_check "$link")"
 	want_warp=off
@@ -4190,7 +4752,11 @@ if [ -n "$WARP_CMD" ]; then
 fi
 
 touch "$LOG" && chmod 600 "$LOG"
-exec > >(tee -a "$LOG") 2>&1
+# tee сигналы не слушает: от терминала их получает вся группа процессов, и без этого он умирал бы раньше, чем скрипт
+# допишет, что вернул при обрыве, — в журнал это не попадало, а на экран тем более. Кончится tee сам — вместе со скриптом.
+# -p: пропал тот, кто читает вывод (запуск без терминала — «ssh сервер 'bash install-vpn.sh …'», бот, — и связь оборвалась), —
+# tee пишет журнал дальше, а не умирает на первой же строке, утягивая за собой скрипт посреди установки.
+exec > >(trap '' INT HUP TERM; exec tee -p -a "$LOG") 2>&1
 START=$(date +%s)
 if [ "$MODE" = domain ]; then
 	printf '\033[1mУстановка VPN на %s (3x-ui %s, Xray %s, выход: %s)\033[0m\n' "$DOMAIN" "$XUI_VERSION" "$XRAY_VERSION" "$EXIT_MODE"
@@ -4213,6 +4779,8 @@ for try in 1 2 3 4 5 6; do
 	sleep 20
 done
 "${APT[@]}" install iproute2 curl ca-certificates python3 >/dev/null || die "не установились iproute2, curl, python3"
+own_inbound_late
+port_taken_check   # сначала — подключения панели: про них можно сказать точнее, чем «порт занят: xray»
 if [ "$MODE" = domain ]; then
 	for p in 80 443; do
 		u=$(port_users "$p")
@@ -4262,9 +4830,10 @@ if [ -f "$STATE" ]; then
 	. "$STATE"
 	ok "найдены настройки прошлой установки ($STATE): ключи, пароли и клиенты остаются прежними"
 elif [ "$FOREIGN_XUI" = 1 ]; then   # чужой 3x-ui (согласие — в самом начале, foreign_xui_check): копия базы до первых изменений
-	cp -a "$DB" "$DB.before-install-$(date +%Y%m%d-%H%M%S)"
-	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
+	foreign_db_copy
 fi
+bot_keep_decision   # «нет» и --no-bot сказаны раньше, чем прочитаны прошлые настройки, — они главнее прочитанного
+own_to_settings     # номер и ключи своего подключения — нынешние, а не просто прочитанные из настроек
 : "${PANEL_USER:=$(rnd "$LOWER$DIGITS" 10)}"
 : "${PANEL_PASS:=$(rnd "$LOWER${LOWER^^}$DIGITS" 22)}"
 : "${WEB_PORT:=$(free_port)}"
@@ -4661,16 +5230,7 @@ MOVED_FROM=
 if [ -n "$OLD_REALITY_PORT" ] && [ "$OLD_REALITY_PORT" != "$REALITY_PORT" ]; then
 	[ -z "$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")" ] ||
 		die "на порту $REALITY_PORT в панели уже есть другое подключение — выберите другой --port"
-	# Имя подключения 3x-ui содержит порт (in-2083-tcp, в старых версиях inbound-2083) — заменить в нём номер.
-	python3 - "$DB" "$OLD_REALITY_PORT" "$REALITY_PORT" <<'PY' || die "не удалось перенести подключение на порт $REALITY_PORT"
-import re, sqlite3, sys
-path, old, new = sys.argv[1:4]
-db = sqlite3.connect(path)
-for iid, tag in db.execute("select id, tag from inbounds where port=?", (int(old),)).fetchall():
-    newtag = re.sub(r"(?<![0-9])%s(?![0-9])" % re.escape(old), new, tag or "") or "in-%s-tcp" % new
-    db.execute("update inbounds set port=?, listen='0.0.0.0', tag=? where id=?", (int(new), newtag, iid))
-db.commit()
-PY
+	inbound_move "$OWN_INBOUND_ID" "$OLD_REALITY_PORT" "$REALITY_PORT" || die "не удалось перенести подключение на порт $REALITY_PORT"
 	MOVED_FROM=$OLD_REALITY_PORT
 	ok "подключение перенесено с :$OLD_REALITY_PORT на :$REALITY_PORT (ключи и клиенты те же)"
 	if [ "$MODE" = domain ]; then
@@ -4738,9 +5298,9 @@ wait_port ":$WEB_PORT" 40 || die "панель x-ui не поднялась на
 
 # API панели — по одноразовому токену, после настройки токен удаляется.
 api_open
-INBOUND_ID=$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")
-if [ -n "$INBOUND_ID" ]; then
-	ok "подключение на :$REALITY_PORT уже есть (#$INBOUND_ID), клиенты прежние"
+port_taken_check   # ещё раз, перед самим созданием: панель уже работает, и база с начала запуска могла измениться
+if [ -n "$OWN_INBOUND_ID" ]; then
+	ok "подключение на :$REALITY_PORT уже есть (#$OWN_INBOUND_ID), клиенты прежние"
 else
 	if [ "$MODE" = domain ]; then TARGET=127.0.0.1:8443; SNI=$DOMAIN; else TARGET=$REALITY_SNI:443; SNI=$REALITY_SNI; fi
 	python3 - "$WORK/inbound.json" "$SNI" "$TARGET" "$SHARE_ADDR" "$REALITY_PORT" "$CLIENTS" "$REALITY_PRIV" "$REALITY_PUB" "$SHORT_IDS" <<'PY'
@@ -4771,13 +5331,19 @@ json.dump({"up": 0, "down": 0, "total": 0, "remark": "", "enable": True, "expiry
 PY
 	RESP=$(api POST inbounds/add -H 'Content-Type: application/json' --data-binary @"$WORK/inbound.json")
 	api_ok <<<"$RESP" || die "панель не приняла подключение: $RESP"
-	INBOUND_ID=$(sqlite3 "$DB" "select id from inbounds where port=$REALITY_PORT limit 1;")
+	# Созданное подключение — то, в котором ключ из настроек: его номер и записывается, а не «того, что стоит на порту».
+	find_own_inbound
+	[ -n "$OWN_INBOUND_ID" ] || die "панель приняла подключение, но в её базе его не видно — запустите скрипт ещё раз"
+	OWN_CREATED=1   # для on_exit: оборвётся запуск и вернётся прежняя база — этот номер из настроек надо убрать
 	if [ "$MODE" = domain ]; then
 		ok "подключение VLESS + XHTTP + Reality на :$REALITY_PORT, клиентов: $CLIENTS"
 	else
 		ok "подключение VLESS + XHTTP + Reality на :$REALITY_PORT под $REALITY_SNI, клиентов: $CLIENTS"
 	fi
 fi
+# Номер своего подключения — в настройки сразу, пока запуск не оборвался.
+S_INBOUND_ID=$OWN_INBOUND_ID
+save_state
 
 if [ "$EXIT_MODE" != direct ] && [ "$HAVE_WARP" = 0 ]; then
 	if warp_register "$WORK/warp.json"; then
@@ -4872,7 +5438,7 @@ detect_other_vpn
 
 say "Ядро, swap, часовой пояс"
 # IPv6 выключается (клиенты и Let's Encrypt — по IPv4). Зашли на сервер по IPv6 — не трогать: вход оборвался бы.
-SSH_FROM=${SSH_CONNECTION:-}; SSH_FROM=${SSH_FROM%% *}
+SSH_FROM=$(ssh_connection); SSH_FROM=${SSH_FROM%% *}
 V6_OFF=1
 case $SSH_FROM in ::ffff:*) ;; *:*) V6_OFF=0 ;; esac
 {
@@ -4941,6 +5507,7 @@ EOF
 fi
 SSH_PORTS=$(ssh_ports)
 SSH_PORT=${SSH_PORTS%% *}
+SSH_NOW_PORT=$(ssh_conn_port)   # порт, через который вошли сейчас (пусто — не по SSH): фаервол его без разрешения не оставит
 SSH_LOGIN=root   # под кем входить в инструкциях: зашли через sudo (AWS, Oracle — ubuntu) — под тем же пользователем
 if [[ ${SUDO_USER:-} =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] && [ "$SUDO_USER" != root ]; then SSH_LOGIN=$SUDO_USER; fi
 
@@ -4952,7 +5519,7 @@ elif ! command -v sshd >/dev/null; then
 elif ! "${APT[@]}" install fail2ban python3-systemd >/dev/null; then
 	bad "fail2ban не установился"
 else
-	CLIENT_IP=${SSH_CONNECTION:-}   # пусто, если зашли не по SSH или через sudo -i (sudo её сбрасывает)
+	CLIENT_IP=$(ssh_connection)   # пусто, если зашли не по SSH
 	CLIENT_IP=${CLIENT_IP%% *}
 	[[ $CLIENT_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || CLIENT_IP=
 	mkdir -p /etc/fail2ban/jail.d
@@ -4986,75 +5553,105 @@ else
 	fi
 fi
 
-xui_inbound_ports() {  # «порт/протокол» включённых подключений панели, которые слушают не только localhost
-	[ -f "$DB" ] || return 0
-	python3 -I - "$DB" <<'PY' 2>/dev/null || true
-import json, sqlite3, sys
-db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-out = set()
-for port, listen, proto, settings, stream, enable in db.execute(
-        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
-    listen = (listen or "").strip()
-    if not enable or not port or listen.startswith(("127.", "/", "@")) or listen in ("::1", "[::1]", "localhost"):
-        continue
-    try:
-        st = json.loads(settings or "{}")
-    except ValueError:
-        st = {}
-    try:
-        ss = json.loads(stream or "{}")
-    except ValueError:
-        ss = {}
-    proto = (proto or "").lower()
-    net = str(ss.get("network") or "tcp").lower()
-    alpn = (ss.get("tlsSettings") or {}).get("alpn") or []
-    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
-        kinds = {"udp"}
-    elif net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
-        kinds = {"tcp", "udp"}
-    elif proto in ("shadowsocks", "dokodemo-door", "tunnel"):
-        n = str(st.get("network") or "tcp").lower()
-        kinds = {k for k in ("tcp", "udp") if k in n} or {"tcp"}
-    elif proto in ("mixed", "socks"):
-        kinds = {"tcp", "udp"} if st.get("udp") else {"tcp"}
-    else:
-        kinds = {"tcp"}
-    out.update((int(port), k) for k in kinds)
-for port, kind in sorted(out):
-    print("%d/%s" % (port, kind))
-PY
+listens_outside() {  # listens_outside ПОРТ — на этом TCP-порту кто-то слушает не только на localhost
+	{ ss -Htln 2>/dev/null || true; } | awk -v p="$1" '
+		{ n = split($4, a, ":") }
+		a[n] == p && $4 !~ /^(127\.|\[::1\])/ { found = 1 }
+		END { exit !found }'
 }
-fw_kept_ports() {  # фаервол ещё выключен — подключения панели снаружи доступны; их порты включённый ufw не должен закрыть
-	! ufw_active || return 0   # уже включён — его правила остаются как есть
-	xui_inbound_ports
+fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в ufw; 1 — не тронуто: на этом порту работает подключение панели или
+	# снаружи слушает кто-то ещё (сайт хозяина сервера на :80) — скрипту порт не нужен, но и закрывать его не ему
+	case " $FW_INBOUND " in *" ${1%/*}/"*) return 1 ;; esac
+	! listens_outside "${1%/*}" || return 1
+	ufw delete allow "$1" >/dev/null 2>&1 || true
 }
-say "Фаервол ufw"
-if [ "$DO_UFW" = 1 ]; then
-	KEEP=$(fw_kept_ports)
+fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить
+	local KEEP="" OPEN KEPT CLOSING p pp state inb inb_ok=1 lost="" lost_ssh="" as_is="" ssh_ok="" ssh_left="" vpn_as_is="" vpn_opened="" opened=""
+	# Состояние ufw спрашивается один раз на весь шаг: от ответа зависит и что открывать, и можно ли включать. Два вопроса
+	# могли получить два разных ответа — и ufw включался без разрешений, которые по первому ответу были нужны.
+	state=$(ufw_state)
+	# Порты включённых подключений панели, слушающих не только localhost. Скрипт их не закрывает никогда, был ufw включён
+	# или нет: ни удалением разрешения (fw_close), ни включением ufw, в котором для них нет разрешения.
+	inb=$(xui_inbound_ports) || inb_ok=0   # база есть, а прочитать её не вышло — на каких портах подключения, неизвестно
+	FW_INBOUND=${inb//$'\n'/ }
+	# ufw выключен (сам так ответил) — подключения панели сейчас доступны снаружи, и включённый ufw не должен их закрыть.
+	# Включён — его правила остаются как есть; состояние не понять — лишнего не открываем.
+	[ "$state" != inactive ] || KEEP=$FW_INBOUND
+	# SSH. Когда ufw включает скрипт, разрешение для всех портов SSH обязательно. Когда ufw уже включён (или его состояние
+	# не понять), главнее правила хозяина сервера:
+	# — у порта есть разрешающее правило, пусть только с адреса админа, — общее не добавляется: оно открыло бы SSH всем,
+	#   кому админ его закрыл. Нынешний вход от этого не страдает: его пускают правила, которые есть;
+	# — у порта правила нет (или стоит deny), а вход по SSH разрешён через другой порт — порт остаётся как есть: общее
+	#   разрешение отменило бы и явный deny. Кроме порта, через который вошли сейчас: он без разрешения не остаётся;
+	# — разрешающего правила нет ни у одного порта SSH — разрешаются все, как раньше.
+	if [ "$state" != inactive ]; then
+		for p in $SSH_PORTS; do ! ufw_allows "$p" tcp || ssh_ok="$ssh_ok $p"; done
+		for p in $SSH_PORTS; do
+			if [[ " $ssh_ok " == *" $p "* ]]; then
+				as_is="$as_is $p/tcp"
+			elif [ -n "$ssh_ok" ] && [ "$p" != "${SSH_NOW_PORT:-}" ]; then
+				as_is="$as_is $p/tcp" ssh_left="$ssh_left $p"
+			fi
+		done
+		# Порт соседнего VPN, у которого разрешающее правило уже есть (пусть только с одной подсети), — тоже как есть.
+		for pp in $OTHER_VPN_PORTS; do
+			! ufw_allows "${pp%/*}" "${pp#*/}" || as_is="$as_is $pp" vpn_as_is="$vpn_as_is $pp"
+		done
+	fi
 	OPEN=$( {
-		for p in $SSH_PORTS; do echo "$p/tcp"; done
-		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
+		for p in $SSH_PORTS; do echo "$p/tcp"; done   # среди них и порт нынешнего входа (ssh_ports)
 		if [ "$MODE" = domain ]; then echo 80/tcp; echo 443/tcp; fi
 		if [ "$PANEL_PUBLIC" = 1 ]; then echo "$WEB_PORT/tcp"; fi
 		if [ "${SUB_TLS:-0}" = 1 ]; then echo 80/tcp; echo "$SUB_PORT/tcp"; fi   # :80 — продление сертификата на IP
 		echo "$REALITY_PORT/tcp"
 		for pp in $OTHER_VPN_PORTS $KEEP; do echo "$pp"; done
 	} | sort -u | sort -t/ -k1,1n -k2,2)
-	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
-	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || printf '%s ' "$pp"; done)
+	for p in $OPEN; do
+		case " $as_is " in *" $p "*) continue ;; esac
+		if ufw allow "$p" >/dev/null; then opened="$opened $p"; continue; fi
+		bad "ufw allow $p не прошёл"
+		case " $KEEP $OTHER_VPN_PORTS " in *" $p "*) lost="$lost $p" ;; esac   # то, что работает сейчас и чего включённый ufw не должен закрыть
+		for pp in $SSH_PORTS; do [ "$pp/tcp" != "$p" ] || lost_ssh="$lost_ssh $pp"; done
+	done
+	if [ -n "$ssh_ok" ]; then
+		p=${ssh_ok# }
+		ok "SSH :${p// /,} уже разрешён правилами ufw — их не менял"
+	fi
+	if [ -n "$ssh_left" ]; then
+		p=${ssh_left# }
+		ok "SSH :${p// /,} в ufw не разрешён, а вход по SSH разрешён через другой порт — оставил как есть (нужен и этот: ufw allow ПОРТ/tcp)"
+	fi
+	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || [[ " $lost " == *" $pp "* ]] || printf '%s ' "$pp"; done)
 	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
-	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ]; then
-		ufw delete allow "$MOVED_FROM/tcp" >/dev/null 2>&1 || true
-		ok "старый порт подключения $MOVED_FROM закрыт в ufw"
+	# «Открыл» — только про то, что действительно открыл скрипт: не про несостоявшийся «ufw allow» и не про оставленное правило.
+	vpn_opened=$(for pp in $OTHER_VPN_PORTS; do [[ " $opened " != *" $pp "* ]] || printf '%s ' "$pp"; done)
+	[ -z "$vpn_opened" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw (${vpn_opened% }), чтобы фаервол его не отрубил"
+	[ -z "$vpn_as_is" ] || ok "рядом работает ${OTHER_VPN:-другой VPN}: его порты (${vpn_as_is# }) уже разрешены правилами ufw — их не менял"
+	if [ "$state" = unknown ]; then
+		# Включён ufw или нет — неизвестно: включение закрыло бы порты, о которых скрипт не знает, а убирать правила вслепую нельзя.
+		bad "состояние ufw понять не удалось («ufw status» не ответил ни «active», ни «inactive») — включать его и убирать в нём правила не стал${opened:+; разрешения добавил:$opened}. Проверьте: ufw status"
+		return 0
 	fi
-	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
-	# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
-	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
-		for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || ufw delete allow "$p" >/dev/null 2>&1 || true; done
+	if [ "$state" = inactive ] && { [ -n "$lost_ssh$lost" ] || [ "$inb_ok" = 0 ]; }; then
+		[ -z "$lost_ssh" ] || bad "ufw не включал: не удалось разрешить в нём порт SSH$lost_ssh — с включённым фаерволом вы остались бы без входа на сервер. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
+		[ -z "$lost" ] || bad "ufw не включал: не удалось разрешить в нём$lost, а включённый фаервол закрыл бы то, что работает на этих портах сейчас (подключения панели, соседний VPN). Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
+		[ "$inb_ok" = 1 ] || bad "ufw не включал: базу панели ($DB) прочитать не удалось, и на каких портах её подключения — неизвестно; включённый фаервол мог бы их закрыть. Запустите скрипт ещё раз"
+		return 0
 	fi
-	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
-	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
-	if ! ufw_active; then
+	if [ "$inb_ok" = 0 ]; then   # ufw включён: нужное разрешено, а убирать правила, не зная портов подключений, нельзя
+		warn "базу панели ($DB) прочитать не удалось — лишние правила ufw не убирал: на каких портах её подключения, неизвестно"
+	else
+		if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ] && fw_close "$MOVED_FROM/tcp"; then
+			ok "старый порт подключения $MOVED_FROM закрыт в ufw"
+		fi
+		# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
+		if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
+			for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || fw_close "$p" || true; done
+		fi
+		# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
+		if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then fw_close "$WEB_PORT/tcp" || true; fi
+	fi
+	if [ "$state" = inactive ]; then
 		# Что ещё слушает снаружи, фаервол закроет — назвать, чтобы чужая служба не пропала молча.
 		CLOSING=$(ss -Htuln 2>/dev/null | awk '{print $1, $5}' | while read -r proto addr; do
 			case $addr in 127.* | "[::1]"* | *%lo:*) continue ;; esac
@@ -5064,7 +5661,21 @@ if [ "$DO_UFW" = 1 ]; then
 		done | sort -u | { grep -vxF -f <(printf '%s\n' 68/udp 546/udp $OPEN) || true; } | sort -t/ -k1,1n | tr '\n' ' ')
 		[ -z "$CLOSING" ] || warn "фаервол закроет и порты, которые сейчас слушает этот сервер: ${CLOSING}— если там нужная служба, откройте: ufw allow ПОРТ/tcp (или /udp)"
 	fi
-	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился (ufw status)"; fi
+	if ufw --force enable >/dev/null 2>&1; then
+		ok "включён, открыто: $(echo $opened)"
+	elif [ "$state" != inactive ]; then
+		bad "ufw не включился (ufw status)"   # он был включён и до запуска: выключать его — не скрипту
+	elif ufw --force disable >/dev/null 2>&1; then
+		# После неудачного включения ufw оставляет политику «всё закрыто», а правила мог и не загрузить — вплоть до правила
+		# для SSH (проверено на настоящем ufw 0.36.1). До запуска он был выключен — вернуть как было.
+		bad "ufw не включился — вернул его в выключенное состояние, как было до запуска (после неудачного включения он оставляет «всё закрыто», иногда и для SSH). Сервер сейчас без фаервола; что мешает включению, покажет: ufw enable"
+	else
+		bad "ufw не включился, и выключить его обратно не удалось — проверьте, что вход по SSH работает (в новом окне, не закрывая это), и разберитесь с ufw: ufw status, ufw disable"
+	fi
+}
+say "Фаервол ufw"
+if [ "$DO_UFW" = 1 ]; then
+	fw_step
 else
 	warn "фаервол не трогали (--no-ufw)"
 fi
@@ -5353,28 +5964,67 @@ port_users() {  # имена процессов, слушающих TCP-порт
 	{ ss -Htlnp "sport = :$1" 2>/dev/null || true; } | { grep -o 'users:(("[^"]*"' || true; } | cut -d'"' -f2 | sort -u | tr '\n' ' '
 }
 
+sshd_listen_ports() {  # порты, которые сам sshd слушает на деле (не только на localhost). Порт, проброшенный сеансом
+	# («ssh -R», X11), тоже слушает процесс sshd — но у него и родитель sshd, а у самого sshd — нет.
+	local port pid ppid
+	{ ss -Htlnp 2>/dev/null || true; } | awk 'match($0, /\("sshd",pid=[0-9]+/) && $4 !~ /^(127\.|\[::1\])/ {
+			n = split($4, a, ":"); print a[n], substr($0, RSTART + 12, RLENGTH - 12) }' |
+		while read -r port pid; do
+			ppid=$(awk '$1 == "PPid:" {print $2}' "/proc/$pid/status" 2>/dev/null || true)
+			[ "$(cat "/proc/${ppid:-0}/comm" 2>/dev/null || true)" = sshd ] || echo "$port"
+		done
+}
+
 inbound_ports() {  # «порт/протокол» внешних (не loopback) включённых inbound'ов из базы $1
+	# Разбор — тот же, что в install-vpn.sh (xui_inbound_ports): строка со странным содержимым (null, список, не JSON)
+	# не роняет функцию. Раньше роняла — и restore под set -e обрывался на шаге фаервола.
 	python3 - "$1" <<'PY'
 import json, sqlite3, sys
-db = sqlite3.connect(sys.argv[1])
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+
+
+def obj(text):  # JSON-объект из поля базы; всё остальное (null, список, строка, не JSON) — пустой объект
+    try:
+        v = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def kinds_of(proto, st, ss):  # что слушает подключение: tcp, udp или оба
+    proto = str(proto or "").lower()
+    net = str(ss.get("network") or "tcp").lower()
+    tls = ss.get("tlsSettings")
+    alpn = (tls.get("alpn") if isinstance(tls, dict) else None) or []
+    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
+        return {"udp"}
+    if net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
+        return {"tcp", "udp"}
+    if proto in ("shadowsocks", "dokodemo-door", "tunnel"):
+        n = str(st.get("network") or "tcp").lower()
+        return {k for k in ("tcp", "udp") if k in n} or {"tcp"}
+    if proto in ("mixed", "socks"):
+        return {"tcp", "udp"} if st.get("udp") else {"tcp"}
+    return {"tcp"}
+
+
 out = set()
-for port, listen, proto, ss, st, enable in db.execute(
-        "select port, listen, protocol, stream_settings, settings, enable from inbounds"):
-    if not enable or (listen or "").strip() in ("127.0.0.1", "::1", "localhost"):
+for port, listen, proto, settings, stream, enable in db.execute(
+        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
+    listen = str(listen or "").strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
         continue
-    def load(v):
-        try:
-            return json.loads(v or "{}")
-        except ValueError:
-            return {}
-    s, cfg = load(ss), load(st)
-    udp_only = proto in ("wireguard", "hysteria", "hysteria2", "tuic") or s.get("network") in ("kcp", "quic")
-    if not udp_only:
-        out.add("%s/tcp" % port)
-    if udp_only or "udp" in str(cfg.get("network", "")).lower() or cfg.get("udp") is True:
-        out.add("%s/udp" % port)
-for p in sorted(out):
-    print(p)
+    if not enable or port <= 0 or listen.startswith(("127.", "/", "@")) or listen in ("::1", "[::1]", "localhost"):
+        continue
+    try:
+        kinds = kinds_of(proto, obj(settings), obj(stream))
+    except Exception:   # строку не разобрать — порт всё равно не терять (считаем его TCP), остальные строки читаем дальше
+        kinds = {"tcp"}
+    out.update((port, k) for k in kinds)
+for port, kind in sorted(out):
+    print("%d/%s" % (port, kind))
 PY
 }
 
@@ -5940,7 +6590,13 @@ else
 	warn "часовой пояс $TIMEZONE не выставлен"
 fi
 
-say "SSH"
+# Раздел «SSH»: заголовок печатается вместе с первым сообщением раздела. Нет в бэкапе ни ключей, ни настроек SSH,
+# ни fail2ban — сказать нечего, и пустой заголовок не нужен.
+SSH_SAID=0
+ssh_say() {
+	[ "$SSH_SAID" = 1 ] || say "SSH"
+	SSH_SAID=1
+}
 if [ -f "$F/root/.ssh/authorized_keys" ]; then
 	install -d -m 700 /root/.ssh
 	touch /root/.ssh/authorized_keys
@@ -5952,11 +6608,14 @@ if [ -f "$F/root/.ssh/authorized_keys" ]; then
 		[ -n "$k" ] || continue
 		grep -qxF -- "$k" /root/.ssh/authorized_keys || printf '%s\n' "$k" >> /root/.ssh/authorized_keys
 	done < "$F/root/.ssh/authorized_keys"
+	ssh_say
 	ok "ключи root из бэкапа добавлены ($(grep -c . /root/.ssh/authorized_keys) шт.)"
 fi
 if ! command -v sshd >/dev/null; then
+	ssh_say
 	warn "sshd не установлен — настройки SSH пропущены"
 elif [ "$HARDEN_SSH" = 1 ] && [ -s /root/.ssh/authorized_keys ] && [ -f "$F/etc/ssh/sshd_config.d/00-disable-password.conf" ]; then
+	ssh_say
 	install -m 644 "$F/etc/ssh/sshd_config.d/00-disable-password.conf" /etc/ssh/sshd_config.d/00-disable-password.conf
 	if sshd -t; then
 		systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
@@ -5968,6 +6627,7 @@ elif [ "$HARDEN_SSH" = 1 ] && [ -s /root/.ssh/authorized_keys ] && [ -f "$F/etc/
 fi
 # fail2ban (ставит install-vpn.sh) — если был на старом сервере.
 if [ -f "$F/etc/fail2ban/jail.d/vpn-sshd.local" ] && command -v sshd >/dev/null; then
+	ssh_say
 	if "${APT[@]}" install fail2ban python3-systemd >/dev/null; then
 		install -d -m 755 /etc/fail2ban/jail.d
 		install -m 644 "$F/etc/fail2ban/jail.d/vpn-sshd.local" /etc/fail2ban/jail.d/vpn-sshd.local
@@ -5984,16 +6644,34 @@ fi
 
 say "Фаервол ufw"
 if [ "$DO_UFW" = 1 ]; then
+	# Порты SSH: из настроек sshd, тот, через который вошли сейчас (в том числе бот при переезде), и те, что sshd
+	# слушает на деле (порт может быть задан не в sshd_config, а SSH_CONNECTION под sudo или с консоли нет).
+	SSH_OPEN=$( {
+		sshd -T 2>/dev/null | awk '$1=="port"{print $2"/tcp"}' || true
+		[ -z "${SSH_CONNECTION:-}" ] || echo "${SSH_CONNECTION##* }/tcp"
+		sshd_listen_ports | sed 's|$|/tcp|'
+	} | sort -u | tr '\n' ' ')
 	OPEN=$( {
-		sshd -T 2>/dev/null | awk '$1=="port"{print $2"/tcp"}'
-		[ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION##* }/tcp"
+		for p in $SSH_OPEN; do echo "$p"; done
 		if [ "$HAS_NGINX" = 1 ]; then echo 80/tcp; echo 443/tcp; fi
 		# Без домена панель может быть открыта по IP (install-vpn.sh) — её порт тоже.
 		if [ -z "$DOMAIN" ] && [ "$(setting webListen)" != 127.0.0.1 ]; then echo "$(setting webPort)/tcp"; fi
 		inbound_ports "$DB"
 	} | sort -u -t/ -k1,1n -k2)
-	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
-	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился"; fi
+	SSH_LOST=""
+	for p in $OPEN; do
+		ufw allow "$p" >/dev/null && continue
+		bad "ufw allow $p не прошёл"
+		case " $SSH_OPEN " in *" $p "*) SSH_LOST="$SSH_LOST ${p%/tcp}" ;; esac
+	done
+	if [ -n "$SSH_LOST" ]; then
+		# Перенос идёт без человека за консолью: включить фаервол, в котором SSH не разрешён, — остаться без входа на сервер.
+		bad "ufw не включал: не удалось разрешить в нём порт SSH$SSH_LOST — с включённым фаерволом на сервер было бы не войти. Разберитесь с ufw и включите его сами: ufw allow ПОРТ/tcp && ufw enable"
+	elif ufw --force enable >/dev/null 2>&1; then
+		ok "включён, открыто: $(echo $OPEN)"
+	else
+		bad "ufw не включился"
+	fi
 else
 	warn "фаервол не трогали (--no-ufw)"
 fi
@@ -6322,16 +7000,7 @@ rm -f /root/vpn-qr/*.png   # прежние QR (удалённых клиент�
 		echo "  (секретный; забрать: ssh -p $SSH_PORT $SSH_LOGIN@$PUBLIC_IP 'sudo cat /root/backups/latest.tgz' > latest.tgz), дальше — README.md"
 	fi
 	echo "  в архиве (restore.sh$([ "$MODE" = domain ] && echo ", потом смена A-записи")). Сам бэкап не запускается."
-	if [ "${S_BOT:-}" = 1 ]; then
-		echo
-		echo "Телеграм-бот для управления VPN: @${S_BOT_USER:-?} — https://t.me/${S_BOT_USER:-}"
-		echo "  клиенты, статистика, проверка блокировки раз в 3 часа, бэкапы, переезд на новый сервер кнопкой"
-		[ "${BOT_RESULT:-}" != fail ] || echo "  ⚠ в этот раз бот не обновился: ${BOT_ERR:-} (повторить: bash install-vpn.sh --bot)"
-	elif [ -n "${BOT_SKIP:-}" ] || [ "${BOT_RESULT:-}" = fail ]; then
-		echo
-		echo "Телеграм-бот не поставлен: ${BOT_ERR:-$BOT_SKIP}"
-		echo "  повторить: bash install-vpn.sh --bot — токены скрипт спросит сам"
-	fi
+	bot_summary
 } > "$INFO"
 chmod 600 "$INFO"
 cat "$INFO"
