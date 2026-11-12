@@ -65,6 +65,7 @@
 set -euo pipefail
 umask 022
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive
+unset LANGUAGE   # sudo её сохраняет, а программы на Python (ufw) переводят по ней ответы даже при LC_ALL=C
 
 XUI_VERSION=3.3.1
 XRAY_VERSION=26.6.1
@@ -517,10 +518,19 @@ case $WARP_CMD in
 esac
 
 # --- Общие проверки и мелочи ---
-ufw_active() {  # ufw включён? Вывод — через переменную: «ufw status | grep -q» под pipefail путает «включён» с «выключен»
+ufw_state() {  # → active | inactive | unknown. «Выключен» — только когда ufw сам так ответил: не ответил или ответил
+	# непонятно (сломан, нет iptables) — unknown, и по такому ответу нельзя ни открывать лишнее, ни закрывать.
+	# Ответ — через переменную («ufw status | grep -q» под pipefail путает «включён» с «выключен») и на английском.
 	local s
-	s=$(ufw status 2>/dev/null) || return 1
-	[[ $s == "Status: active"* ]]
+	s=$(LANGUAGE=C LC_ALL=C ufw status 2>/dev/null) || s=
+	case $s in
+		"Status: active"*) echo active ;;
+		"Status: inactive"*) echo inactive ;;
+		*) echo unknown ;;
+	esac
+}
+ufw_active() {  # ufw включён?
+	[ "$(ufw_state)" = active ]
 }
 in_container() {
 	if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -cq 2>/dev/null; then return 0; fi
@@ -1452,6 +1462,7 @@ case $STAGE in */.vpn-exit-stage) trap 'rm -rf "$STAGE"' EXIT ;; esac
 . "$STAGE/exit.env"
 [ "$(id -u)" = 0 ] || { echo "EXIT_RESULT=FAIL настройка старого сервера запущена не от root"; exit 1; }
 export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive
+unset LANGUAGE   # sudo её сохраняет, а ufw (Python) переводит по ней ответы даже при LC_ALL=C
 command -v apt-get >/dev/null || { echo "EXIT_RESULT=FAIL нужен Ubuntu/Debian на старом сервере"; exit 1; }
 case $(uname -m) in
 	x86_64 | amd64) A=amd64; SHA=$XUI_SHA_AMD64 ;;
@@ -1566,8 +1577,8 @@ if [ "$ok" != 1 ]; then
 fi
 rm -f "$DIR/config.bak.json"
 # Фаервол: если ufw активен — пустить новый сервер на порт цепочки (ssh не трогаем). Неактивный ufw не включаем, чтобы не запереть.
-# Состояние ufw — через переменную: «ufw status | grep -q» под pipefail путает «включён» с «выключен».
-UFW_STATUS=$(command -v ufw >/dev/null && ufw status 2>/dev/null || true)
+# Ответ ufw — в переменную и на английском: по нему видно «включён», «выключен» и «понять не удалось» (ufw не ответил).
+UFW_STATUS=$(command -v ufw >/dev/null && LANGUAGE=C LC_ALL=C ufw status 2>/dev/null || true)
 if [[ $UFW_STATUS == "Status: active"* ]]; then
 	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
 	echo "EXIT_UFW=restricted"
@@ -1582,6 +1593,11 @@ elif command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -qE 
 		iptables-save > /etc/iptables/rules.v4 2>/dev/null && saved=1
 	fi
 	if [ -n "$saved" ]; then echo "EXIT_UFW=iptables"; else echo "EXIT_UFW=iptables-unsaved"; fi
+elif command -v ufw >/dev/null && [[ $UFW_STATUS != "Status: inactive"* ]]; then
+	# ufw есть, а включён ли он — понять не удалось: правило новому серверу добавляем (больше оно никому ничего не
+	# открывает), ufw не включаем и «порт открыт всем» не говорим.
+	ufw allow from "$ENTRY_IP" to any port "$EXIT_PORT" proto tcp >/dev/null 2>&1 || true
+	echo "EXIT_UFW=unknown"
 else
 	echo "EXIT_UFW=open"
 fi
@@ -1885,6 +1901,7 @@ setup_chain_exit_try() {
 	is_host "$CHAIN_SNI" || { CHAIN_ERR="старый сервер не выбрал сайт для маскировки"; return 1; }
 	case $(sed -n 's/^EXIT_UFW=//p' <<<"$out" | tail -1) in
 		open) warn "на старом сервере ufw выключен — порт $CHAIN_PORT открыт всем; включи там ufw и оставь доступ только новому серверу" ;;
+		unknown) warn "на старом сервере не удалось понять, включён ли ufw («ufw status» не ответил): правило для нового сервера на порт $CHAIN_PORT добавлено, но работает ли там фаервол — проверь сам: ufw status" ;;
 		iptables) ok "на старом сервере фаервол iptables (как у Oracle): порт $CHAIN_PORT открыт новому серверу, правило сохранено" ;;
 		iptables-unsaved) warn "на старом сервере фаервол iptables: порт $CHAIN_PORT открыт новому серверу, но правило не переживёт перезагрузку — поставь там iptables-persistent" ;;
 	esac
@@ -2017,7 +2034,7 @@ issue_ip_cert() {  # сертификат Let's Encrypt на PUBLIC_IP в $IPCER
 		fi
 	fi
 	[ -z "$(port_users 80)" ] || { IPCERT_ERR="порт 80 занят ($(port_users 80)) — Let's Encrypt не сможет проверить сервер"; return 1; }
-	if ufw_active && ! grep -qE '^80/tcp +ALLOW' <<<"$(ufw status 2>/dev/null || true)"; then
+	if ufw_active && ! grep -qE '^80/tcp +ALLOW' <<<"$(LANGUAGE=C LC_ALL=C ufw status 2>/dev/null || true)"; then
 		ufw allow 80/tcp >/dev/null 2>&1 && opened80=1
 	fi
 	# Let's Encrypt проверяет сервер по http://IP/ — на время проверки acme.sh сам слушает :80 (socat).
@@ -3061,12 +3078,13 @@ for port, kind in sorted(out):
     print("%d/%s" % (port, kind))
 PY
 }
-fw_kept_ports() {  # фаервол ещё выключен — подключения панели снаружи доступны; их порты включённый ufw не должен закрыть
-	! ufw_active || return 0   # уже включён — его правила остаются как есть
+fw_kept_ports() {  # ufw выключен (сам так ответил) — подключения панели сейчас доступны снаружи; их порты включённый ufw не должен закрыть
+	[ "$(ufw_state)" = inactive ] || return 0   # включён — его правила остаются как есть; не понять — лишнего не открываем
 	xui_inbound_ports
 }
 fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить
-	local KEEP OPEN KEPT CLOSING p pp
+	local KEEP OPEN KEPT CLOSING p pp state
+	state=$(ufw_state)
 	KEEP=$(fw_kept_ports)
 	OPEN=$( {
 		for p in $SSH_PORTS; do echo "$p/tcp"; done
@@ -3080,18 +3098,23 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 	for p in $OPEN; do ufw allow "$p" >/dev/null || bad "ufw allow $p не прошёл"; done
 	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || printf '%s ' "$pp"; done)
 	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
+	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
+	if [ "$state" = unknown ]; then
+		# Включён ufw или нет — неизвестно: включение закрыло бы порты, о которых скрипт не знает, а убирать правила вслепую нельзя.
+		bad "состояние ufw понять не удалось («ufw status» не ответил ни «active», ни «inactive») — нужные порты в нём разрешил, но включать его и убирать лишние правила не стал. Проверьте: ufw status"
+		return 0
+	fi
 	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ]; then
 		ufw delete allow "$MOVED_FROM/tcp" >/dev/null 2>&1 || true
 		ok "старый порт подключения $MOVED_FROM закрыт в ufw"
 	fi
-	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
 	# Подписка без сертификата на IP — внутри сервера: её порт и :80 снаружи не нужны.
 	if [ "$MODE" = nodomain ] && [ "${SUB_TLS:-0}" != 1 ]; then
 		for p in "$SUB_PORT/tcp" 80/tcp; do grep -qx "$p" <<<"$OPEN" || ufw delete allow "$p" >/dev/null 2>&1 || true; done
 	fi
 	# Панель убрали с внешнего адреса (--panel-local) — закрыть и её порт.
 	if [ "$MODE" = nodomain ] && [ "$PANEL_PUBLIC" = 0 ]; then ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true; fi
-	if ! ufw_active; then
+	if [ "$state" = inactive ]; then
 		# Что ещё слушает снаружи, фаервол закроет — назвать, чтобы чужая служба не пропала молча.
 		CLOSING=$(ss -Htuln 2>/dev/null | awk '{print $1, $5}' | while read -r proto addr; do
 			case $addr in 127.* | "[::1]"* | *%lo:*) continue ;; esac

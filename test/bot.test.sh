@@ -1290,7 +1290,7 @@ test_no_password_login_nag() {  # решение владельца 11.11: бе�
 
 # ——— Чужой 3x-ui: вопрос в самом начале, порты его подключений фаервол не закрывает ———
 xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports / fw_kept_ports; die/ok/warn — строками в $WORK/out
-	eval "$(awk '/^(foreign_xui_check|xui_inbound_ports|fw_kept_ports|ufw_active)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(foreign_xui_check|xui_inbound_ports|fw_kept_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
@@ -1463,9 +1463,14 @@ fw_env() {
 	OTHER_VPN='' OTHER_VPN_PORTS='' MOVED_FROM='' FAILS=0
 	UFW_SAYS="Status: inactive" UFW_STATUS_RC='' UFW_FAIL=''
 	unset SSH_CONNECTION   # тесты идут и по SSH: порты SSH шагу задаёт только $SSH_PORTS
-	: > "$WORK/out"; : > "$WORK/ufw.calls"; : > "$UFW_RULES"
+	: > "$WORK/out"; : > "$WORK/ufw.calls"; : > "$UFW_RULES"; rm -f "$DB"
 }
 fw_called() { grep -qxF -- "$1" "$WORK/ufw.calls"; }
+ufw_speaks_russian() {  # настоящий ufw (Python, gettext) берёт язык из первой непустой: LANGUAGE, LC_ALL, LC_MESSAGES, LANG —
+	# то есть с LANGUAGE=ru отвечает по-русски даже при LC_ALL=C (проверено на ufw 0.36.1 с language-pack-ru)
+	local l=${LANGUAGE:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}
+	[[ $l == ru* ]]
+}
 fw_calls() { tr '\n' ';' < "$WORK/ufw.calls"; }
 ACTIVE=$'Status: active\n\nTo                         Action      From\n--                         ------      ----\n22/tcp                     ALLOW       Anywhere'
 
@@ -1489,6 +1494,76 @@ test_fw_off_keeps_inbound_ports_and_enables() {  # ufw был выключен: 
 	t_has "OK включён, открыто: 22/tcp 80/tcp 2083/tcp 8443/tcp" "$(cat "$WORK/out")" "итог"
 }
 
+test_ufw_state_needs_a_clear_answer() {  # пункт 5: «выключен» — только когда ufw так и сказал; молчание и чужой язык — «не понять»
+	fw_env
+	t_eq inactive "$(ufw_state)" "Status: inactive"
+	UFW_SAYS=$ACTIVE; t_eq active "$(ufw_state)" "Status: active"
+	UFW_SAYS=$'Состояние: активен\n\nВ                          Действие    Из'; t_eq unknown "$(ufw_state)" "ответ не на английском"
+	UFW_SAYS=''; t_eq unknown "$(ufw_state)" "пустой ответ"
+	UFW_SAYS="ERROR: Couldn't determine iptables version" UFW_STATUS_RC=1; t_eq unknown "$(ufw_state)" "ufw status не выполнился"
+	ufw() { if ufw_speaks_russian; then echo "Состояние: активен"; else echo "Status: active"; fi; }
+	t_eq active "$(LANGUAGE=ru LC_ALL=C ufw_state)" "LANGUAGE=ru в окружении — ответ всё равно читается"
+}
+test_fw_unknown_state_opens_no_extra_and_closes_nothing() {  # пункт 5: состояние ufw не понять — ни чужих портов, ни удалений, ни включения
+	local says
+	for says in "RC" $'Состояние: активен\n\nВ   Действие   Из'; do
+		fw_env; MOVED_FROM=443
+		if [ "$says" = RC ]; then UFW_STATUS_RC=1; else UFW_SAYS=$says; fi
+		mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
+		fw_step
+		! fw_called "allow 8443/tcp" || t_fail "открыт порт чужого подключения при непонятном состоянии ufw: $(fw_calls)"
+		! grep -q '^delete ' "$WORK/ufw.calls" || t_fail "удалено правило при непонятном состоянии ufw: $(fw_calls)"
+		! fw_called "--force enable" || t_fail "ufw включён при непонятном состоянии: $(fw_calls)"
+		fw_called "allow 2083/tcp" && fw_called "allow 22/tcp" || t_fail "нужные порты не разрешены: $(fw_calls)"
+		grep -q '^BAD .*понять не удалось' "$WORK/out" || t_fail "не сказано, что состояние ufw непонятно: $(cat "$WORK/out")"
+		! grep -q 'включён, открыто' "$WORK/out" || t_fail "сказано «включён»: $(cat "$WORK/out")"
+	done
+}
+
+test_language_env_is_dropped_at_start() {  # пункт 5: LANGUAGE из окружения (sudo её сохраняет) переводит ответы ufw — в начале скрипта она снимается
+	local pre
+	pre=$(sed -n '/^set -euo pipefail$/,/^XUI_VERSION=/p' "$ROOT/src/install-vpn.sh.in" | sed '$d')
+	t_eq "unset C.UTF-8" "$(LANGUAGE=ru:en bash -c "$pre"$'\necho "${LANGUAGE-unset} $LC_ALL"')" "LANGUAGE и LC_ALL после начала скрипта"
+}
+# Кусок скрипта выхода про фаервол (в шаблоне — от «# Фаервол:» до ключа бота) — как он исполняется на старом сервере:
+# set -eu, ufw и iptables — заглушки (iptables отвечает «всё разрешено», его ветка не исполняется; путь /etc/iptables
+# на всякий случай уведён в $WORK). exit_fw 'ответ ufw status' [код] → что напечатал кусок; просьбы к ufw — в $WORK/ufw.calls.
+exit_fw() {
+	sed -n '/^# Фаервол: /,/^# >>> vpn-bot key/p' "$ROOT/src/install-vpn.sh.in" | sed "s#/etc/iptables#$WORK/etc-iptables#g" > "$WORK/exit-fw.sh"
+	grep -q 'EXIT_UFW=' "$WORK/exit-fw.sh" || t_fail "кусок про фаервол в скрипте выхода не найден"
+	: > "$WORK/ufw.calls"
+	(
+		set -eu
+		trap 'echo "ERR в строке $LINENO"' ERR
+		ufw() {
+			if [ "$1" = status ]; then
+				! ufw_speaks_russian || { echo "Состояние: активен"; return 0; }
+				printf '%s\n' "$UFW_SAYS"
+				return "${UFW_STATUS_RC:-0}"
+			fi
+			echo "$*" >> "$WORK/ufw.calls"
+		}
+		iptables() { echo "-P INPUT ACCEPT"; }
+		netfilter-persistent() { echo "netfilter-persistent $*" >> "$WORK/ufw.calls"; }
+		iptables-save() { echo "iptables-save" >> "$WORK/ufw.calls"; }
+		ENTRY_IP=203.0.113.10 EXIT_PORT=2087 UFW_SAYS=$1 UFW_STATUS_RC=${2:-0}
+		# shellcheck source=/dev/null
+		. "$WORK/exit-fw.sh"
+	)
+}
+test_exit_fw_follows_what_ufw_says() {  # пункт 5: на старом сервере «выключен» — только со слов ufw; не ответил — «не понять», а не «открыт всем»
+	local allow="allow from 203.0.113.10 to any port 2087 proto tcp"
+	t_eq "EXIT_UFW=restricted" "$(exit_fw "$ACTIVE")" "ufw включён"
+	t_eq "$allow" "$(cat "$WORK/ufw.calls")" "новому серверу порт открыт"
+	t_eq "EXIT_UFW=open" "$(exit_fw "Status: inactive")" "ufw выключен"
+	t_eq "" "$(cat "$WORK/ufw.calls")" "выключенный ufw не трогаем"
+	t_eq "EXIT_UFW=unknown" "$(exit_fw "ERROR: Couldn't determine iptables version" 1)" "ufw status не выполнился"
+	t_eq "$allow" "$(cat "$WORK/ufw.calls")" "правило новому серверу добавлено и при непонятном состоянии (ufw не включаем)"
+	t_eq "EXIT_UFW=unknown" "$(exit_fw "")" "пустой ответ"
+	t_eq "EXIT_UFW=restricted" "$(LANGUAGE=ru exit_fw "$ACTIVE")" "LANGUAGE=ru в окружении — ответ всё равно читается"
+	sed -n '/^emit_exit_setup() {/,/^VPN_EXIT_SETUP$/p' "$ROOT/src/install-vpn.sh.in" | sed -n '/^set -eu$/,/apt-get/p' | grep -q '^unset LANGUAGE\( \|$\)' ||
+		t_fail "скрипт выхода не снимает LANGUAGE в самом начале"
+}
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan
