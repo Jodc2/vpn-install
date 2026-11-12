@@ -1594,11 +1594,11 @@ test_no_password_login_nag() {  # решение владельца 11.11: бе�
 
 # ——— Чужой 3x-ui: вопрос в самом начале, порты его подключений фаервол не закрывает ———
 xui_fns() {  # функции шаблона foreign_xui_check / xui_inbound_ports / fw_kept_ports; die/ok/warn — строками в $WORK/out
-	eval "$(awk '/^(foreign_xui_check|foreign_on_port|xui_inbound_ports|fw_kept_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(foreign_xui_check|foreign_on_port|service_ports|service_port_check|xui_inbound_ports|fw_kept_ports|ufw_active|ufw_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
-	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
+	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG='' DOMAIN='' NO_DOMAIN=0 SUB_PORT=2096
 	: > "$WORK/out"
 }
 mkdb() {  # mkdb "порт|listen|протокол|settings|stream|enable" … → $DB с таблицей inbounds, как у 3x-ui
@@ -2092,11 +2092,11 @@ test_sshd_listen_ports_skips_session_forwards() {  # проброс «ssh -R» �
 REALITY='{"network":"tcp","security":"reality"}'
 own_fns() {
 	eval "$(grep -m1 '^state_val() {' "$ROOT/src/install-vpn.sh.in")"
-	eval "$(awk '/^(own_inbound|find_own_inbound|own_inbound_late|own_to_settings|foreign_on_port|port_taken_check|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	eval "$(awk '/^(own_inbound|find_own_inbound|own_inbound_late|own_to_settings|foreign_on_port|port_taken_check|service_ports|service_port_check|xui_inbound_ports|inbound_move|foreign_xui_check|save_state)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
 	ok() { echo "OK $*" >> "$WORK/out"; }
 	warn() { echo "WARN $*" >> "$WORK/out"; }
-	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
+	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG='' MODE=nodomain DOMAIN='' NO_DOMAIN=0 SUB_PORT=2096
 	S_INBOUND_ID='' OWN_INBOUND_ID='' OLD_REALITY_PORT='' OWN_KEY='' OWN_KNOWN=1 REALITY_PORT=2083
 	: > "$WORK/out"; rm -f "$DB" "$STATE" "$STATE".failed-*
 }
@@ -2273,6 +2273,79 @@ test_port_taken_check_own_and_foreign() {  # порт своего подклю�
 	S_INBOUND_ID='' OWN_INBOUND_ID=2 REALITY_PORT=2083
 	( port_taken_check ) || t_fail "настройки без номера, своё найдено — не помеха: $(cat "$WORK/out")"
 }
+# Порты, которые скрипт занимает сам (пункт 1 второй порции): подписка — 2096; с доменом — ещё 80, 443 и 8443 под nginx.
+# На настоящих x-ui 3.3.1 и Xray проверено: чужое подключение на 2096 — и Xray не стартует («failed to listen TCP on 2096»,
+# не работает ни одно подключение) либо, если порт успел занять он, падает сама панель («Error starting sub server»).
+svc_check() {  # svc_check РЕЖИМ → «ok» или текст остановки
+	: > "$WORK/out"
+	if ( service_port_check "$1" ); then echo ok; else cat "$WORK/out"; fi
+}
+test_service_ports_checked_against_panel() {  # на порту, который скрипт займёт сам, у панели включённое подключение — стоп до изменений
+	local out
+	own_fns
+	mkdb '443||vless|{}|{}|1' '8443||vmess|{}|{}|1' '80||trojan|{}|{}|1' '2096||vless|{}|{}|0' '9000||vless|{}|{}|1'
+	t_eq ok "$(svc_check nodomain)" "без домена 80, 443 и 8443 скрипту не нужны, а на 2096 подключение выключено"
+	out=$(svc_check domain)
+	t_has "DIE " "$out" "с доменом — стоп"
+	t_has " 80" "$out" "первым назван порт 80"; t_has "nginx" "$out" "зачем порт скрипту"
+	t_has "еренесите" "$out" "что сделать: перенести подключение"; t_has "чистый сервер" "$out" "или чистый сервер"
+	rm -f "$DB"; mkdb '8443||vmess|{}|{}|1'
+	out=$(svc_check domain); t_has "8443" "$out" "8443 занят подключением"; t_has "nginx" "$out" "зачем он скрипту"
+	rm -f "$DB"; mkdb '443|203.0.113.7|vless|{}|{}|1'
+	t_has " 443" "$(svc_check domain)" "443 занят подключением на своём адресе"
+	rm -f "$DB"; mkdb '2096||vmess|{}|{}|1'
+	out=$(svc_check nodomain); t_has "2096" "$out" "порт подписки занят"; t_has "подписк" "$out" "зачем он скрипту"
+	t_has "2096" "$(svc_check domain)" "и с доменом тоже"
+	rm -f "$DB"; mkdb '2096|127.0.0.1|vless|{}|{}|1'
+	t_has "2096" "$(svc_check nodomain)" "подключение только на localhost — тот же порт, что у подписки на 127.0.0.1"
+	rm -f "$DB"; mkdb '443||wireguard|{}|{}|1' '2096|/run/xray.sock|vless|{}|{}|1' '8443||vless|{}|{"network":"kcp"}|1'
+	t_eq ok "$(svc_check domain)" "UDP на тех же номерах и unix-сокет TCP-порт не занимают"
+	rm -f "$DB"; echo "это не база" > "$DB"
+	t_eq ok "$(svc_check domain)" "базу не прочитать — проверить нечем, не останавливаться"
+	rm -f "$DB"
+	t_eq ok "$(svc_check domain)" "панели нет"
+}
+test_foreign_xui_service_port_stops_before_question() {  # чужой 3x-ui, его подключение — на порту подписки: стоп до вопроса и изменений.
+	# Раньше скрипт получал «да», ставил подписку на тот же порт, и Xray не поднимался: не работало ни одно подключение.
+	local out
+	own_fns; answers y y y
+	mkdb_tags '443||vless|{}|{}|1' '2096||vmess|{}|{}|1'
+	! ( foreign_xui_check ) || t_fail "пошёл дальше, хотя порт подписки занят чужим подключением"
+	out=$(cat "$WORK/out")
+	t_has "DIE " "$out" "остановка"; t_has "2096" "$out" "какой порт"; t_has "подписк" "$out" "зачем он скрипту"
+	t_has "Ничего не менял" "$out" "сказано, что ничего не изменено"
+	! grep -q 'Продолжить?' "$WORK/tty.out" 2> /dev/null || t_fail "вопрос задан, хотя ставить некуда"
+	rm -f "$DB"; mkdb_tags '443||vless|{}|{}|1' '8443||vmess|{}|{}|1'
+	: > "$WORK/out"; DOMAIN=vpn.example.com
+	! ( foreign_xui_check ) || t_fail "--domain, а 443 и 8443 заняты чужими подключениями — должен остановиться"
+	t_has " 443" "$(cat "$WORK/out")" "какой порт (с доменом)"
+	! grep -q 'Продолжить?' "$WORK/tty.out" 2> /dev/null || t_fail "вопрос задан, хотя ставить некуда"
+	: > "$WORK/out"; DOMAIN=''   # вариант ещё не выбран (спросят позже) — пока известен только порт подписки
+	foreign_xui_check
+	t_eq 1 "$FOREIGN_XUI" "без --domain порты nginx ещё не нужны — обычный вопрос и согласие"
+	: > "$WORK/out"; FOREIGN_XUI=0 DOMAIN=vpn.example.com NO_DOMAIN=1   # противоречие опций разберут дальше
+	foreign_xui_check
+	t_eq 1 "$FOREIGN_XUI" "--no-domain: порты nginx не нужны"
+}
+test_port_taken_check_covers_service_ports() {  # та же сверка — перед изменениями на любом запуске: вариант (с доменом или без) уже известен
+	own_fns
+	mkdb_tags "2083||vless|{}|$(reality "$KEY_OWN")|1" '8443||vmess|{}|{}|1'
+	OWN_INBOUND_ID=1 REALITY_PORT=2083 MODE=nodomain
+	( port_taken_check ) || t_fail "без домена 8443 скрипту не нужен: $(cat "$WORK/out")"
+	MODE=domain
+	! ( port_taken_check ) || t_fail "с доменом 8443 нужен nginx, а на нём подключение панели — должен остановиться"
+	t_has "8443" "$(cat "$WORK/out")" "какой порт"
+	sql "update inbounds set port=2096 where id=2"; : > "$WORK/out"; MODE=nodomain
+	! ( port_taken_check ) || t_fail "порт подписки занят подключением панели — должен остановиться"
+	t_has "2096" "$(cat "$WORK/out")" "какой порт"
+}
+test_inbound_ports_local_mode() {  # для сверки портов нужны и подключения, слушающие только localhost; для фаервола — нет
+	xui_fns
+	mkdb '2083||vless|{}|{}|1' '8443|127.0.0.1|vless|{}|{}|1' '9000|::1|trojan|{}|{}|1' '9001|/run/x.sock|vless|{}|{}|1' '9002||vless|{}|{}|0'
+	t_eq "2083/tcp" "$(xui_inbound_ports | tr '\n' ' ' | sed 's/ $//')" "фаерволу — только то, что слушает снаружи"
+	t_eq "2083/tcp 8443/tcp 9000/tcp" "$(xui_inbound_ports local | tr '\n' ' ' | sed 's/ $//')" "для сверки — и localhost; сокет и выключенное — нет"
+}
+
 test_inbound_move_touches_only_own() {  # --port переносит своё подключение — и только его
 	own_fns
 	mkdb_tags "443||vless|{}|$REALITY|1" "2083||vless|{}|$REALITY|1" "2083|203.0.113.7|vless|{}|$REALITY|1"
@@ -2412,10 +2485,10 @@ test_foreign_question_on_real_terminal() {  # настоящий термина�
 set -euo pipefail
 WORK=$WORK
 . "$ROOT/src/bot.sh"
-eval "\$(awk '/^(foreign_xui_check|foreign_on_port)\\(\\) \\{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+eval "\$(awk '/^(foreign_xui_check|foreign_on_port|service_ports|service_port_check|xui_inbound_ports)\\(\\) \\{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
 warn() { printf '  ВНИМ. %s\\n' "\$*"; }
 die() { printf 'Остановлено: %s\\n' "\$*" >&2; exit 1; }
-DB=\$WORK/x-ui.db STATE=\$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG=''
+DB=\$WORK/x-ui.db STATE=\$WORK/vpn-install.env XUI_VERSION=3.3.1 FOREIGN_XUI=0 PORT_ARG='' DOMAIN='' NO_DOMAIN=0 SUB_PORT=2096
 foreign_xui_check
 EOF
 	DB=$WORK/x-ui.db; mkdb '443||vless|{}|{}|1'

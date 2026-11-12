@@ -242,6 +242,79 @@ r = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute(
 print(r[0] if r else "")' "$DB" "$1" "${2:-0}" 2> /dev/null ||
 		sqlite3 -readonly "$DB" "select id from inbounds where port=$((10#$1)) and id<>$((10#${2:-0})) order by id limit 1;" 2> /dev/null || true
 }
+xui_inbound_ports() {  # xui_inbound_ports [local] → «порт/протокол» включённых подключений панели, которые слушают не только
+	# localhost (это нужно фаерволу); с «local» — и тех, что слушают только localhost (это нужно сверке портов)
+	[ -f "$DB" ] || return 0
+	python3 -I - "$DB" "${1:-}" <<'PY' 2>/dev/null || true
+import json, sqlite3, sys
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+local = sys.argv[2] == "local"
+
+
+def obj(text):  # JSON-объект из поля базы; всё остальное (null, список, строка, не JSON) — пустой объект
+    try:
+        v = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def kinds_of(proto, st, ss):  # что слушает подключение: tcp, udp или оба
+    proto = str(proto or "").lower()
+    net = str(ss.get("network") or "tcp").lower()
+    tls = ss.get("tlsSettings")
+    alpn = (tls.get("alpn") if isinstance(tls, dict) else None) or []
+    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
+        return {"udp"}
+    if net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
+        return {"tcp", "udp"}
+    if proto in ("shadowsocks", "dokodemo-door", "tunnel"):
+        n = str(st.get("network") or "tcp").lower()
+        return {k for k in ("tcp", "udp") if k in n} or {"tcp"}
+    if proto in ("mixed", "socks"):
+        return {"tcp", "udp"} if st.get("udp") else {"tcp"}
+    return {"tcp"}
+
+
+out = set()
+for port, listen, proto, settings, stream, enable in db.execute(
+        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
+    listen = str(listen or "").strip()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        continue
+    if not enable or port <= 0 or listen.startswith(("/", "@")):   # выключено; unix-сокет порта не занимает
+        continue
+    if not local and (listen.startswith("127.") or listen in ("::1", "[::1]", "localhost")):
+        continue
+    try:
+        kinds = kinds_of(proto, obj(settings), obj(stream))
+    except Exception:   # строку не разобрать — порт всё равно не терять (считаем его TCP), остальные строки читаем дальше
+        kinds = {"tcp"}
+    out.update((port, k) for k in kinds)
+for port, kind in sorted(out):
+    print("%d/%s" % (port, kind))
+PY
+}
+service_ports() {  # service_ports РЕЖИМ → «порт|зачем он скрипту»: порты, которые скрипт занимает сам (кроме порта своего подключения)
+	echo "$SUB_PORT|под подписку (её отдаёт сама панель)"
+	[ "$1" = domain ] || return 0
+	echo "80|под nginx — выпуск и продление сертификата"
+	echo "443|под nginx — сайт, панель и подписка по адресу домена"
+	echo "8443|под nginx — внутренний порт сайта, под который маскируется VPN"
+}
+service_port_check() {  # service_port_check РЕЖИМ [ХВОСТ] — на порту, который скрипт займёт сам, у панели есть включённое подключение:
+	# остановиться, пока ничего не изменено. Иначе (проверено на настоящих x-ui и Xray) не поднимается либо Xray — и не
+	# работает ни одно подключение, чужое и своё, — либо сама панель.
+	local p why busy
+	busy=$(xui_inbound_ports local)
+	[ -n "$busy" ] || return 0
+	while IFS='|' read -r p why; do
+		! grep -qx "$p/tcp" <<<"$busy" ||
+			die "в панели есть включённое подключение на порту $p, а этот порт нужен скрипту $why. Вдвоём на одном порту они не уживутся: не поднимется либо Xray со всеми подключениями, либо сама панель. Перенесите то подключение на другой порт (в панели) и запустите скрипт ещё раз — или ставьте VPN на чистый сервер.${2:+ $2}"
+	done < <(service_ports "$1")
+}
 foreign_xui_check() {  # 3x-ui здесь ставили без этого скрипта: сказать, что будет, и спросить сразу — до любых вопросов и изменений
 	local n msg p=${PORT_ARG:-2083}
 	[ -f "$DB" ] && [ ! -f "$STATE" ] || return 0
@@ -250,6 +323,8 @@ foreign_xui_check() {  # 3x-ui здесь ставили без этого ск�
 	if [[ $p =~ ^[0-9]{1,5}$ ]] && [ -n "$(foreign_on_port "$p")" ]; then
 		die "здесь уже есть 3x-ui, поставленный не этим скриптом, и на порту $p у него есть подключение. Своё подключение скрипт создаёт на этом порту, а чужие не трогает — запустите с другим портом: bash $0 --port N. Ничего не менял"
 	fi
+	# То же — для портов, которые скрипт займёт сам: подписка, а с доменом (если он уже назван опцией) — ещё и nginx.
+	service_port_check "$([ -n "$DOMAIN" ] && [ "$NO_DOMAIN" != 1 ] && echo domain || echo nodomain)" "Ничего не менял."
 	n=$(python3 -I -c 'import sqlite3, sys; print(sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("select count(*) from inbounds").fetchone()[0])' "$DB" 2> /dev/null ||
 		sqlite3 -readonly "$DB" 'select count(*) from inbounds;' 2> /dev/null || echo '?')
 	msg="здесь уже есть 3x-ui, поставленный не этим скриптом (подключений: $n). Удалять его скрипт не будет: подключения и клиенты останутся, их порты фаервол не закроет. Заменятся логин, пароль, порт и путь панели, шаблон Xray (маршрутизация), адреса подписок и сама программа — на 3x-ui $XUI_VERSION. Копия базы останется рядом с ней"
@@ -398,13 +473,16 @@ own_to_settings() {  # сразу после чтения настроек ($STA
 	S_INBOUND_ID=${OWN_INBOUND_ID:-${S_INBOUND_ID:+0}}
 	[ -n "${REALITY_PRIV:-}" ] || REALITY_PRIV=$OWN_KEY
 }
-port_taken_check() {  # порт своего подключения занят в панели другим — остановиться, пока ничего не изменено
+port_taken_check() {  # порт своего подключения или порт, который скрипт занимает сам, занят в панели другим подключением —
+	# остановиться, пока ничего не изменено
 	local other why=""
 	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-0}")
-	[ -n "$other" ] || return 0
-	# Повторный запуск: подсказать, почему подключение на своём же порту могло оказаться «другим».
-	[ ! -f "$STATE" ] || why=" Своё подключение скрипт узнаёт по ключу Reality из $STATE — в этом такого ключа нет."
-	die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N.$why"
+	if [ -n "$other" ]; then
+		# Повторный запуск: подсказать, почему подключение на своём же порту могло оказаться «другим».
+		[ ! -f "$STATE" ] || why=" Своё подключение скрипт узнаёт по ключу Reality из $STATE — в этом такого ключа нет."
+		die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N.$why"
+	fi
+	service_port_check "$MODE"   # и порты, которые скрипт занимает сам: подписка, с доменом — nginx
 }
 inbound_move() {  # inbound_move ID СТАРЫЙ_ПОРТ НОВЫЙ_ПОРТ — перенести своё подключение, и только его (x-ui остановлен)
 	# Имя подключения 3x-ui содержит порт (in-2083-tcp, в старых версиях inbound-2083) — заменить в нём номер.
@@ -2458,6 +2536,7 @@ for try in 1 2 3 4 5 6; do
 done
 "${APT[@]}" install iproute2 curl ca-certificates python3 >/dev/null || die "не установились iproute2, curl, python3"
 own_inbound_late
+port_taken_check   # сначала — подключения панели: про них можно сказать точнее, чем «порт занят: xray»
 if [ "$MODE" = domain ]; then
 	for p in 80 443; do
 		u=$(port_users "$p")
@@ -2466,7 +2545,6 @@ if [ "$MODE" = domain ]; then
 fi
 u=$(port_users "$REALITY_PORT")
 case $u in "" | xray* | x-ui*) ;; *) die "порт $REALITY_PORT занят: $u— освободите его (на этом сервере не должно быть другого сайта)" ;; esac
-port_taken_check   # слушает xray — а чьё подключение?
 if [ "$MODE" = domain ]; then ok "порты 80, 443 и $REALITY_PORT свободны"; else ok "порт $REALITY_PORT свободен"; fi
 
 detect_ips
@@ -3229,57 +3307,6 @@ else
 	fi
 fi
 
-xui_inbound_ports() {  # «порт/протокол» включённых подключений панели, которые слушают не только localhost
-	[ -f "$DB" ] || return 0
-	python3 -I - "$DB" <<'PY' 2>/dev/null || true
-import json, sqlite3, sys
-db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-
-
-def obj(text):  # JSON-объект из поля базы; всё остальное (null, список, строка, не JSON) — пустой объект
-    try:
-        v = json.loads(text or "{}")
-    except (TypeError, ValueError):
-        return {}
-    return v if isinstance(v, dict) else {}
-
-
-def kinds_of(proto, st, ss):  # что слушает подключение: tcp, udp или оба
-    proto = str(proto or "").lower()
-    net = str(ss.get("network") or "tcp").lower()
-    tls = ss.get("tlsSettings")
-    alpn = (tls.get("alpn") if isinstance(tls, dict) else None) or []
-    if proto in ("wireguard", "hysteria", "hysteria2", "tuic") or net in ("kcp", "mkcp", "quic"):
-        return {"udp"}
-    if net in ("xhttp", "splithttp") and "h3" in alpn:   # XHTTP поверх HTTP/3 слушает и UDP
-        return {"tcp", "udp"}
-    if proto in ("shadowsocks", "dokodemo-door", "tunnel"):
-        n = str(st.get("network") or "tcp").lower()
-        return {k for k in ("tcp", "udp") if k in n} or {"tcp"}
-    if proto in ("mixed", "socks"):
-        return {"tcp", "udp"} if st.get("udp") else {"tcp"}
-    return {"tcp"}
-
-
-out = set()
-for port, listen, proto, settings, stream, enable in db.execute(
-        "select port, listen, protocol, settings, stream_settings, enable from inbounds"):
-    listen = str(listen or "").strip()
-    try:
-        port = int(port)
-    except (TypeError, ValueError):
-        continue
-    if not enable or port <= 0 or listen.startswith(("127.", "/", "@")) or listen in ("::1", "[::1]", "localhost"):
-        continue
-    try:
-        kinds = kinds_of(proto, obj(settings), obj(stream))
-    except Exception:   # строку не разобрать — порт всё равно не терять (считаем его TCP), остальные строки читаем дальше
-        kinds = {"tcp"}
-    out.update((port, k) for k in kinds)
-for port, kind in sorted(out):
-    print("%d/%s" % (port, kind))
-PY
-}
 fw_kept_ports() {  # ufw выключен (сам так ответил) — подключения панели сейчас доступны снаружи; их порты включённый ufw не должен закрыть
 	[ "$(ufw_state)" = inactive ] || return 0   # включён — его правила остаются как есть; не понять — лишнего не открываем
 	xui_inbound_ports
