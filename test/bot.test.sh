@@ -1273,8 +1273,8 @@ test_dns_verify_strict_without_own_write() {  # запись ставил не �
 
 test_all_input_visible() {  # решение владельца 11.11: всё, что вводят, видно на экране — ни одного скрытого ввода
 	local f
-	for f in "$ROOT/src/bot.sh" "$ROOT/src/install-vpn.sh.in" "$ROOT/install-passwall2.sh"; do
-		! grep -n 'не отобраз' "$f" || t_fail "в $(basename "$f") осталось «не отобразится»"
+	for f in "$ROOT/src/bot.sh" "$ROOT/src/install-vpn.sh.in" "$ROOT/install-passwall2.sh" "$ROOT/README.md" "$ROOT/src/README-friend.md"; do
+		! grep -n 'не отобра[зж]' "$f" || t_fail "в $(basename "$f") осталось «не отобразится» или «не отображается»"
 		! grep -nE 'read +(-[a-zA-Z]*s[a-zA-Z]*|-s)( |$)' "$f" || t_fail "в $(basename "$f") остался скрытый ввод (read -s)"
 	done
 }
