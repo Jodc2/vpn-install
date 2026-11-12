@@ -897,8 +897,18 @@ for x in (json.load(open(sys.argv[1])).get("result") or {}).get("bindings") or [
 	# чужой (перенастроенный с согласия) и наш её хранят.
 	f='/selftest?part=hook'
 	if [ -z "${BOT_HOOK_URL:-}" ] && [ "${BOT_EXISTING:-none}" = none ]; then f+='&drop=1'; fi
-	body=$(bot_http "$f") || { BOT_ERR="воркер не ответил на просьбу поставить вебхук"; return 1; }
-	[ "$(jget ok <<< "$body")" = true ] || { BOT_ERR="Телеграм не принял вебхук — $(jget error <<< "$body")"; return 1; }
+	# Ответ без «ok» — отвечает ещё прежняя версия воркера (её секрет самопроверки другой: 404): новая расходится
+	# по сети Cloudflare несколько секунд после загрузки. Ждём её — заодно дальше работаем уже точно с новой.
+	tries=${BOT_HOOK_TRIES:-20}
+	for p in $(seq 1 "$tries"); do
+		body=$(bot_http "$f" 2> /dev/null) || body=
+		case $(jget ok <<< "$body") in
+			true) break ;;
+			false) BOT_ERR="Телеграм не принял вебхук — $(jget error <<< "$body")"; return 1 ;;
+		esac
+		[ "$p" != "$tries" ] || { BOT_ERR="воркер не поставил вебхук: новая версия так и не ответила (ответ: $(head -c 80 <<< "$body" | tr -d '\n'))"; return 1; }
+		sleep "${BOT_HEALTH_SLEEP:-2}"
+	done
 	printf '[{"cron":"%s"}]' "$BOT_CRON" > "$BOT_DIR/req.json"
 	body=$(cf_api PUT "/accounts/$BOT_ACC/workers/scripts/$BOT_WORKER/schedules" -H 'Content-Type: application/json' --data-binary @"$BOT_DIR/req.json") || { BOT_ERR="Cloudflare не отвечает"; return 1; }
 	cf_ok <<< "$body" || { BOT_ERR="не поставить расписание — $(cf_err <<< "$body")"; return 1; }

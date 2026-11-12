@@ -971,6 +971,29 @@ test_deploy_webhook_is_set_by_worker() {  # вебхук ставит сам в�
 	grep -qx '/selftest?part=hook&drop=1' "$WORK/http.calls" || t_fail "воркер не просили поставить вебхук: $(tr '\n' ' ' < "$WORK/http.calls")"
 	! grep -q '^setWebhook' "$WORK/tg.calls" 2> /dev/null || t_fail "вебхук ставил сам установщик"
 }
+test_deploy_webhook_waits_for_new_version() {  # сразу после загрузки ещё отвечает прежняя версия воркера (её секрет самопроверки другой — 404): ждём новую
+	deploy_env; BOT_HEALTH_SLEEP=0
+	bot_http() {
+		local n
+		printf '%s\n' "$1" >> "$WORK/http.calls"
+		case $1 in
+			/healthz) echo ok ;;
+			"/selftest?part=hook"*)
+				n=$(($(cat "$WORK/hook.n" 2> /dev/null || echo 0) + 1)); echo "$n" > "$WORK/hook.n"
+				if [ "$n" -le 3 ]; then echo "not found"; else echo '{"ok":true}'; fi ;;
+			"/selftest?part="*) st_part "$1" ;;
+		esac
+	}
+	bot_deploy || t_fail "не дождался новой версии воркера: $BOT_ERR"
+	t_eq 4 "$(grep -c '^/selftest?part=hook' "$WORK/http.calls")" "просил, пока не ответила новая версия"
+}
+test_deploy_webhook_new_version_never_answers() {
+	deploy_env; BOT_HEALTH_SLEEP=0 BOT_HOOK_TRIES=5
+	bot_http() { printf '%s\n' "$1" >> "$WORK/http.calls"; case $1 in /healthz) echo ok ;; "/selftest?part=hook"*) echo "not found" ;; "/selftest?part="*) st_part "$1" ;; esac; }
+	! bot_deploy || t_fail "успех, хотя воркер вебхук не поставил"
+	t_has "вебхук" "$BOT_ERR" "что случилось"
+	t_eq 5 "$(grep -c '^/selftest?part=hook' "$WORK/http.calls")" "число попыток"
+}
 test_deploy_webhook_refused() {  # Телеграм вебхук не принял — это не «всё хорошо»
 	deploy_env
 	echo '{"ok":false,"error":"tg setWebhook: Unauthorized"}' > "$WORK/st.hook"
