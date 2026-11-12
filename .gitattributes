@@ -1,0 +1,2 @@
+# Скрипты запускают на Linux и на роутерах: с CRLF (checkout в Windows) оболочка их не разберёт.
+* text=auto eol=lf
