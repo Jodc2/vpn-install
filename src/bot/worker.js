@@ -461,6 +461,9 @@ async function putSoon(env, key, value, opts) {
     await env.STATE.put(key, value, opts);
   }
 }
+async function wasSeen(env, updateId) {
+  return typeof updateId === "number" && Boolean(await env.STATE.get(`upd:${updateId}`));
+}
 async function seenUpdate(env, updateId) {
   if (typeof updateId !== "number") return false;
   const key = `upd:${updateId}`;
@@ -477,7 +480,7 @@ async function getDialog(env, uid) {
 }
 async function setDialog(env, uid, d) {
   if (d.mode === "idle") await env.STATE.delete(`dialog:${uid}`);
-  else await env.STATE.put(`dialog:${uid}`, JSON.stringify(d), { expirationTtl: 3600 });
+  else await putSoon(env, `dialog:${uid}`, JSON.stringify(d), { expirationTtl: 3600 });
 }
 async function putBackup(env, name, bytes2) {
   const meta = { name, size: bytes2.byteLength, createdAt: Date.now() };
@@ -533,7 +536,7 @@ async function claimReport(env, token) {
   }
   await sleep(300);
   const now = await env.STATE.get(key);
-  return wrote ? now === mine : now === null;
+  return now === null || wrote && now === mine;
 }
 async function markMigrationFailed(env, m) {
   const cur = await currentMigration(env);
@@ -788,17 +791,42 @@ async function checkBanGlobalping(env, ip, port, pollMs = POLL_MS) {
   return summarizeGlobalping(ip, port, results);
 }
 
-// src/cf.ts
-async function cfApi(env, method, path, body) {
-  const resp = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${env.CF_API_TOKEN}`,
-      "Content-Type": "application/json"
-    },
-    body: body === void 0 ? void 0 : JSON.stringify(body)
+// src/deadline.ts
+async function withDeadline(work, ms, what, onTimeout) {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      try {
+        void Promise.resolve(onTimeout?.()).catch(() => {
+        });
+      } catch {
+      }
+      reject(new Error(`${what}: \u043D\u0435\u0442 \u043E\u0442\u0432\u0435\u0442\u0430 \u0437\u0430 ${Math.round(ms / 1e3)} \u0441`));
+    }, ms);
   });
-  const json = await resp.json().catch(() => ({}));
+  try {
+    return await Promise.race([work, late]);
+  } finally {
+    if (timer !== void 0) clearTimeout(timer);
+  }
+}
+
+// src/cf.ts
+var CF_LIMITS = { apiMs: 1e4, dohMs: 5e3 };
+async function cfApi(env, method, path, body) {
+  const ask = async () => {
+    const resp2 = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${env.CF_API_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: body === void 0 ? void 0 : JSON.stringify(body),
+      signal: AbortSignal.timeout(CF_LIMITS.apiMs)
+    });
+    return { resp: resp2, json: await resp2.json().catch(() => ({})) };
+  };
+  const { resp, json } = await withDeadline(ask(), CF_LIMITS.apiMs, "Cloudflare");
   if (!json.success) {
     const msg = (json.errors || []).map((e) => e.message).join("; ") || `HTTP ${resp.status}`;
     throw new Error(`Cloudflare: ${msg}`);
@@ -826,11 +854,14 @@ async function pointDnsTo(env, newIp) {
   return { previous, proxied: rec.proxied };
 }
 async function resolveIPv4(name) {
-  const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=A`, {
-    headers: { Accept: "application/dns-json" },
-    signal: AbortSignal.timeout(1e4)
-  });
-  const j = await r.json().catch(() => ({}));
+  const ask = async () => {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=A`, {
+      headers: { Accept: "application/dns-json" },
+      signal: AbortSignal.timeout(CF_LIMITS.dohMs)
+    });
+    return await r.json().catch(() => ({}));
+  };
+  const j = await withDeadline(ask(), CF_LIMITS.dohMs, `\u0430\u0434\u0440\u0435\u0441 ${name}`);
   const a = (j.Answer || []).find((x) => x.type === 1 && typeof x.data === "string");
   if (!a) throw new Error(`\u0443 \u0438\u043C\u0435\u043D\u0438 ${name} \u043D\u0435\u0442 A-\u0437\u0430\u043F\u0438\u0441\u0438`);
   return a.data;
@@ -3627,7 +3658,7 @@ function hostKeyChecker(check) {
     }
   };
 }
-async function withDeadline(work, ms, what, onTimeout) {
+async function withDeadline2(work, ms, what, onTimeout) {
   let timer;
   const deadline = new Promise((_, reject) => {
     timer = setTimeout(() => {
@@ -3685,7 +3716,7 @@ var SshClient = class _SshClient {
         await transport.handshake();
         await authenticate(transport, options.username, [options.auth].flat(), options.onBanner);
       };
-      await withDeadline(
+      await withDeadline2(
         login(),
         options.timeoutMs ?? DEFAULT_TIMEOUT,
         "connecting",
@@ -3884,26 +3915,23 @@ var SSH_LIMITS = {
   // «Поехали»: вход на новый сервер и запуск переноса — до 35 с
   probe: { tcpMs: 8e3, keyMs: 8e3 },
   // отпечаток ключа нового сервера — до 16 с
-  exit: { connectMs: 8e3, execMs: 1e4 }
+  exit: { connectMs: 8e3, execMs: 1e4 },
   // порт цепочки на выходе — до 26 с
+  backupNow: { connectMs: 7e3, workMs: 28e3 },
+  // бэкап по кнопке и перед переездом — до 42 с
+  backupCron: { connectMs: 25e3, workMs: 15e4 }
+  // суточный бэкап по расписанию
 };
 var DEFAULT_CONNECT_MS = 25e3;
 async function probeHostKey(host, port) {
   const socket = await openSocket(host, port, SSH_LIMITS.probe.tcpMs);
-  let timer;
-  const late = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      void socket.close?.().catch(() => {
-      });
-      reject(new Error(`\u0441\u0435\u0440\u0432\u0435\u0440 ${host}:${port} \u043F\u0440\u0438\u043D\u044F\u043B \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435, \u043D\u043E \u043F\u043E SSH \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B \u0437\u0430 ${SSH_LIMITS.probe.keyMs / 1e3} \u0441`));
-    }, SSH_LIMITS.probe.keyMs);
-  });
-  try {
-    const { hostKey, serverVersion } = await Promise.race([readHostKey(socket), late]);
-    return { fpr: hostKey.fingerprint, serverVersion };
-  } finally {
-    if (timer !== void 0) clearTimeout(timer);
-  }
+  const { hostKey, serverVersion } = await withDeadline(
+    readHostKey(socket),
+    SSH_LIMITS.probe.keyMs,
+    `\u0441\u0435\u0440\u0432\u0435\u0440 ${host}:${port} \u043F\u0440\u0438\u043D\u044F\u043B \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435, \u043D\u043E \u043F\u043E SSH \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B`,
+    () => socket.close?.()
+  );
+  return { fpr: hostKey.fingerprint, serverVersion };
 }
 async function connectPassword(host, port, user, pass, fprs, timeoutMs = DEFAULT_CONNECT_MS) {
   return connect({
@@ -3925,6 +3953,7 @@ async function connectKey(host, port, user, key, fprs, timeoutMs = DEFAULT_CONNE
     timeoutMs
   });
 }
+var sshDeps = { connectPassword, connectKey, probeHostKey };
 
 // src/backup.ts
 async function readAll(stream) {
@@ -3947,20 +3976,21 @@ async function readAll(stream) {
   }
   return out;
 }
-async function pullBackup(env) {
+async function pullBackup(env, now = false) {
+  const lim = now ? SSH_LIMITS.backupNow : SSH_LIMITS.backupCron;
   const host = await currentDnsIp(env);
   if (!host) throw new Error("\u043D\u0435 \u0443\u0437\u043D\u0430\u0442\u044C \u0430\u0434\u0440\u0435\u0441 \u0432\u0445\u043E\u0434\u0430 \u0438\u0437 DNS");
   let fprs = await getEntryFpr(env);
   if (fprs.length === 0) {
-    const { fpr } = await probeHostKey(host, Number(env.ENTRY_SSH_PORT));
+    const { fpr } = await sshDeps.probeHostKey(host, Number(env.ENTRY_SSH_PORT));
     fprs = [fpr];
     await setEntryFpr(env, fprs);
   }
-  const ssh = await connectKey(host, Number(env.ENTRY_SSH_PORT), env.ENTRY_USER, env.ENTRY_SSH_KEY, fprs);
-  try {
+  const ssh = await sshDeps.connectKey(host, Number(env.ENTRY_SSH_PORT), env.ENTRY_USER, env.ENTRY_SSH_KEY, fprs, lim.connectMs);
+  const work = async () => {
     const r = await ssh.exec("/usr/local/bin/vpn-backup.sh 2>/dev/null | tail -1", {
       maxOutputBytes: 4096,
-      signal: AbortSignal.timeout(12e4)
+      signal: AbortSignal.timeout(lim.workMs)
     });
     const path = r.stdout.trim();
     if (!path.startsWith("/")) throw new Error(`vpn-backup.sh \u043D\u0435 \u0434\u0430\u043B \u043F\u0443\u0442\u044C: ${path.slice(0, 120)}`);
@@ -3972,12 +4002,16 @@ async function pullBackup(env) {
     } finally {
       await sftp.end();
     }
+  };
+  try {
+    return await withDeadline(work(), lim.workMs, "\u0431\u044D\u043A\u0430\u043F \u0441\u043E \u0441\u0442\u0430\u0440\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430", () => ssh.close());
   } finally {
-    await ssh.close();
+    await ssh.close().catch(() => {
+    });
   }
 }
-async function doBackup(env) {
-  const { name, bytes: bytes2 } = await pullBackup(env);
+async function doBackup(env, now = false) {
+  const { name, bytes: bytes2 } = await pullBackup(env, now);
   await putBackup(env, name, bytes2);
   return { name, size: bytes2.byteLength, bytes: bytes2 };
 }
@@ -4104,11 +4138,12 @@ async function announceGranted(env, added) {
 }
 
 // src/migrate.ts
-var deps = { connectPassword, connectKey, probeHostKey };
+var deps = sshDeps;
+var RESTORE_LIMIT_SEC = 1500;
 async function preflight(host, port) {
   return deps.probeHostKey(host, port);
 }
-function bootstrap(env, token, root = "/root") {
+function bootstrap(env, token, root = "/root", limitSec = RESTORE_LIMIT_SEC) {
   const base = env.SELF_ORIGIN.replace(/\/$/, "");
   return [
     "set -e",
@@ -4127,7 +4162,8 @@ function bootstrap(env, token, root = "/root") {
     `bash ${root}/.mig/vpn-backup-*/restore.sh`,
     "EOS",
     `chmod +x ${root}/.vpn-migrate.sh`,
-    `nohup bash -c '${root}/.vpn-migrate.sh >${root}/.vpn-migrate.log 2>&1 9>&-; rc=$?; ip=$(curl -fsS --max-time 8 https://api.ipify.org 9>&- || echo); curl -fsS --retry 3 --max-time 15 -X POST "${base}/migdone/${token}" --data-urlencode "rc=$rc" --data-urlencode "ip=$ip" 9>&- || true' >/dev/null 2>&1 &`,
+    // timeout: зависший перенос обрывается (код 124) — замок снимается, а бот узнаёт об исходе.
+    `nohup bash -c 'timeout -k 30 ${limitSec} ${root}/.vpn-migrate.sh >${root}/.vpn-migrate.log 2>&1 9>&-; rc=$?; ip=$(curl -fsS --max-time 8 https://api.ipify.org 9>&- || echo); curl -fsS --retry 3 --max-time 15 -X POST "${base}/migdone/${token}" --data-urlencode "rc=$rc" --data-urlencode "ip=$ip" 9>&- || true' >/dev/null 2>&1 &`,
     "echo STARTED"
   ].join("\n");
 }
@@ -4140,10 +4176,12 @@ async function launch(env, opts) {
   try {
     let r;
     try {
-      r = await ssh.exec(bootstrap(env, opts.token), {
-        maxOutputBytes: 8192,
-        signal: AbortSignal.timeout(SSH_LIMITS.launch.execMs)
-      });
+      r = await withDeadline(
+        ssh.exec(bootstrap(env, opts.token), { maxOutputBytes: 8192, signal: AbortSignal.timeout(SSH_LIMITS.launch.execMs) }),
+        SSH_LIMITS.launch.execMs,
+        "\u0441\u0435\u0440\u0432\u0435\u0440",
+        () => ssh.close()
+      );
     } catch (e) {
       throw new LaunchUnknown(e.message || "\u0441\u0432\u044F\u0437\u044C \u043E\u0431\u043E\u0440\u0432\u0430\u043B\u0430\u0441\u044C");
     }
@@ -4163,7 +4201,12 @@ async function runOnExit(env, cmd) {
   const ms = SSH_LIMITS.exit.connectMs;
   const ssh = env.EXIT_SSH_KEY ? await deps.connectKey(env.EXIT_HOST, Number(env.EXIT_PORT), env.EXIT_USER, env.EXIT_SSH_KEY, fprs, ms) : await deps.connectPassword(env.EXIT_HOST, Number(env.EXIT_PORT), env.EXIT_USER, env.EXIT_SSH_PASS || "", fprs, ms);
   try {
-    const r = await ssh.exec(cmd, { maxOutputBytes: 8192, signal: AbortSignal.timeout(SSH_LIMITS.exit.execMs) });
+    const r = await withDeadline(
+      ssh.exec(cmd, { maxOutputBytes: 8192, signal: AbortSignal.timeout(SSH_LIMITS.exit.execMs) }),
+      SSH_LIMITS.exit.execMs,
+      "\u0432\u044B\u0445\u043E\u0434",
+      () => ssh.close()
+    );
     if (r.exitStatus !== 0) {
       throw new Error((r.stderr || r.stdout || `\u043A\u043E\u0434 ${r.exitStatus}`).trim().slice(0, 200));
     }
@@ -4175,8 +4218,8 @@ async function runOnExit(env, cmd) {
 async function openExitFor(env, newIp) {
   const cmd = exitCmds(env, newIp);
   if (!cmd) return;
-  await runOnExit(env, cmd);
   await noteExitOpened(env, newIp);
+  await runOnExit(env, cmd);
 }
 var EXIT_TMP_MS = 90 * 6e4;
 async function sweepExit(env, now, entryIp) {
@@ -4236,8 +4279,6 @@ async function finishDns(env, mig, reportedIp = "") {
     );
     return;
   }
-  await setEntryFpr(env, mig.fpr ? [mig.fpr] : []);
-  await finishMigration(env, { ...mig, status: "done", newIp });
   await notifyAdmins(
     env,
     `\u2705 \u0413\u043E\u0442\u043E\u0432\u043E. \u0412\u0445\u043E\u0434 \u043F\u0435\u0440\u0435\u0435\u0445\u0430\u043B \u043D\u0430 <b>${esc(newIp)}</b>, A-\u0437\u0430\u043F\u0438\u0441\u044C \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0430.
@@ -4245,6 +4286,27 @@ async function finishDns(env, mig, reportedIp = "") {
 \u0421\u0442\u0430\u0440\u044B\u0439 \u0441\u0435\u0440\u0432\u0435\u0440 \u043F\u043E\u043A\u0430 \u043D\u0435 \u0443\u0434\u0430\u043B\u044F\u0439.`,
     MENU
   );
+  const lost = [];
+  try {
+    await setEntryFpr(env, mig.fpr ? [mig.fpr] : []);
+  } catch (e) {
+    lost.push(`\u043E\u0442\u043F\u0435\u0447\u0430\u0442\u043E\u043A \u043A\u043B\u044E\u0447\u0430 \u043D\u043E\u0432\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430 (${esc(why(e))}) \u2014 \u0431\u044D\u043A\u0430\u043F\u044B \u043D\u0435 \u0431\u0443\u0434\u0443\u0442 \u0441\u043D\u0438\u043C\u0430\u0442\u044C\u0441\u044F, \u043F\u043E\u043A\u0430 \u043E\u043D \u043D\u0435 \u0437\u0430\u043F\u0438\u0448\u0435\u0442\u0441\u044F`);
+  }
+  try {
+    await finishMigration(env, { ...mig, status: "done", newIp });
+  } catch (e) {
+    lost.push(`\u043E\u0442\u043C\u0435\u0442\u043A\u0443 \u043E\u0431 \u043E\u043A\u043E\u043D\u0447\u0430\u043D\u0438\u0438 (${esc(why(e))}) \u2014 \xAB\u041F\u0435\u0440\u0435\u0435\u0437\u0434\xBB \u0441 \u043F\u043E\u043B\u0447\u0430\u0441\u0430 \u0431\u0443\u0434\u0435\u0442 \u043E\u0442\u0432\u0435\u0447\u0430\u0442\u044C \xAB\u0443\u0436\u0435 \u0438\u0434\u0451\u0442\xBB`);
+  }
+  if (lost.length) {
+    await saveMigration(env, { ...mig, status: "dns", newIp }, 86400).catch(() => {
+    });
+    await notifyAdmins(
+      env,
+      `\u26A0\uFE0F \u041F\u0435\u0440\u0435\u0435\u0437\u0434 \u0441\u043E\u0441\u0442\u043E\u044F\u043B\u0441\u044F, \u043D\u043E \u0432 \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0435 \u044F \u043D\u0435 \u0437\u0430\u043F\u0438\u0441\u0430\u043B: ${lost.join("; ")}.
+\u041A\u043E\u0433\u0434\u0430 \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0435 \u0437\u0430\u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442 (\u043B\u0438\u043C\u0438\u0442 \u0437\u0430\u043F\u0438\u0441\u0435\u0439 \u043E\u0431\u043D\u0443\u043B\u044F\u0435\u0442\u0441\u044F \u0432 \u043F\u043E\u043B\u043D\u043E\u0447\u044C UTC), \u043D\u0430\u0436\u043C\u0438 \xAB\u041F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0434\u043E\u043C\u0435\u043D\xBB \u2014 \u0434\u043E\u0432\u0435\u0440\u0448\u0443 \u0443\u0447\u0451\u0442; \u0434\u043E\u043C\u0435\u043D \u0443\u0436\u0435 \u043D\u0430 \u043C\u0435\u0441\u0442\u0435.`,
+      [[{ text: "\u{1F501} \u041F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0434\u043E\u043C\u0435\u043D", data: "mgd" }], ...MENU]
+    );
+  }
   if (!chainConfigured(env) || !exitHasFirewall(env)) return;
   const old = previous && previous !== newIp ? previous : "";
   let line = "";
@@ -4322,6 +4384,7 @@ async function onMessage(env, tg, msg, updateId) {
   }
 }
 async function onInvite(env, tg, from, chat, token, admins, updateId) {
+  if (await wasSeen(env, updateId)) return;
   const inv = await peekInvite(env, token);
   if (!inv || !admins.some((a) => a.id === inv.by)) {
     return void await tg.send(chat, "\u0421\u0441\u044B\u043B\u043A\u0430-\u043F\u0440\u0438\u0433\u043B\u0430\u0448\u0435\u043D\u0438\u0435 \u043D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u0430: \u043E\u043D\u0430 \u043E\u0434\u043D\u043E\u0440\u0430\u0437\u043E\u0432\u0430\u044F \u0438 \u0436\u0438\u0432\u0451\u0442 \u0441\u0443\u0442\u043A\u0438. \u041F\u043E\u043F\u0440\u043E\u0441\u0438 \u043D\u043E\u0432\u0443\u044E.");
@@ -4357,7 +4420,7 @@ async function onCallback(env, tg, cq, updateId) {
   const data = cq.data || "";
   const [key, arg] = data.split(":");
   try {
-    if (key !== "mgo" && (await getDialog(env, uid)).mode !== "idle") await setDialog(env, uid, { mode: "idle" });
+    if (key !== "mgo" && key !== "ca" && (await getDialog(env, uid)).mode !== "idle") await setDialog(env, uid, { mode: "idle" });
     switch (key) {
       case "m":
         await tg.answer(cq.id);
@@ -4569,7 +4632,7 @@ async function runBanCheck(env, tg, chat, mid) {
 async function runBackup(env, tg, chat, mid) {
   await show(tg, chat, mid, working("\u0421\u043D\u0438\u043C\u0430\u044E \u0431\u044D\u043A\u0430\u043F \u0441\u043E \u0432\u0445\u043E\u0434\u0430"));
   try {
-    const { size } = await doBackup(env);
+    const { size } = await doBackup(env, true);
     await show(tg, chat, mid, {
       text: `\u2705 \u0411\u044D\u043A\u0430\u043F \u0441\u043D\u044F\u0442 (${(size / 1024).toFixed(0)} \u041A\u0411) \u0438 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D \u0432 \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0435 Cloudflare. \u0418\u0437 \u043D\u0435\u0433\u043E \u0434\u0435\u043B\u0430\u0435\u0442\u0441\u044F \u043F\u0435\u0440\u0435\u0435\u0437\u0434.`,
       kb: [[{ text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]]
@@ -4617,7 +4680,7 @@ async function migStart(env, tg, chat, mid, uid) {
   let pick2;
   try {
     pick2 = await freshOrStored(
-      async () => ({ size: (await doBackup(env)).size }),
+      async () => ({ size: (await doBackup(env, true)).size }),
       () => backupMeta(env)
     );
   } catch (e) {
@@ -4723,19 +4786,30 @@ async function migConfirm(env, tg, cq, chat, mid, me, admins) {
     await setDialog(env, uid, { mode: "idle" });
     return show(tg, chat, mid, errorScreen(busy, "m"));
   }
-  const token = crypto.randomUUID().replace(/-/g, "");
-  const started = { token, chatId: String(chat), host: dialog.host, startedAt: Date.now(), status: "running", by: uid, fpr: dialog.fpr };
-  await startMigration(env, started);
   await setDialog(env, uid, { mode: "idle" });
   await tg.answer(cq.id, "\u0417\u0430\u043F\u0443\u0441\u043A\u0430\u044E\u2026");
-  await show(tg, chat, mid, working("\u0417\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u043F\u0435\u0440\u0435\u043D\u043E\u0441 \u043D\u0430 \u043D\u043E\u0432\u043E\u043C \u0441\u0435\u0440\u0432\u0435\u0440\u0435"));
-  await sleep3(400);
-  const now = await currentMigration(env);
-  if (!now || now.token !== token) {
-    await dropToken(env, token);
-    return show(tg, chat, mid, errorScreen("\u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u0442\u043E\u043B\u044C\u043A\u043E \u0447\u0442\u043E \u0437\u0430\u043F\u0443\u0441\u0442\u0438\u043B \u0434\u0440\u0443\u0433\u043E\u0439 \u0430\u0434\u043C\u0438\u043D \u2014 \u0434\u043E\u0436\u0434\u0438\u0441\u044C \u0435\u0433\u043E \u0438\u0442\u043E\u0433\u0430", "m"));
-  }
+  const token = crypto.randomUUID().replace(/-/g, "");
+  const started = { token, chatId: String(chat), host: dialog.host, startedAt: Date.now(), status: "running", by: uid, fpr: dialog.fpr };
+  let mine = false;
   try {
+    try {
+      await startMigration(env, started);
+      mine = true;
+    } catch {
+      await markMigrationFailed(env, started).catch(() => {
+      });
+    }
+    if (mine) {
+      await show(tg, chat, mid, working("\u0417\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u043F\u0435\u0440\u0435\u043D\u043E\u0441 \u043D\u0430 \u043D\u043E\u0432\u043E\u043C \u0441\u0435\u0440\u0432\u0435\u0440\u0435"));
+      await sleep3(400);
+      const now = await currentMigration(env);
+      if (now && now.token !== token) mine = false;
+    }
+    if (!mine) {
+      await dropToken(env, token).catch(() => {
+      });
+      return show(tg, chat, mid, errorScreen("\u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u0442\u043E\u043B\u044C\u043A\u043E \u0447\u0442\u043E \u0437\u0430\u043F\u0443\u0441\u0442\u0438\u043B \u0434\u0440\u0443\u0433\u043E\u0439 \u0430\u0434\u043C\u0438\u043D \u2014 \u0434\u043E\u0436\u0434\u0438\u0441\u044C \u0435\u0433\u043E \u0438\u0442\u043E\u0433\u0430", "m"));
+    }
     if (!await backupMeta(env)) throw new Error("\u043D\u0435\u0442 \u0431\u044D\u043A\u0430\u043F\u0430 \u2014 \u043D\u0430\u0447\u043D\u0438 \u043F\u0435\u0440\u0435\u0435\u0437\u0434 \u0437\u0430\u043D\u043E\u0432\u043E");
     await launch(env, { host: dialog.host, port: dialog.port, pass: dialog.pass, fpr: dialog.fpr, token });
   } catch (e) {
@@ -4745,11 +4819,11 @@ async function migConfirm(env, tg, cq, chat, mid, me, admins) {
         kb: [[{ text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]]
       });
     }
-    const marked = await markMigrationFailed(env, started).then(() => true, () => false);
+    const marked = !mine || await markMigrationFailed(env, started).then(() => true, () => false);
     const tail = marked ? "" : " \u041E\u0442\u043C\u0435\u0442\u0438\u0442\u044C \u0437\u0430\u043F\u0443\u0441\u043A \u0441\u043E\u0440\u0432\u0430\u0432\u0448\u0438\u043C\u0441\u044F \u043D\u0435 \u0432\u044B\u0448\u043B\u043E \u2014 \u043F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0441\u044F \u0447\u0435\u0440\u0435\u0437 \u043F\u043E\u043B\u0447\u0430\u0441\u0430.";
     if (e instanceof LaunchBusy) {
       return show(tg, chat, mid, {
-        text: `\u26A0\uFE0F \u041D\u0430 <b>${esc(dialog.host)}</b> \u0443\u0436\u0435 \u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u043D\u043E\u0441, \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u043D\u044B\u0439 \u0440\u0430\u043D\u044C\u0448\u0435, \u2014 \u0432\u0442\u043E\u0440\u043E\u0439 \u043F\u043E\u0432\u0435\u0440\u0445 \u043D\u0435\u0433\u043E \u044F \u043D\u0435 \u0437\u0430\u043F\u0443\u0441\u043A\u0430\u043B. \u0414\u043E\u0436\u0434\u0438\u0441\u044C \u0435\u0433\u043E \u0438\u0442\u043E\u0433\u0430: \u044F \u043D\u0430\u043F\u0438\u0448\u0443. \u0415\u0441\u043B\u0438 \u0437\u0430 \u043F\u043E\u043B\u0447\u0430\u0441\u0430 \u043D\u0438\u0447\u0435\u0433\u043E \u043D\u0435 \u043F\u0440\u0438\u0434\u0451\u0442 \u2014 \u043D\u0430\u0447\u043D\u0438 \u0437\u0430\u043D\u043E\u0432\u043E.${tail}`,
+        text: `\u26A0\uFE0F \u041D\u0430 <b>${esc(dialog.host)}</b> \u0443\u0436\u0435 \u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u043D\u043E\u0441, \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u043D\u044B\u0439 \u0440\u0430\u043D\u044C\u0448\u0435, \u2014 \u0432\u0442\u043E\u0440\u043E\u0439 \u043F\u043E\u0432\u0435\u0440\u0445 \u043D\u0435\u0433\u043E \u044F \u043D\u0435 \u0437\u0430\u043F\u0443\u0441\u043A\u0430\u043B. \u0414\u043E\u0436\u0434\u0438\u0441\u044C \u0435\u0433\u043E \u0438\u0442\u043E\u0433\u0430: \u044F \u043D\u0430\u043F\u0438\u0448\u0443. \u041F\u0435\u0440\u0435\u043D\u043E\u0441 \u043D\u0430 \u0441\u0435\u0440\u0432\u0435\u0440\u0435 \u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442 \u043D\u0435 \u0434\u043E\u043B\u044C\u0448\u0435 25 \u043C\u0438\u043D\u0443\u0442; \u0435\u0441\u043B\u0438 \u0438 \u0447\u0435\u0440\u0435\u0437 \u043F\u043E\u043B\u0447\u0430\u0441\u0430 \u043E\u0442\u0432\u0435\u0442 \u0442\u043E\u0442 \u0436\u0435 \u2014 \u043F\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u0438 \u043D\u043E\u0432\u044B\u0439 \u0441\u0435\u0440\u0432\u0435\u0440 \u0438 \u043D\u0430\u0447\u043D\u0438 \u0437\u0430\u043D\u043E\u0432\u043E.${tail}`,
         kb: [[{ text: "\u2190 \u041C\u0435\u043D\u044E", data: "m" }]]
       });
     }
