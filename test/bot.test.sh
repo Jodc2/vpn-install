@@ -1749,7 +1749,7 @@ fw_env() {
 	port_users() { :; }
 	DB=$WORK/x-ui.db STATE=$WORK/vpn-install.env UFW_RULES=$WORK/user.rules
 	MODE=nodomain PANEL_PUBLIC=0 SUB_TLS=0 SUB_PORT=2096 WEB_PORT=54321 REALITY_PORT=2083 SSH_PORTS=22
-	OTHER_VPN='' OTHER_VPN_PORTS='' MOVED_FROM='' FAILS=0
+	OTHER_VPN='' OTHER_VPN_PORTS='' MOVED_FROM='' FAILS=0 SSH_NOW_PORT=''
 	UFW_SAYS="Status: inactive" UFW_STATUS_RC='' UFW_FAIL=''
 	unset SSH_CONNECTION   # тесты идут и по SSH: порты SSH шагу задаёт только $SSH_PORTS
 	: > "$WORK/out"; : > "$WORK/ufw.calls"; : > "$UFW_RULES"; rm -f "$DB"
@@ -1937,7 +1937,7 @@ test_fw_ssh_limited_by_source_is_not_reopened_to_all() {  # пункт 9а: ufw 
 		'### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 OpenSSH - in' \
 		'### tuple ### limit tcp 22 0.0.0.0/0 any 0.0.0.0/0 in' \
 		'### tuple ### allow any any 0.0.0.0/0 any 203.0.113.5 in'; do
-		fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222"
+		fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222" SSH_NOW_PORT=2222
 		echo "$rule" > "$UFW_RULES"
 		fw_step
 		! fw_called "allow 22/tcp" || t_fail "SSH открыт всем поверх правила «$rule»: $(fw_calls)"
@@ -1945,12 +1945,55 @@ test_fw_ssh_limited_by_source_is_not_reopened_to_all() {  # пункт 9а: ufw 
 			*"any any"*)
 				! fw_called "allow 2222/tcp" || t_fail "правило на любой порт покрывает и 2222: $(fw_calls)"
 				grep -q '^OK SSH :22,2222 уже разрешён' "$WORK/out" || t_fail "оба порта SSH названы оставленными: $(cat "$WORK/out")" ;;
-			*) fw_called "allow 2222/tcp" || t_fail "для порта SSH 2222 правила нет — его надо разрешить: $(fw_calls)" ;;
+			*) fw_called "allow 2222/tcp" || t_fail "через порт 2222 вошли сейчас, правила для него нет — его надо разрешить: $(fw_calls)" ;;
 		esac
 		fw_called "allow 2083/tcp" || t_fail "порт VPN не разрешён: $(fw_calls)"
 		grep -q '^OK SSH :22.* уже разрешён правилами ufw' "$WORK/out" || t_fail "не сказано, что правила SSH оставлены: $(cat "$WORK/out")"
 		! grep -q 'открыто:.* 22/tcp' "$WORK/out" || t_fail "порт 22 назван открытым скриптом: $(cat "$WORK/out")"
 	done
+}
+test_fw_ssh_port_without_rule_stays_closed_when_ssh_is_allowed_elsewhere() {  # ufw включён, вход по SSH разрешён через 2222, а для 22 правила нет
+	# или стоит явный deny. Скрипт добавлял общее «allow 22/tcp» — настоящий ufw заменяет им и deny: порт, который хозяин
+	# сервера закрыл, открывался всем.
+	local rules now
+	for rules in '### tuple ### allow tcp 2222 0.0.0.0/0 any 0.0.0.0/0 in' \
+		$'### tuple ### deny tcp 22 0.0.0.0/0 any 0.0.0.0/0 in\n### tuple ### allow tcp 2222 0.0.0.0/0 any 203.0.113.5 in'; do
+		for now in 2222 ''; do   # вошли через разрешённый порт; вошли не по SSH (консоль хостера)
+			fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222" SSH_NOW_PORT=$now
+			echo "$rules" > "$UFW_RULES"
+			fw_step
+			! fw_called "allow 22/tcp" || t_fail "порт 22 открыт всем, хотя вход разрешён через 2222 (вошли через «$now»): $(fw_calls)"
+			! fw_called "allow 2222/tcp" || t_fail "порту с правилом добавлено общее разрешение: $(fw_calls)"
+			grep -q '^OK SSH :22 в ufw не разрешён.*как есть' "$WORK/out" || t_fail "не сказано, что порт 22 оставлен закрытым: $(cat "$WORK/out")"
+			! grep -q 'открыто:.* 22/tcp' "$WORK/out" || t_fail "порт 22 назван открытым: $(cat "$WORK/out")"
+			fw_called "allow 2083/tcp" || t_fail "порт VPN не разрешён: $(fw_calls)"
+		done
+	done
+}
+test_fw_ssh_port_of_this_login_gets_rule() {  # порт, через который вошли сейчас, без разрешения не остаётся — даже когда у другого порта SSH правило есть
+	fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222" SSH_NOW_PORT=22
+	echo '### tuple ### allow tcp 2222 0.0.0.0/0 any 203.0.113.5 in' > "$UFW_RULES"
+	fw_step
+	fw_called "allow 22/tcp" || t_fail "порт нынешнего входа (22) не разрешён: $(fw_calls)"
+	! fw_called "allow 2222/tcp" || t_fail "порту с правилом добавлено общее разрешение: $(fw_calls)"
+}
+test_fw_ssh_no_rule_for_any_port_allows_them_all() {  # ни у одного порта SSH разрешающего правила нет — разрешаются все, как раньше
+	local now
+	for now in '' 2222; do
+		fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222" SSH_NOW_PORT=$now
+		echo '### tuple ### allow tcp 443 0.0.0.0/0 any 0.0.0.0/0 in' > "$UFW_RULES"
+		fw_step
+		fw_called "allow 22/tcp" && fw_called "allow 2222/tcp" || t_fail "правил для SSH нет вовсе — нужны оба порта (вошли через «$now»): $(fw_calls)"
+	done
+}
+test_fw_unknown_state_keeps_ssh_rules_too() {  # состояние ufw не понять, а SSH в его правилах разрешён только с одного адреса —
+	# общее разрешение не добавляется и тут (ufw может оказаться включённым)
+	fw_env; UFW_STATUS_RC=1 SSH_PORTS="22 2222" SSH_NOW_PORT=22
+	printf '%s\n' '### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 in' > "$UFW_RULES"
+	fw_step
+	! fw_called "allow 22/tcp" || t_fail "состояние ufw не понять — SSH открыт всем поверх правила «только с адреса»: $(fw_calls)"
+	! fw_called "allow 2222/tcp" || t_fail "порт без правила открыт, хотя вход разрешён через 22: $(fw_calls)"
+	fw_called "allow 2083/tcp" || t_fail "порт VPN не разрешён: $(fw_calls)"
 }
 test_fw_ssh_always_allowed_when_script_enables_ufw() {  # пункт 9а: ufw выключен и включаем его мы — SSH разрешается обязательно, какие бы правила ни лежали в файлах
 	fw_env; SSH_PORTS="22 2222"

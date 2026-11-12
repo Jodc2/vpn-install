@@ -3263,6 +3263,7 @@ EOF
 fi
 SSH_PORTS=$(ssh_ports)
 SSH_PORT=${SSH_PORTS%% *}
+SSH_NOW_PORT=$(ssh_conn_port)   # порт, через который вошли сейчас (пусто — не по SSH): фаервол его без разрешения не оставит
 SSH_LOGIN=root   # под кем входить в инструкциях: зашли через sudo (AWS, Oracle — ubuntu) — под тем же пользователем
 if [[ ${SUDO_USER:-} =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] && [ "$SUDO_USER" != root ]; then SSH_LOGIN=$SUDO_USER; fi
 
@@ -3313,7 +3314,7 @@ fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в u
 	ufw delete allow "$1" >/dev/null 2>&1 || true
 }
 fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить
-	local KEEP="" OPEN KEPT CLOSING p pp state inb inb_ok=1 lost="" lost_ssh="" ssh_as_is="" opened=""
+	local KEEP="" OPEN KEPT CLOSING p pp state inb inb_ok=1 lost="" lost_ssh="" ssh_as_is="" ssh_ok="" ssh_left="" opened=""
 	# Состояние ufw спрашивается один раз на весь шаг: от ответа зависит и что открывать, и можно ли включать. Два вопроса
 	# могли получить два разных ответа — и ufw включался без разрешений, которые по первому ответу были нужны.
 	state=$(ufw_state)
@@ -3324,11 +3325,22 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 	# ufw выключен (сам так ответил) — подключения панели сейчас доступны снаружи, и включённый ufw не должен их закрыть.
 	# Включён — его правила остаются как есть; состояние не понять — лишнего не открываем.
 	[ "$state" != inactive ] || KEEP=$FW_INBOUND
-	# SSH. Когда ufw включает скрипт, разрешение для портов SSH обязательно. Когда ufw уже включён (или его состояние не
-	# понять) и для порта есть разрешающее правило — пусть только с адреса админа, — общее не добавляется: оно открыло бы
-	# SSH всем, кому админ его закрыл. Нынешний вход от этого не страдает: его пускают правила, которые есть.
+	# SSH. Когда ufw включает скрипт, разрешение для всех портов SSH обязательно. Когда ufw уже включён (или его состояние
+	# не понять), главнее правила хозяина сервера:
+	# — у порта есть разрешающее правило, пусть только с адреса админа, — общее не добавляется: оно открыло бы SSH всем,
+	#   кому админ его закрыл. Нынешний вход от этого не страдает: его пускают правила, которые есть;
+	# — у порта правила нет (или стоит deny), а вход по SSH разрешён через другой порт — порт остаётся как есть: общее
+	#   разрешение отменило бы и явный deny. Кроме порта, через который вошли сейчас: он без разрешения не остаётся;
+	# — разрешающего правила нет ни у одного порта SSH — разрешаются все, как раньше.
 	if [ "$state" != inactive ]; then
-		for p in $SSH_PORTS; do ! ufw_allows_tcp "$p" || ssh_as_is="$ssh_as_is $p/tcp"; done
+		for p in $SSH_PORTS; do ! ufw_allows_tcp "$p" || ssh_ok="$ssh_ok $p"; done
+		for p in $SSH_PORTS; do
+			if [[ " $ssh_ok " == *" $p "* ]]; then
+				ssh_as_is="$ssh_as_is $p/tcp"
+			elif [ -n "$ssh_ok" ] && [ "$p" != "${SSH_NOW_PORT:-}" ]; then
+				ssh_as_is="$ssh_as_is $p/tcp" ssh_left="$ssh_left $p"
+			fi
+		done
 	fi
 	OPEN=$( {
 		for p in $SSH_PORTS; do echo "$p/tcp"; done   # среди них и порт нынешнего входа (ssh_ports)
@@ -3345,9 +3357,13 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		case " $KEEP " in *" $p "*) lost="$lost $p" ;; esac
 		for pp in $SSH_PORTS; do [ "$pp/tcp" != "$p" ] || lost_ssh="$lost_ssh $pp"; done
 	done
-	if [ -n "$ssh_as_is" ]; then
-		p=${ssh_as_is# }; p=${p//\/tcp/}
+	if [ -n "$ssh_ok" ]; then
+		p=${ssh_ok# }
 		ok "SSH :${p// /,} уже разрешён правилами ufw — их не менял"
+	fi
+	if [ -n "$ssh_left" ]; then
+		p=${ssh_left# }
+		ok "SSH :${p// /,} в ufw не разрешён, а вход по SSH разрешён через другой порт — оставил как есть (нужен и этот: ufw allow ПОРТ/tcp)"
 	fi
 	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || [[ " $lost " == *" $pp "* ]] || printf '%s ' "$pp"; done)
 	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
