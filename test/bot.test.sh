@@ -1861,6 +1861,8 @@ test_port_taken_check_by_state() {  # та же проверка перед из
 	! ( port_taken_check ) || t_fail "выключенное чужое подключение тоже занимает порт в панели"
 	S_INBOUND_ID=7 OWN_INBOUND_ID='' REALITY_PORT=2083
 	! ( port_taken_check ) || t_fail "своё подключение удалено, на его порту другое — оно не своё"
+	S_INBOUND_ID=2 OWN_INBOUND_ID='' REALITY_PORT=2083
+	( port_taken_check ) || t_fail "своё подключение в начале запуска было нечем прочитать (нет python3) — оно всё равно своё: $(cat "$WORK/out")"
 	S_INBOUND_ID='' OWN_INBOUND_ID=1 REALITY_PORT=2083
 	( port_taken_check ) || t_fail "настройки прежней версии — как раньше, без этой проверки: $(cat "$WORK/out")"
 }

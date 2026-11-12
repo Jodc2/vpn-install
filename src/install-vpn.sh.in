@@ -240,7 +240,7 @@ foreign_on_port() {  # foreign_on_port ПОРТ [СВОЙ_ID] → id друго�
 r = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute(
     "select id from inbounds where port=? and id<>? order by id limit 1", (int(sys.argv[2]), int(sys.argv[3]))).fetchone()
 print(r[0] if r else "")' "$DB" "$1" "${2:-0}" 2> /dev/null ||
-		sqlite3 -readonly "$DB" "select id from inbounds where port=$(($1)) and id<>$((${2:-0})) order by id limit 1;" 2> /dev/null || true
+		sqlite3 -readonly "$DB" "select id from inbounds where port=$((10#$1)) and id<>$((10#${2:-0})) order by id limit 1;" 2> /dev/null || true
 }
 foreign_xui_check() {  # 3x-ui здесь ставили без этого скрипта: сказать, что будет, и спросить сразу — до любых вопросов и изменений
 	local n msg p=${PORT_ARG:-2083}
@@ -363,7 +363,7 @@ find_own_inbound() {  # → S_INBOUND_ID (из настроек), OWN_INBOUND_ID
 port_taken_check() {  # порт своего подключения занят в панели другим — остановиться, пока ничего не изменено
 	local other
 	[ -n "$S_INBOUND_ID" ] || return 0   # настройки прежней версии: своё подключение там — по признакам, как раньше
-	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-0}")
+	other=$(foreign_on_port "$REALITY_PORT" "${OWN_INBOUND_ID:-$S_INBOUND_ID}")   # своё — и то, что в начале было нечем прочитать
 	[ -z "$other" ] || die "на порту $REALITY_PORT в панели уже есть другое подключение (#$other). Скрипт его не трогает, а своему нужен свободный порт — запустите с другим: bash $0 --port N"
 }
 inbound_move() {  # inbound_move ID СТАРЫЙ_ПОРТ НОВЫЙ_ПОРТ — перенести своё подключение, и только его (x-ui остановлен)
@@ -3265,7 +3265,7 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		case " $KEEP " in *" $p "*) lost="$lost $p" ;; esac
 		for pp in $SSH_PORTS; do [ "$pp/tcp" != "$p" ] || lost_ssh="$lost_ssh $pp"; done
 	done
-	[ -z "$ssh_as_is" ] || ok "SSH :$(echo $ssh_as_is | sed 's#/tcp##g; s/ /,/g') уже разрешён правилами ufw — их не менял (общего разрешения не добавлял)"
+	[ -z "$ssh_as_is" ] || ok "SSH :$(echo $ssh_as_is | sed 's#/tcp##g; s/ /,/g') уже разрешён правилами ufw — их не менял"
 	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || [[ " $lost " == *" $pp "* ]] || printf '%s ' "$pp"; done)
 	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
 	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
