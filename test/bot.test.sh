@@ -1977,7 +1977,7 @@ test_exit_fw_follows_what_ufw_says() {  # пункт 5: на старом сер
 
 # Порты SSH (пункт 9в). sshd -T отвечает портами из $SSHD_T, systemctl знает сокеты из $SOCK_ON (их Listen — в файлах
 # $WORK/listen.ИМЯ), ss печатает $WORK/ss.out. ssh_fns_file — те же функции и заглушки файлом, для запуска в другой оболочке.
-SSH_FNS='ssh_ports|ssh_conn_port|ssh_socket_ports|sshd_listen_ports'
+SSH_FNS='ssh_ports|ssh_connection|ssh_login_method|ssh_conn_port|ssh_socket_ports|sshd_listen_ports'
 ssh_stubs() {
 	sshd() {
 		local p
@@ -2348,6 +2348,39 @@ restore_ssh() {
 test_restore_ssh_header_only_with_content() {  # заголовок «SSH» без единой строки под ним — когда в бэкапе нет ни ключей, ни настроек SSH
 	t_eq "" "$(restore_ssh есть)" "печатать нечего — нет и заголовка"
 	t_eq $'== SSH\nWARN sshd не установлен — настройки SSH пропущены' "$(restore_ssh нет)" "есть что сказать — заголовок один раз, перед сообщением"
+}
+
+# ——— запуск под sudo: SSH_CONNECTION стёрта, а знать о своём входе скрипту нужно ———
+test_ssh_login_method_seen_through_sudo() {  # --ssh-key-only: «вы вошли по паролю» должно быть видно и под sudo — иначе пароль выключался, и человек оставался без входа
+	local out
+	cat > "$WORK/journal" <<'EOF'
+Accepted publickey for root from 203.0.113.9 port 40000 ssh2: ED25519 SHA256:abc
+Accepted password for ubuntu from 203.0.113.9 port 50000 ssh2
+EOF
+	ssh_fns_file "$WORK/how.sh" "journalctl() { cat '$WORK/journal'; }; ssh_login_method"
+	# Средняя оболочка — «sudo»: у неё SSH_CONNECTION есть, а запущенному из неё скрипту она её не передаёт.
+	out=$(SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 22' bash -c 'env -u SSH_CONNECTION bash "$0"; :' "$WORK/how.sh")
+	t_eq "password" "$out" "под sudo способ входа известен"
+	out=$(SSH_CONNECTION='203.0.113.9 40000 198.51.100.1 22' bash "$WORK/how.sh")
+	t_eq "publickey" "$out" "без sudo — как раньше"
+}
+test_ssh_session_address_seen_through_sudo() {  # адрес входа: по нему IPv6 не выключается при входе по IPv6, и он идёт в исключения fail2ban
+	local f=$ROOT/src/install-vpn.sh.in
+	ssh_fns_file "$WORK/conn.sh" 'ssh_connection'
+	t_eq "2001:db8::5 50000 2001:db8::1 22" "$(SSH_CONNECTION='2001:db8::5 50000 2001:db8::1 22' bash -c 'env -u SSH_CONNECTION bash "$0"; :' "$WORK/conn.sh")" "под sudo"
+	t_eq "203.0.113.9 50001 198.51.100.1 2200" "$(SSH_CONNECTION='203.0.113.9 50000 198.51.100.1 2222' bash -c 'SSH_CONNECTION="203.0.113.9 50001 198.51.100.1 2200" bash "$0"; :' "$WORK/conn.sh")" "своя главнее родительской"
+	# установщик узнаёт о своём входе только через эту функцию: прямое чтение SSH_CONNECTION под sudo даёт пусто
+	! awk '/^ssh_connection\(\) \{/,/^}/ {next} {print}' "$f" | grep -n 'SSH_CONNECTION[:}]' || t_fail "SSH_CONNECTION читается мимо ssh_connection"
+	grep -q 'SSH_FROM=$(ssh_connection)' "$f" || t_fail "решение про IPv6 — не по ssh_connection"
+	grep -q 'CLIENT_IP=$(ssh_connection)' "$f" || t_fail "исключение fail2ban — не по ssh_connection"
+}
+test_ssh_key_only_ignores_cloud_stub_key() {  # в облачных образах у root лежит ключ-заглушка («Please login as the user ubuntu…»): войти по нему нельзя
+	eval "$(awk '/^root_has_own_key\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	local f=$WORK/ak
+	printf '%s\n' 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding,command="echo '"'"'Please login as the user \"ubuntu\" rather than the user \"root\".'"'"';echo;sleep 10;exit 142" ssh-rsa AAAAstub cloud' > "$f"
+	! root_has_own_key "$f" || t_fail "ключ-заглушка сошёл за ключ человека"
+	echo 'ssh-ed25519 AAAAuser user@laptop' >> "$f"
+	root_has_own_key "$f" || t_fail "настоящий ключ рядом с заглушкой не увиден"
 }
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———

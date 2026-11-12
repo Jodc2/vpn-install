@@ -754,28 +754,35 @@ detect_ips() {  # LISTEN_IP — адрес на интерфейсе, PUBLIC_IP 
 	fi
 }
 
-root_has_own_key() {  # у root в authorized_keys есть ключ человека; ключ бота («… vpn-bot») не в счёт
+root_has_own_key() {  # у root в authorized_keys есть ключ человека. Не в счёт: ключ бота («… vpn-bot») и ключи с
+	# принудительной командой — такова заглушка облачных образов («Please login as the user ubuntu…»): войти по ней нельзя
 	local f=${1:-/root/.ssh/authorized_keys}
-	[ -f "$f" ] && grep -qvE -e ' vpn-bot$' -e '^[[:space:]]*(#|$)' "$f"
+	[ -f "$f" ] && grep -qvE -e ' vpn-bot$' -e '^[[:space:]]*(#|$)' -e 'command="' "$f"
 }
-
-ssh_login_method() {  # как вошли в эту SSH-сессию: publickey | password | keyboard-interactive | пусто (не узнать)
-	local cip cport rest
-	read -r cip cport rest <<<"${SSH_CONNECTION:-}" || true
-	[ -n "${cport:-}" ] || return 0
-	{ journalctl -q --no-pager -o cat -t sshd -t sshd-session 2>/dev/null || true; cat /var/log/auth.log 2>/dev/null || true; } |
-		{ grep -oE "Accepted [a-z-]+ for [^ ]+ from ${cip//./\\.} port $cport( |\$)" || true; } | tail -1 | awk '{print $2}'
-}
-
-ssh_conn_port() {  # порт сервера из SSH_CONNECTION — через него человек вошёл сейчас. sudo и «su -» её стирают:
-	# тогда она берётся из окружения родительских процессов (оболочки, из которой запущен sudo).
+ssh_connection() {  # SSH_CONNECTION этого входа («адрес_клиента порт адрес_сервера порт»); пусто — вошли не по SSH.
+	# sudo и «su -» её стирают — тогда она берётся из окружения родительских процессов (оболочки, из которой запущен
+	# sudo). Читать переменную напрямую нельзя: под sudo скрипт не знал бы ни как вошёл человек (--ssh-key-only
+	# выключал пароль тому, кто вошёл по паролю), ни откуда (IPv6, исключения fail2ban), ни через какой порт.
 	local c=${SSH_CONNECTION:-} pid=$$ n=0
 	while [ -z "$c" ] && [ "${pid:-0}" -gt 1 ] && [ "$n" -lt 32 ]; do
 		c=$({ tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^SSH_CONNECTION=//p'; } 2>/dev/null || true)
 		pid=$(awk '$1 == "PPid:" {print $2}' "/proc/$pid/status" 2>/dev/null || true)
 		n=$((n + 1))
 	done
-	c=${c%%$'\n'*}
+	echo "${c%%$'\n'*}"
+}
+
+ssh_login_method() {  # как вошли в эту SSH-сессию: publickey | password | keyboard-interactive | пусто (не узнать)
+	local cip cport rest
+	read -r cip cport rest <<<"$(ssh_connection)" || true
+	[ -n "${cport:-}" ] || return 0
+	{ journalctl -q --no-pager -o cat -t sshd -t sshd-session 2>/dev/null || true; cat /var/log/auth.log 2>/dev/null || true; } |
+		{ grep -oE "Accepted [a-z-]+ for [^ ]+ from ${cip//./\\.} port $cport( |\$)" || true; } | tail -1 | awk '{print $2}'
+}
+
+ssh_conn_port() {  # порт сервера, через который человек вошёл сейчас (из ssh_connection); пусто — вошли не по SSH
+	local c
+	c=$(ssh_connection)
 	echo "${c##* }"
 }
 ssh_socket_ports() {  # порты из ListenStream у ssh.socket / sshd.socket: когда sshd запускает systemd по обращению к порту,
@@ -3065,7 +3072,7 @@ detect_other_vpn
 
 say "Ядро, swap, часовой пояс"
 # IPv6 выключается (клиенты и Let's Encrypt — по IPv4). Зашли на сервер по IPv6 — не трогать: вход оборвался бы.
-SSH_FROM=${SSH_CONNECTION:-}; SSH_FROM=${SSH_FROM%% *}
+SSH_FROM=$(ssh_connection); SSH_FROM=${SSH_FROM%% *}
 V6_OFF=1
 case $SSH_FROM in ::ffff:*) ;; *:*) V6_OFF=0 ;; esac
 {
@@ -3145,7 +3152,7 @@ elif ! command -v sshd >/dev/null; then
 elif ! "${APT[@]}" install fail2ban python3-systemd >/dev/null; then
 	bad "fail2ban не установился"
 else
-	CLIENT_IP=${SSH_CONNECTION:-}   # пусто, если зашли не по SSH или через sudo -i (sudo её сбрасывает)
+	CLIENT_IP=$(ssh_connection)   # пусто, если зашли не по SSH
 	CLIENT_IP=${CLIENT_IP%% *}
 	[[ $CLIENT_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || CLIENT_IP=
 	mkdir -p /etc/fail2ban/jail.d
