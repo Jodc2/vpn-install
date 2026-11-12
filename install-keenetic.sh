@@ -2,7 +2,7 @@
 # install-keenetic.sh — VPN на роутер Keenetic / Netcraze с родной прошивкой (KeeneticOS 4 и новее) одной командой.
 # Ставит XKeen с ядром Xray и настраивает его по ссылке на подписку 3x-ui (VLESS + Reality, транспорт XHTTP или TCP).
 # По умолчанию через VPN идёт только заблокированное в России, остальное — напрямую; режим меняется одной командой.
-# Подписка и списки сайтов перечитываются сами.
+# Подписка проверяется сама раз в 10 минут (сменились порт или ключи сервера — роутер подхватит), списки сайтов — раз в сутки.
 #
 # До запуска на роутере должна стоять среда Entware (лучше на флешке) — см. README, раздел «Роутер Keenetic».
 # Запуск — в SSH-консоли Entware (ssh root@192.168.1.1 -p 222):
@@ -13,11 +13,13 @@
 #   vpn-keenetic --mode all       через VPN — всё
 #   vpn-keenetic --mode sites youtube,instagram,discord   через VPN — только названные сервисы (имена — из списка v2fly)
 #   vpn-keenetic --update         перечитать подписку, списки и свои файлы; применить, если что-то изменилось
+#   vpn-keenetic --poll           то же, но только подписка и молча — так скрипт сам зовёт себя по расписанию
 #   vpn-keenetic --status         что сейчас настроено и работает ли туннель
 #   vpn-keenetic --off | --on     выключить VPN (интернет идёт напрямую) / включить обратно
 #   vpn-keenetic --remove         убрать настройки этого скрипта (XKeen остаётся: его снимает «xkeen -remove»)
 #
 # Свои сайты — в /opt/etc/vpn-keenetic/vpn.txt (всегда через VPN) и direct.txt (всегда напрямую), потом --update.
+# Как часто проверять подписку — VPNK_POLL_MIN=5 sh vpn-keenetic.sh … (минуты; 0 — только раз в сутки вместе со списками).
 # Повторный запуск безопасен. Сам скрипт ничего не шлёт никуда, кроме вашего сервера и проверки адреса выхода.
 
 # shellcheck disable=SC3043   # local есть и в busybox ash (оболочка Entware), и в dash
@@ -28,13 +30,22 @@ XKEEN_SHA256=${VPNK_XKEEN_SHA256:-4b9350b11fab7fd3e4973db609db0fb780994f4b5ab009
 XRAY_VER=${VPNK_XRAY_VER:-26.6.1}      # как на сервере из install-vpn.sh: клиент и сервер XHTTP — одной версии
 P=${VPNK_PREFIX:-}                      # для проверки скрипта: корень поддельной системы
 OPT=$P/opt
+# Планировщик запускает скрипт с коротким PATH, а curl, jq и остальное лежат в Entware.
+PATH=$OPT/sbin:$OPT/bin:$OPT/usr/sbin:$OPT/usr/bin:$PATH
+export PATH
 CONF_DIR=$OPT/etc/xray/configs
 DAT_DIR=$OPT/etc/xray/dat               # списки сайтов; имена файлов — как у XKeen
-GEO_DAYS=${VPNK_GEO_DAYS:-7}            # списки старше этого перечитываются
+GEO_DAYS=${VPNK_GEO_DAYS:-1}            # списки старше этого (в сутках) перечитываются — ночным и ручным обновлением
+case $GEO_DAYS in '' | *[!0-9]*) GEO_DAYS=1 ;; esac
 STATE_DIR=$OPT/etc/vpn-keenetic
 XKEEN_JSON=$OPT/etc/xkeen/xkeen.json
 SELF=$OPT/sbin/vpn-keenetic
 CRON_FILE=$OPT/var/spool/cron/crontabs/root
+RUN_DIR=${VPNK_RUN_DIR:-$P/tmp}         # память роутера, не флешка: замок и пометки опроса подписки
+LOCK=$RUN_DIR/vpn-keenetic.lock         # один запуск за раз
+BAD=$RUN_DIR/vpn-keenetic.bad           # подключение из подписки, которое не заработало: по кругу его не пробуем
+FAILING=$RUN_DIR/vpn-keenetic.failing   # подписка сейчас не читается — в журнал об этом один раз, а не каждый опрос
+CHECKED=$RUN_DIR/vpn-keenetic.checked   # когда подписку проверяли в последний раз
 SOCKS_PORT=${VPNK_SOCKS_PORT:-1090}     # локальный вход для самопроверки туннеля (только 127.0.0.1)
 RCI=${VPNK_RCI:-127.0.0.1:79}
 MIN_FREE_MB=${VPNK_MIN_FREE_MB:-60}
@@ -47,7 +58,8 @@ say() { printf '\n==> %s\n' "$*"; }
 ok() { printf '  OK    %s\n' "$*"; }
 warn() { printf '  ВНИМ. %s\n' "$*"; }
 die() { printf '\nОстановлено: %s\n' "$*" >&2; exit 1; }
-note() { command -v logger > /dev/null 2>&1 && logger -t vpn-keenetic "$*" || true; }
+LOGGER=${VPNK_LOGGER:-logger}
+note() { command -v "$LOGGER" > /dev/null 2>&1 && "$LOGGER" -t vpn-keenetic "$*" || true; }   # запись в журнал роутера
 
 # ——— Ссылка vless:// → исходящее подключение Xray. Целиком на jq, без регулярных выражений: jq в Entware собран без них. ———
 # shellcheck disable=SC2016
@@ -421,6 +433,13 @@ geo_fetch() {  # geo_fetch ФАЙЛ РЕПОЗИТОРИЙ ИМЯ → $WORK/geo/
 	! head -c 64 "$out" | grep -qi '<html\|<!doctype' || { GEO_ERR="вместо списка пришла веб-страница"; return 1; }
 	GEO_ERR=''
 }
+geo_fresh() {  # geo_fresh ФАЙЛ — список на месте и моложе GEO_DAYS суток. Запас в час: ночное обновление идёт в одно и то же
+	# время, и вчерашнему списку до полных суток всегда не хватало бы секунд — он обновлялся бы через день
+	local now mt
+	[ -s "$1" ] || return 1
+	now=$(date +%s) && mt=$(date -r "$1" +%s 2> /dev/null) || return 1
+	[ $((now - mt)) -lt $((GEO_DAYS * 86400 - 3600)) ]
+}
 geo_ensure() {  # списки для режима ROUTE: скачать, если их нет или они устарели. → GEO_CHANGED; 1 и ERR — нужного списка нет вовсе
 	local f repo asset
 	GEO_CHANGED=0 GEO_UNVERIFIED=0 ERR=''
@@ -429,7 +448,7 @@ geo_ensure() {  # списки для режима ROUTE: скачать, есл
 	mkdir -p "$DAT_DIR"
 	while IFS='|' read -r f repo asset; do
 		[ -n "$f" ] || continue
-		if [ -s "$DAT_DIR/$f" ] && [ -z "$(find "$DAT_DIR/$f" -mtime "+$GEO_DAYS" 2> /dev/null)" ]; then continue; fi
+		if geo_fresh "$DAT_DIR/$f"; then continue; fi
 		if geo_fetch "$f" "$repo" "$asset"; then
 			if cmp -s "$WORK/geo/$f" "$DAT_DIR/$f" 2> /dev/null; then touch "$DAT_DIR/$f"; continue; fi
 			# прежний файл — в сторону: не заработает новый — вернём (geo_rollback)
@@ -539,21 +558,39 @@ rollback() {  # настройки и списки — как до этого з
 	geo_rollback
 }
 
-tunnel_ip() {  # адрес, под которым интернет видит роутер через VPN; пусто — туннель не работает
-	local i out
-	for i in 1 2 3 4 5 6; do
+tunnel_ip() {  # tunnel_ip [ПОПЫТОК] — адрес, под которым интернет видит роутер через VPN; пусто — туннель не работает
+	local i=0 n="${1:-6}" out
+	while [ "$i" -lt "$n" ]; do
+		i=$((i + 1))
 		out=$(curl -s --connect-timeout 5 -m 12 -x "socks5h://127.0.0.1:$SOCKS_PORT" "$TRACE_URL" 2> /dev/null | sed -n 's/^ip=//p' | head -1) || out=
 		[ -z "$out" ] || { printf '%s' "$out"; return 0; }
-		sleep "${VPNK_WAIT:-3}"
+		[ "$i" -ge "$n" ] || sleep "${VPNK_WAIT:-3}"
 	done
 	return 0
 }
 
-apply() {  # проверить настройки, запустить и убедиться, что туннель работает; иначе вернуть как было. → VPN_IP
+tunnel_dead() {  # Xray запущен, а туннель через него не работает. Запущен ли — видно по его входу для самопроверки: закрытый порт
+	# (код 7 у curl) значит, что VPN остановлен, а не сломан
+	local i=0 rc out
+	while [ "$i" -lt 2 ]; do
+		i=$((i + 1))
+		rc=0
+		out=$(curl -s --connect-timeout 5 -m 12 -x "socks5h://127.0.0.1:$SOCKS_PORT" "$TRACE_URL" 2> /dev/null) || rc=$?
+		[ "$rc" != 7 ] || return 1
+		! printf '%s\n' "$out" | grep -q '^ip=' || return 1
+		[ "$i" -ge 2 ] || sleep "${VPNK_WAIT:-3}"
+	done
+	return 0
+}
+
+apply() {  # проверить настройки, запустить и убедиться, что туннель работает. → VPN_IP; 1 — туннель с новыми настройками не
+	# поднялся (вернуть прежние — дело вызывающего); Xray настройки не принял — прежние возвращены, VPN не трогали: остановка,
+	# а при APPLY_SOFT=1 (опрос по расписанию) — код 2
 	local out
 	VPN_IP=
 	if ! out=$(XRAY_LOCATION_CONFDIR="$CONF_DIR" XRAY_LOCATION_ASSET="$DAT_DIR" "$OPT/sbin/xray" -format=json -test 2>&1 < /dev/null); then
 		rollback
+		[ "${APPLY_SOFT:-0}" != 1 ] || return 2
 		die "Xray не принял настройки, вернул прежние. Его ответ: $(printf '%s' "$out" | tail -3 | tr '\n' ' ' | cut -c1-300)"
 	fi
 	"$OPT/sbin/xkeen" -restart < /dev/null > "$WORK/xkeen.out" 2>&1 || true
@@ -561,23 +598,85 @@ apply() {  # проверить настройки, запустить и убе
 	[ -n "$VPN_IP" ]
 }
 
-cron_set() {  # раз в сутки перечитывать подписку (для прямой ссылки vless:// не нужно)
-	local line="17 5 * * * $SELF --update > /dev/null 2>&1"
-	mkdir -p "$(dirname "$CRON_FILE")"
-	touch "$CRON_FILE"
-	grep -v 'vpn-keenetic --update' "$CRON_FILE" > "$WORK/cron" || true
+# Подписка 3x-ui на каждый запрос отдаёт другую ссылку: shortId — случайный из списка подключения, spiderX — случайный всегда
+# (проверено на 3x-ui 3.3.1). Сервер при этом тот же, и нынешние значения годятся: это не «подписка изменилась» — иначе
+# каждая проверка перезапускала бы VPN.
+JQ_CORE='def core: del(.streamSettings.realitySettings.shortId, .streamSettings.realitySettings.spiderX);'
+link_core() { printf '%s' "$1" | jq -c "$JQ_CORE"' .outbound | core'; }   # подключение без случайных полей
+link_settle() {  # PARSED против нынешних настроек → SAME_LINK=1, если отличие только в случайных полях: тогда в PARSED остаётся
+	# нынешнее подключение, а ссылка как пришла — в FRESH
+	local cur
+	SAME_LINK=0 FRESH=$PARSED
+	[ -s "$CONF_DIR/04_outbounds.json" ] || return 0
+	cur=$(jq -c '.outbounds[0]' "$CONF_DIR/04_outbounds.json" 2> /dev/null) || return 0
+	if printf '%s' "$PARSED" | jq -e --argjson cur "$cur" "$JQ_CORE"' (.outbound | core) == ($cur | core)' > /dev/null 2>&1; then
+		PARSED=$(printf '%s' "$PARSED" | jq -c --argjson cur "$cur" '.outbound = $cur')
+		SAME_LINK=1
+	fi
+}
+
+lock_stale() {  # замок остался от умершего запуска: его процесса нет, или замку больше получаса (столько не идёт ни один запуск)
+	local pid now mt
+	now=$(date +%s)
+	mt=$(date -r "$LOCK" +%s 2> /dev/null) || return 0   # замка уже нет
+	[ $((now - mt)) -lt 1800 ] || return 0
+	pid=$(cat "$LOCK/pid" 2> /dev/null) || return 1      # замок взят только что: его хозяин ещё не записал себя
+	case $pid in '' | *[!0-9]*) return 1 ;; esac
+	! kill -0 "$pid" 2> /dev/null
+}
+lock_take() {  # lock_take [quiet] — один запуск за раз: опрос раз в несколько минут не должен наложиться на обновление, которое
+	# качает списки и перезапускает VPN. Занято: опрос (quiet) молча выходит, остальные ждут и, не дождавшись, останавливаются
+	local i=0 n=0 wait="${VPNK_LOCK_WAIT:-60}"
+	mkdir -p "$RUN_DIR" 2> /dev/null || true
+	while ! mkdir "$LOCK" 2> /dev/null; do
+		if [ ! -d "$LOCK" ] || lock_stale; then   # замка нет (его только что сняли — или в $RUN_DIR нельзя писать) либо он ничей
+			n=$((n + 1))
+			[ "$n" -lt 5 ] || die "не получается взять замок $LOCK (нет записи в $RUN_DIR?)"
+			rm -rf "$LOCK" 2> /dev/null || true
+			continue
+		fi
+		[ "${1:-}" != quiet ] || exit 0
+		[ "$i" -lt "$wait" ] || die "vpn-keenetic уже работает (другая команда или проверка по расписанию) — подождите минуту и повторите"
+		sleep 2
+		i=$((i + 2))
+	done
+	echo $$ > "$LOCK/pid"
+	LOCKED=1
+}
+
+poll_load() {  # → POLL_MIN, период опроса подписки в минутах (0 — не опрашивать): из окружения, прошлой установки или умолчания
+	POLL_MIN=${VPNK_POLL_MIN:-}
+	[ -n "$POLL_MIN" ] || { [ ! -s "$STATE_DIR/poll" ] || POLL_MIN=$(cat "$STATE_DIR/poll"); }
+	POLL_MIN=${POLL_MIN:-10}
+	case $POLL_MIN in
+		*[!0-9]* | ???*) die "VPNK_POLL_MIN — как часто проверять подписку, в минутах: число от 1 до 59 (0 — только раз в сутки), а дано «$POLL_MIN»" ;;
+		0?) POLL_MIN=${POLL_MIN#0} ;;   # «05» → 5
+	esac
+	[ "$POLL_MIN" -le 59 ] || die "VPNK_POLL_MIN — как часто проверять подписку, в минутах: число от 1 до 59 (0 — только раз в сутки), а дано «$POLL_MIN»"
+}
+
+cron_set() {  # расписание: раз в POLL_MIN минут — подписка (у прямой ссылки vless:// её нет); ночью — ещё списки сайтов и свои файлы
+	local nightly="17 5 * * * $SELF --update > /dev/null 2>&1" poll=''
 	case $SOURCE in
 		[Vv][Ll][Ee][Ss][Ss]://*) ;;
-		*) printf '%s\n' "$line" >> "$WORK/cron" ;;
+		*) [ "$POLL_MIN" = 0 ] || poll="*/$POLL_MIN * * * * $SELF --poll > /dev/null 2>&1" ;;
 	esac
+	mkdir -p "$(dirname "$CRON_FILE")"
+	touch "$CRON_FILE"
+	grep -v -e 'vpn-keenetic --update' -e 'vpn-keenetic --poll' "$CRON_FILE" > "$WORK/cron" || true
+	[ -z "$poll" ] || printf '%s\n' "$poll" >> "$WORK/cron"
+	printf '%s\n' "$nightly" >> "$WORK/cron"
 	cmp -s "$WORK/cron" "$CRON_FILE" || { cp "$WORK/cron" "$CRON_FILE.vpnk-new" && chmod 600 "$CRON_FILE.vpnk-new" && mv -f "$CRON_FILE.vpnk-new" "$CRON_FILE"; }
-	case $SOURCE in [Vv][Ll][Ee][Ss][Ss]://*) return 0 ;; esac
 	[ -x "$OPT/etc/init.d/S10cron" ] || opkg install cron > /dev/null 2>&1 || true
 	if [ -x "$OPT/etc/init.d/S10cron" ]; then
 		"$OPT/etc/init.d/S10cron" restart > /dev/null 2>&1 || "$OPT/etc/init.d/S10cron" start > /dev/null 2>&1 || true
-		ok "подписка перечитывается сама раз в сутки (в 05:17)"
+		if [ -n "$poll" ]; then
+			ok "подписка проверяется сама каждые $POLL_MIN мин; списки сайтов и свои файлы перечитываются раз в сутки (в 05:17)"
+		else
+			ok "списки сайтов и свои файлы перечитываются сами раз в сутки (в 05:17)$(case $SOURCE in [Vv][Ll][Ee][Ss][Ss]://*) ;; *) echo ", подписка — тогда же" ;; esac)"
+		fi
 	else
-		warn "планировщик cron не установился — подписка сама обновляться не будет (вручную: vpn-keenetic --update)"
+		warn "планировщик cron не установился — подписка и списки сайтов сами обновляться не будут (вручную: vpn-keenetic --update)"
 	fi
 }
 
@@ -586,6 +685,7 @@ state_save() {
 	chmod 700 "$STATE_DIR"
 	(umask 077 && printf '%s\n' "$SOURCE" > "$STATE_DIR/source" && printf '%s\n' "$INDEX" > "$STATE_DIR/index" && date '+%F %R' > "$STATE_DIR/updated" &&
 		printf '%s\n' "$ROUTE" > "$STATE_DIR/mode" && printf '%s\n' "$SITES" > "$STATE_DIR/sites")
+	[ -z "${POLL_MIN:-}" ] || printf '%s\n' "$POLL_MIN" > "$STATE_DIR/poll"
 	[ -f "$STATE_DIR/vpn.txt" ] || printf '%s\n' "# Сайты, которые всегда идут через VPN — по одному в строке: example.com (вместе с поддоменами) или подсеть 203.0.113.0/24." \
 		"# После правки: vpn-keenetic --update" > "$STATE_DIR/vpn.txt"
 	[ -f "$STATE_DIR/direct.txt" ] || printf '%s\n' "# Сайты, которые всегда идут напрямую, мимо VPN — по одному в строке: example.com или подсеть 203.0.113.0/24." \
@@ -596,6 +696,7 @@ do_install() {
 	local direct host
 	MODE=install
 	need_entware
+	lock_take
 	say "Пакеты Entware"
 	opkg update > /dev/null 2>&1 || warn "список пакетов не обновился — если дальше не найдётся пакет, замените зеркало: sed -i 's,http://bin.entware.net/,http://mirrors.nju.edu.cn/entware/,g' $OPT/etc/opkg.conf"
 	opkg install curl jq tar ca-bundle > /dev/null 2>&1 || true
@@ -607,6 +708,7 @@ do_install() {
 	links_fetch || die "$ERR"
 	link_pick || die "$ERR"
 	mode_load
+	poll_load
 	host=$(printf '%s' "$PARSED" | jq -r '.host + ":" + (.port | tostring)')
 	ok "сервер $host ($(printf '%s' "$PARSED" | jq -r '.outbound.streamSettings.network | ascii_upcase') + Reality)$(printf '%s' "$PARSED" | jq -r 'if (.name | length) > 0 then ", клиент «" + .name + "»" else "" end')"
 	xkeen_install
@@ -622,6 +724,7 @@ do_install() {
 	if apply; then
 		geo_commit
 		state_save
+		rm -f "$STATE_DIR/off" "$BAD" "$FAILING"   # установка — это и «включить»
 		if [ -f "$0" ] && [ "$(readlink -f "$0" 2> /dev/null || echo "$0")" != "$SELF" ]; then cp "$0" "$SELF.new" && chmod 755 "$SELF.new" && mv -f "$SELF.new" "$SELF"; fi
 		direct=$(curl -s --connect-timeout 5 -m 12 "$TRACE_URL" 2> /dev/null | sed -n 's/^ip=//p' | head -1) || direct=
 		ok "туннель работает: через VPN интернет видит адрес $VPN_IP${direct:+ (без VPN был бы $direct)}"
@@ -658,15 +761,29 @@ reapply() {  # после сбоя новых настроек: прежние �
 	"$OPT/sbin/xkeen" -restart < /dev/null > /dev/null 2>&1 || true
 }
 
-do_update() {  # для планировщика: тихо; меняет что-то, только если есть что менять и новый туннель работает
+do_update() {  # вручную и ночью по расписанию: подписка, списки сайтов и свои файлы. Меняет что-то, только если есть что менять
+	# и новый туннель работает
+	local heal=0
 	MODE=update
 	[ -s "$STATE_DIR/source" ] && [ -x "$OPT/sbin/xkeen" ] || die "VPN этим скриптом ещё не настраивался"
+	lock_take
+	if [ -e "$STATE_DIR/off" ]; then   # выключили — значит выключили: обновление не включает VPN обратно
+		echo "VPN выключен (vpn-keenetic --off) — настройки не перечитываю. Включить: vpn-keenetic --on"
+		return 0
+	fi
 	SOURCE=$(cat "$STATE_DIR/source")
 	mode_load
 	links_fetch || { note "подписка не прочиталась: $ERR"; die "$ERR"; }
 	link_pick || { note "подписка не подошла: $ERR"; die "$ERR"; }
+	link_settle
+	# Сервер тот же, Xray запущен, а туннель не работает — возможно, не годится уже нынешний shortId (их сменили в панели):
+	# взять поля свежей ссылки. Остановленный VPN (Xray не запущен) не трогаем — его остановили намеренно.
+	if [ "$SAME_LINK" = 1 ] && tunnel_dead; then
+		PARSED=$FRESH heal=1
+	fi
 	geo_ensure || { note "$ERR"; die "$ERR"; }
 	configs_write
+	date '+%F %R' > "$CHECKED" 2> /dev/null || true
 	if [ "$CHANGED" = 0 ] && [ "$GEO_CHANGED" = 0 ]; then
 		date '+%F %R' > "$STATE_DIR/updated"
 		echo "подписка и списки сайтов не изменились"
@@ -675,12 +792,65 @@ do_update() {  # для планировщика: тихо; меняет что-
 	if apply; then
 		geo_commit
 		state_save
-		note "настройки обновлены (подписка, списки сайтов или свои списки), выход $VPN_IP"
-		echo "настройки обновлены, туннель работает (выход $VPN_IP)"
+		rm -f "$BAD"
+		if [ "$heal" = 1 ]; then
+			note "туннель не работал — VPN перезапущен со свежей ссылкой из подписки, выход $VPN_IP"
+			echo "туннель не работал — перезапустил VPN со свежей ссылкой из подписки: работает (выход $VPN_IP)"
+		else
+			note "настройки обновлены (подписка, списки сайтов или свои списки), выход $VPN_IP"
+			echo "настройки обновлены, туннель работает (выход $VPN_IP)"
+		fi
 	else
 		reapply
+		if [ "$heal" = 1 ]; then
+			note "туннель не работает и со свежей ссылкой из подписки — прежние настройки возвращены"
+			die "туннель не работает и со свежей ссылкой из подписки — вернул прежние настройки (сервер недоступен? на нём: vpn-check)"
+		fi
+		(umask 077 && link_core "$PARSED" > "$BAD") 2> /dev/null || true   # опрос по расписанию не будет пробовать это же по кругу
 		note "новые настройки не заработали — возвращены прежние"
 		die "новые настройки не заработали — вернул прежние"
+	fi
+}
+
+do_poll() {  # по расписанию, раз в несколько минут: только подписка. Сервер тот же — ни слова, ни перезапуска, ни записи на флешку
+	local core rc
+	MODE=update
+	[ -s "$STATE_DIR/source" ] && [ -x "$OPT/sbin/xkeen" ] || return 0
+	[ ! -e "$STATE_DIR/off" ] || return 0   # VPN выключен — не трогаем
+	SOURCE=$(cat "$STATE_DIR/source")
+	case $SOURCE in [Vv][Ll][Ee][Ss][Ss]://*) return 0 ;; esac   # прямая ссылка — опрашивать нечего
+	lock_take quiet
+	mode_load
+	if ! links_fetch || ! link_pick; then
+		[ -e "$FAILING" ] || { : > "$FAILING"; note "подписка не читается ($ERR) — работаю на прежних настройках"; }
+		return 0
+	fi
+	if [ -e "$FAILING" ]; then
+		rm -f "$FAILING"
+		note "подписка снова читается"
+	fi
+	date '+%F %R' > "$CHECKED"
+	link_settle
+	[ "$SAME_LINK" != 1 ] || return 0
+	core=$(link_core "$PARSED")
+	[ "$(cat "$BAD" 2> /dev/null)" != "$core" ] || return 0   # эту перемену уже пробовали — не заработала; ждём следующей или ночи
+	GEO_CHANGED=0
+	configs_write
+	[ "$CHANGED" = 1 ] || return 0
+	APPLY_SOFT=1
+	if apply; then
+		state_save
+		rm -f "$BAD"
+		note "подписка изменилась — настройки обновлены, выход $VPN_IP"
+	else
+		rc=$?
+		[ "$rc" = 2 ] || reapply
+		(umask 077 && printf '%s\n' "$core" > "$BAD")
+		if [ "$rc" = 2 ]; then
+			note "подписка изменилась, но Xray не принял новые настройки — работаю на прежних"
+		else
+			note "подписка изменилась, но с новыми настройками туннель не заработал — возвращены прежние (повтор — ночью или когда подписка изменится ещё раз)"
+		fi
 	fi
 }
 
@@ -688,6 +858,7 @@ do_mode() {  # vpn-keenetic --mode РЕЖИМ [СЕРВИСЫ]: сменить, 
 	MODE=update
 	[ -s "$STATE_DIR/source" ] && [ -x "$OPT/sbin/xkeen" ] && [ -f "$CONF_DIR/04_outbounds.json" ] || die "VPN этим скриптом ещё не настраивался"
 	[ -n "${1:-}" ] || die "какой режим? vpn-keenetic --mode blocked | all | sites youtube,instagram"
+	lock_take
 	VPNK_MODE=$1
 	[ -z "${2:-}" ] || VPNK_SITES=$2
 	mode_load
@@ -706,6 +877,7 @@ do_mode() {  # vpn-keenetic --mode РЕЖИМ [СЕРВИСЫ]: сменить, 
 	if apply; then
 		geo_commit
 		state_save
+		rm -f "$STATE_DIR/off"   # смена режима запускает VPN — значит, он включён
 		note "режим: $(mode_label)"
 		echo "Готово. Режим: $(mode_label). Туннель работает (выход $VPN_IP)"
 	else
@@ -722,7 +894,8 @@ do_status() {
 	fi
 	mode_load
 	echo "Режим: $(mode_label)"
-	echo "Подписка проверялась: $(cat "$STATE_DIR/updated" 2> /dev/null || echo 'ни разу')"
+	echo "Подписка проверялась: $(cat "$CHECKED" 2> /dev/null || cat "$STATE_DIR/updated" 2> /dev/null || echo 'ни разу')"
+	[ ! -e "$STATE_DIR/off" ] || echo "VPN выключен командой vpn-keenetic --off (включить: vpn-keenetic --on)"
 	VPNK_WAIT=1
 	ip=$(tunnel_ip)
 	if [ -n "$ip" ]; then echo "Туннель работает, выход в интернет с адреса $ip"; else echo "Туннель НЕ работает (VPN выключен? включить: vpn-keenetic --on)"; fi
@@ -731,11 +904,13 @@ do_status() {
 do_remove() {
 	local f
 	[ -d "$STATE_DIR" ] || die "настроек этого скрипта на роутере нет"
+	lock_take
 	"$OPT/sbin/xkeen" -stop < /dev/null > /dev/null 2>&1 || true
 	if [ -d "$STATE_DIR/original" ]; then configs_back "$STATE_DIR/original"; else for f in $FILES; do rm -f "$CONF_DIR/$f"; done; fi
 	for f in geosite_refilter.dat geoip_refilter.dat geosite_v2fly.dat; do rm -f "$DAT_DIR/$f" "$DAT_DIR/$f.vpnk-prev" "$DAT_DIR/$f.vpnk-absent"; done
-	if [ -f "$CRON_FILE" ]; then grep -v 'vpn-keenetic --update' "$CRON_FILE" > "$WORK/cron" || true; cp "$WORK/cron" "$CRON_FILE"; fi
+	if [ -f "$CRON_FILE" ]; then grep -v -e 'vpn-keenetic --update' -e 'vpn-keenetic --poll' "$CRON_FILE" > "$WORK/cron" || true; cp "$WORK/cron" "$CRON_FILE"; fi
 	rm -rf "$STATE_DIR"
+	rm -f "$BAD" "$FAILING" "$CHECKED"
 	rm -f "$SELF"
 	echo "Настройки VPN убраны (файлы Xray — какими были до этого скрипта), XKeen остановлен: интернет идёт напрямую."
 	echo "Сам XKeen снимается командой: xkeen -remove"
@@ -743,13 +918,23 @@ do_remove() {
 
 main() {
 	WORK=$(mktemp -d "${TMPDIR:-/tmp}/vpnk.XXXXXX")
-	trap 'rm -rf "$WORK"' EXIT
+	trap 'rm -rf "$WORK"; [ "${LOCKED:-0}" != 1 ] || rm -rf "$LOCK"' EXIT
+	trap 'exit 130' INT
+	trap 'exit 129' HUP
+	trap 'exit 143' TERM
 	case ${1:-} in
 		--update) do_update ;;
+		--poll) do_poll ;;
 		--mode) do_mode "${2:-}" "${3:-}" ;;
 		--status) do_status ;;
-		--off) "$OPT/sbin/xkeen" -stop < /dev/null && echo "VPN выключен: интернет идёт напрямую" ;;
-		--on) "$OPT/sbin/xkeen" -start < /dev/null && echo "VPN включён" ;;
+		--off)   # пометка — раньше остановки: проверка по расписанию не должна включить VPN обратно
+			lock_take
+			mkdir -p "$STATE_DIR" && : > "$STATE_DIR/off"
+			"$OPT/sbin/xkeen" -stop < /dev/null && echo "VPN выключен: интернет идёт напрямую (включить: vpn-keenetic --on)" ;;
+		--on)
+			lock_take
+			rm -f "$STATE_DIR/off"
+			"$OPT/sbin/xkeen" -start < /dev/null && echo "VPN включён" ;;
 		--remove) do_remove ;;
 		-h | --help) sed -n '2,/^$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' ;;
 		--*) die "неизвестный параметр $1 (справка: --help)" ;;

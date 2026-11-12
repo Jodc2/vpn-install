@@ -291,7 +291,8 @@ case $url in
 		[ -f "$FAKE/mirror.file" ] || exit 22; cat "$FAKE/mirror.file" > "$out" ;;
 	*cdn-cgi/trace*)
 		if [ -n "$proxy" ]; then
-			[ -f "$FAKE/tunnel.ok" ] || exit 7
+			# туннель не работает: Xray запущен — запрос через его вход срывается (97); не запущен — вход закрыт (7)
+			[ -f "$FAKE/tunnel.ok" ] || { [ -f "$FAKE/xray.running" ] && exit 97; exit 7; }
 			printf 'fl=1\nip=203.0.113.9\nwarp=off\n'
 		else
 			printf 'ip=198.51.100.7\n'
@@ -312,6 +313,7 @@ case $1 in
 		mkdir -p "$OPT/etc/xray/configs" "$OPT/etc/xray/dat"
 		cp "$FAKE/tpl"/*.json "$OPT/etc/xray/configs/"
 		cp "$FAKE/xray" "$OPT/sbin/xray" && chmod +x "$OPT/sbin/xray" ;;
+	-restart | -start) [ ! -f "$FAKE/restart.heals" ] || : > "$FAKE/tunnel.ok" ;;   # перезапуск «чинит» туннель, если так задано
 esac
 exit 0
 EOF
@@ -327,18 +329,31 @@ esac
 exit 0
 EOF
 	printf '#!/bin/sh\necho "cron $*" >> "$FAKE/calls"\n' > "$WORK/opt/etc/init.d/S10cron"
-	chmod +x "$WORK/bin/opkg" "$WORK/bin/curl" "$WORK/pkg/xkeen" "$FAKE/xray" "$WORK/opt/etc/init.d/S10cron"
+	# Записи в журнал роутера — в журнал вызовов, а не в настоящий syslog этой машины.
+	printf '#!/bin/sh\necho "logger $*" >> "$FAKE/calls"\n' > "$WORK/bin/logger"
+	: > "$FAKE/xray.running"   # Xray запущен (его вход для самопроверки отвечает), пока есть этот файл
+	chmod +x "$WORK/bin/opkg" "$WORK/bin/curl" "$WORK/bin/logger" "$WORK/pkg/xkeen" "$FAKE/xray" "$WORK/opt/etc/init.d/S10cron"
 	tar -czf "$FAKE/xkeen.tar.gz" -C "$WORK/pkg" xkeen _xkeen
 	: > "$FAKE/calls"
 	SUB=https://vpn.example.com/sub/s3cr3t
 }
 run() {  # run АРГУМЕНТЫ… → OUT, RC: скрипт на поддельном роутере, без терминала
 	RC=0
-	OUT=$(cd "$WORK" && VPNK_PREFIX=$WORK VPNK_PROC=$FAKE/proc VPNK_MODDIRS=$FAKE/nomods VPNK_WAIT=0 \
+	OUT=$(cd "$WORK" && VPNK_PREFIX=$WORK VPNK_PROC=$FAKE/proc VPNK_MODDIRS=$FAKE/nomods VPNK_WAIT=0 VPNK_LOGGER=$WORK/bin/logger \
 		VPNK_XKEEN_SHA256=$(sha256sum "$FAKE/xkeen.tar.gz" | cut -d' ' -f1) PATH="$WORK/bin:$PATH" \
 		$SH "$SCRIPT" "$@" 2>&1 < /dev/null) || RC=$?
 }
 calls() { grep -c -- "$1" "$FAKE/calls" || true; }
+resub() {  # resub 'ПРАВКА sed' — что теперь отдаёт подписка: та же ссылка с правкой
+	printf '%s\n' "$LINK" | sed "$1" | base64 | tr -d '\n' > "$FAKE/sub.body"
+}
+# Так подписку отдаёт 3x-ui: shortId — случайный из списка подключения, spiderX — новый на каждый запрос (проверено на 3.3.1).
+RND1='s/sid=ab12cd34/sid=77/; s/spx=%2F#/spx=%2FnfZK2sPiB3ItYYk#/'
+RND2='s/sid=ab12cd34/sid=c0cd/; s/spx=%2F#/spx=%2FPdF25vOgA3kubYx#/'
+port() { conf 04_outbounds.json '.outbounds[0].settings.vnext[0].port'; }
+sid() { conf 04_outbounds.json '.outbounds[0].streamSettings.realitySettings.shortId'; }
+CRON_OF() { echo "$WORK/opt/var/spool/cron/crontabs/root"; }
+flash_writes() { find "$WORK/opt" -newer "$WORK/marker" -type f | sed "s#^$WORK/##" | tr '\n' ' '; }   # что записано «на флешку» после метки
 conf() { jq -r "$2" "$WORK/opt/etc/xray/configs/$1"; }
 
 test_install_fresh_router() {
@@ -434,12 +449,17 @@ test_rerun_keeps_xkeen_and_link() {  # повтор без ссылки: XKeen �
 	t_has "туннель работает" "$OUT" "туннель проверен снова"
 	t_eq 1 "$(grep -c 'vpn-keenetic --update' "$WORK/opt/var/spool/cron/crontabs/root")" "задание одно"
 }
-test_direct_vless_link_has_no_schedule() {  # прямая ссылка vless:// — перечитывать нечего
+test_direct_vless_link_schedule_is_nightly_only() {  # прямая ссылка vless:// — опрашивать нечего, а списки сайтов и свои файлы перечитывать надо
 	router
 	run "$LINK"
 	t_eq 0 "$RC" "установка по прямой ссылке: $OUT"
 	t_eq 0 "$(calls 'curl https://vpn.example.com/sub/')" "подписку не запрашивали"
-	! grep -q 'vpn-keenetic --update' "$WORK/opt/var/spool/cron/crontabs/root" 2> /dev/null || t_fail "задание на обновление поставлено"
+	grep -q 'vpn-keenetic --update' "$(CRON_OF)" || t_fail "ночного задания нет — списки сайтов не обновлялись бы никогда"
+	! grep -q 'vpn-keenetic --poll' "$(CRON_OF)" || t_fail "поставлен опрос подписки, которой нет"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$RC" "опрос при прямой ссылке — не ошибка: $OUT"
+	t_eq 0 "$(calls '^curl ')" "и никуда не ходит"
 }
 test_token_needed_on_new_firmware() {  # KeeneticOS 5.2: без токена доступа XKeen не работает
 	router
@@ -528,6 +548,237 @@ test_update_broken_subscription_keeps_working_setup() {  # новые настр
 	[ "$RC" != 0 ] || t_fail "недоступная подписка — не ошибка"
 	t_eq 0 "$(calls '^xkeen ')" "при недоступной подписке ничего не трогали"
 	t_eq 2083 "$(conf 04_outbounds.json '.outbounds[0].settings.vnext[0].port')" "настройки целы"
+}
+test_update_ignores_random_link_fields() {  # 3x-ui на каждый запрос отдаёт ссылку с другими shortId и spiderX — это не «подписка изменилась»:
+	# иначе каждое обновление перезапускало бы VPN (так и было: каждую ночь)
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	cp "$WORK/opt/etc/xray/configs/04_outbounds.json" "$WORK/before.json"
+	resub "$RND1"
+	: > "$FAKE/calls"
+	run --update
+	t_eq 0 "$RC" "обновление: $OUT"
+	t_has "не изменились" "$OUT" "итог"
+	t_eq 0 "$(calls '^xkeen ')" "XKeen не перезапускали"
+	cmp -s "$WORK/before.json" "$WORK/opt/etc/xray/configs/04_outbounds.json" || t_fail "настройки переписаны, хотя сервер тот же"
+}
+test_poll_same_server_is_silent_and_writes_nothing() {  # опрос раз в несколько минут: сервер тот же — ни перезапуска, ни записей на флешку, ни слова
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	resub "$RND1"
+	: > "$WORK/marker"; : > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$RC" "опрос: $OUT"
+	t_eq "" "$OUT" "опрос молчит"
+	t_eq 1 "$(calls 'curl https://vpn.example.com/sub/')" "подписку запросили один раз"
+	t_eq 0 "$(calls '^xkeen ')" "XKeen не трогали"
+	t_eq 0 "$(calls '^logger ')" "в журнал роутера не писали"
+	t_eq "" "$(flash_writes)" "на флешку ничего не записано"
+	resub "$RND2"
+	run --poll
+	t_eq "" "$(flash_writes)" "и на втором опросе с другими случайными полями — тоже"
+}
+test_poll_applies_changed_subscription() {  # сервер сменил порт — роутер подхватил за один опрос
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	resub "s/:2083?/:8443?/; $RND1"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$RC" "опрос: $OUT"
+	t_eq 8443 "$(port)" "новый порт"
+	t_eq 77 "$(sid)" "и поля — из новой ссылки"
+	t_eq 1 "$(calls '^xkeen -restart$')" "перезапуск один"
+	t_eq 1 "$(calls '^logger .*подписка изменилась')" "запись в журнале роутера"
+	: > "$FAKE/calls"
+	resub "s/:2083?/:8443?/; $RND2"
+	run --poll
+	t_eq 0 "$(calls '^xkeen ')" "следующий опрос: сервер уже тот же"
+}
+test_poll_failed_change_is_not_retried_until_it_changes() {  # новые настройки из подписки не работают: вернуть прежние и не дёргать VPN
+	# каждые несколько минут — попробовать снова, только когда подписка изменится ещё раз (или ночью, полным обновлением)
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	resub "s/:2083?/:8443?/; $RND1"
+	rm -f "$FAKE/tunnel.ok"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$RC" "опрос планировщика не «падает»: $OUT"
+	t_eq 2083 "$(port)" "прежний порт возвращён"
+	t_eq 2 "$(calls '^xkeen -restart$')" "перезапуск с новыми и ещё раз — с прежними"
+	t_eq 1 "$(calls '^logger .*не заработал')" "запись в журнале роутера"
+	resub "s/:2083?/:8443?/; $RND2"
+	: > "$WORK/marker"; : > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$(calls '^xkeen ')" "ту же перемену второй раз не пробуем"
+	t_eq "" "$(flash_writes)" "и на флешку не пишем"
+	: > "$FAKE/tunnel.ok"
+	resub "s/:2083?/:9443?/; $RND1"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 9443 "$(port)" "подписка изменилась ещё раз — пробуем"
+	t_eq 1 "$(calls '^xkeen -restart$')" "и применяем"
+}
+test_poll_rejected_config_is_not_retried() {  # Xray не принял настройки из новой ссылки — VPN не трогаем вовсе и по кругу не ходим
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	resub "s/:2083?/:8443?/; $RND1"
+	: > "$FAKE/xray.test.fail"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$RC" "опрос: $OUT"
+	t_eq 2083 "$(port)" "прежние настройки на месте"
+	t_eq 0 "$(calls '^xkeen ')" "XKeen не перезапускали"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$(calls '^xray .*-test')" "ту же ссылку второй раз не проверяем"
+}
+test_poll_unreachable_subscription_notes_once() {  # сервер подписки недоступен: работаем на прежних настройках, в журнал — один раз, а не каждый опрос
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	rm -f "$FAKE/sub.body"
+	: > "$FAKE/calls"
+	run --poll; t_eq 0 "$RC" "опрос при недоступной подписке: $OUT"
+	run --poll; run --poll
+	t_eq 1 "$(calls '^logger .*подписка не')" "о сбое сказано один раз"
+	t_eq 0 "$(calls '^xkeen ')" "VPN не трогали"
+	resub "$RND1"
+	run --poll; run --poll
+	t_eq 1 "$(calls '^logger .*снова')" "и один раз — что подписка снова читается"
+}
+test_off_stays_off() {  # VPN выключили — ни опрос, ни обновление не включают его обратно, даже когда подписка действительно изменилась
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	run --off
+	t_has "выключен" "$OUT" "выключение"
+	resub "s/:2083?/:8443?/; $RND1"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$(calls '^xkeen ')" "опрос не включил VPN"
+	run --update
+	t_eq 0 "$RC" "обновление при выключенном VPN — не ошибка: $OUT"
+	t_has "выключен" "$OUT" "и говорит почему ничего не делает"
+	t_eq 0 "$(calls '^xkeen ')" "обновление не включило VPN"
+	t_eq 2083 "$(port)" "настройки не тронуты"
+	run --on
+	t_eq 1 "$(calls '^xkeen -start$')" "включение"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 8443 "$(port)" "после включения перемена подхвачена"
+}
+test_runs_do_not_overlap() {  # опрос раз в несколько минут не должен наложиться на идущее обновление (оно качает списки и перезапускает VPN)
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	mkdir -p "$WORK/tmp/vpn-keenetic.lock"
+	echo $$ > "$WORK/tmp/vpn-keenetic.lock/pid"   # «идёт другой запуск»: процесс жив
+	resub "s/:2083?/:8443?/; $RND1"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$RC" "опрос уступил молча: $OUT"
+	t_eq 0 "$(calls '^curl ')" "и никуда не ходил"
+	VPNK_LOCK_WAIT=0; export VPNK_LOCK_WAIT
+	run --update
+	[ "$RC" != 0 ] || t_fail "обновление пошло поверх идущего запуска"
+	t_has "уже работает" "$OUT" "и объяснило"
+	t_eq 2083 "$(port)" "настройки не тронуты"
+	sh -c 'echo $$' > "$WORK/tmp/vpn-keenetic.lock/pid"   # замок остался от умершего процесса
+	run --poll
+	t_eq 8443 "$(port)" "замок умершего процесса не мешает"
+	[ ! -e "$WORK/tmp/vpn-keenetic.lock" ] || t_fail "после запуска замок остался"
+}
+test_lock_never_spins_forever() {  # в каталоге для замка нельзя писать — остановиться с объяснением, а не крутиться вечно
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	VPNK_RUN_DIR=$WORK/nodir/deeper; export VPNK_RUN_DIR
+	: > "$WORK/nodir"   # на месте каталога — файл: создать в нём ничего нельзя
+	RC=0
+	OUT=$(cd "$WORK" && VPNK_PREFIX=$WORK VPNK_WAIT=0 VPNK_LOGGER=$WORK/bin/logger PATH="$WORK/bin:$PATH" timeout 20 $SH "$SCRIPT" --update 2>&1 < /dev/null) || RC=$?
+	[ "$RC" != 0 ] && [ "$RC" != 124 ] || t_fail "ждали остановку с объяснением, получили код $RC: $OUT"
+	t_has "замок" "$OUT" "объяснение"
+}
+test_schedule_poll_every_ten_minutes_lists_nightly() {  # решение владельца 12.11: подписка — раз в 10 минут, списки сайтов — раз в сутки
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	grep -qxF "*/10 * * * * $WORK/opt/sbin/vpn-keenetic --poll > /dev/null 2>&1" "$(CRON_OF)" || t_fail "нет опроса подписки раз в 10 минут: $(cat "$(CRON_OF)")"
+	grep -qxF "17 5 * * * $WORK/opt/sbin/vpn-keenetic --update > /dev/null 2>&1" "$(CRON_OF)" || t_fail "нет ночного обновления: $(cat "$(CRON_OF)")"
+	t_has "каждые 10 мин" "$OUT" "сказано, как часто проверяется подписка"
+	t_has "раз в сутки" "$OUT" "и списки"
+	run "$SUB"; t_eq 0 "$RC" "повторная установка: $OUT"
+	t_eq 2 "$(grep -c 'vpn-keenetic --' "$(CRON_OF)")" "строки планировщика не множатся"
+}
+test_schedule_period_is_configurable() {  # VPNK_POLL_MIN: свой период опроса; 0 — не опрашивать (только ночное обновление); запоминается
+	router
+	VPNK_POLL_MIN=5; export VPNK_POLL_MIN
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	grep -qF "*/5 * * * * $WORK/opt/sbin/vpn-keenetic --poll" "$(CRON_OF)" || t_fail "период 5 минут не поставлен: $(cat "$(CRON_OF)")"
+	unset VPNK_POLL_MIN
+	run "$SUB"; t_eq 0 "$RC" "повторная установка: $OUT"
+	grep -qF "*/5 * * * * $WORK/opt/sbin/vpn-keenetic --poll" "$(CRON_OF)" || t_fail "выбранный период забыт при повторной установке"
+	VPNK_POLL_MIN=0; export VPNK_POLL_MIN
+	run "$SUB"; t_eq 0 "$RC" "установка без опроса: $OUT"
+	! grep -q 'vpn-keenetic --poll' "$(CRON_OF)" || t_fail "опрос остался, хотя просили 0"
+	grep -q 'vpn-keenetic --update' "$(CRON_OF)" || t_fail "ночное обновление пропало"
+	VPNK_POLL_MIN=семь; export VPNK_POLL_MIN
+	run "$SUB"
+	[ "$RC" != 0 ] || t_fail "негодный период принят"
+	t_has "VPNK_POLL_MIN" "$OUT" "и названо, что не так"
+}
+age_h() { python3 -I -c 'import os, sys, time; t = time.time() - float(sys.argv[1]) * 3600; [os.utime(f, (t, t)) for f in sys.argv[2:]]' "$@"; }   # age_h ЧАСОВ ФАЙЛ…
+test_update_refreshes_lists_daily() {  # списки сайтов перечитываются раз в сутки: ночное обновление в одно и то же время не должно «не дотягивать» до суток
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	mkdat "$FAKE/geo/refilter_site.dat" site "refilter=blocked.example.org,rutracker.example,new-blocked.example"
+	geo_api
+	age_h 5 "$WORK/opt/etc/xray/dat/geosite_refilter.dat" "$WORK/opt/etc/xray/dat/geoip_refilter.dat"
+	: > "$FAKE/calls"
+	run --update
+	t_eq 0 "$(calls 'geosite.dat')" "списку 5 часов — не качаем"
+	age_h 23.9 "$WORK/opt/etc/xray/dat/geosite_refilter.dat" "$WORK/opt/etc/xray/dat/geoip_refilter.dat"   # вчера в это же время, минус секунды работы
+	run --update
+	t_eq 0 "$RC" "обновление: $OUT"
+	cmp -s "$FAKE/geo/refilter_site.dat" "$WORK/opt/etc/xray/dat/geosite_refilter.dat" || t_fail "вчерашний список не обновлён"
+	t_eq 1 "$(calls '^xkeen -restart$')" "перезапуск, чтобы Xray перечитал список"
+	: > "$FAKE/calls"
+	run --poll
+	t_eq 0 "$(calls 'api.github.com')" "опрос подписки списками не занимается"
+}
+test_update_restarts_dead_tunnel_with_fresh_link() {  # ссылка та же с точностью до случайных полей, Xray запущен, а туннель не работает
+	# (например, в панели сменили shortIds): ночное обновление пробует свежую ссылку — иначе роутер так и остался бы с негодной
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	resub "$RND1"
+	rm -f "$FAKE/tunnel.ok"; : > "$FAKE/restart.heals"
+	: > "$FAKE/calls"
+	run --update
+	t_eq 0 "$RC" "обновление: $OUT"
+	t_eq 77 "$(sid)" "взяты поля свежей ссылки"
+	t_eq 1 "$(calls '^xkeen -restart$')" "перезапуск один"
+	# Xray не запущен вовсе — VPN остановили мимо скрипта: не включаем.
+	rm -f "$FAKE/tunnel.ok" "$FAKE/xray.running" "$FAKE/restart.heals"
+	resub "$RND2"
+	: > "$FAKE/calls"
+	run --update
+	t_eq 0 "$RC" "обновление при остановленном Xray: $OUT"
+	t_eq 0 "$(calls '^xkeen ')" "остановленный VPN не включаем"
+	t_eq 77 "$(sid)" "настройки не тронуты"
+}
+test_status_shows_last_poll() {  # «Подписка проверялась» — по последнему опросу, а он на флешку не пишет
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	echo "2001-01-01 00:00" > "$WORK/opt/etc/vpn-keenetic/updated"
+	run --poll
+	run --status
+	t_has "Подписка проверялась: $(date +%F)" "$OUT" "время последнего опроса"
+}
+test_finds_entware_tools_when_run_by_cron() {  # планировщик запускает скрипт с коротким PATH, без каталогов Entware — curl и jq лежат там
+	router
+	run "$SUB"; t_eq 0 "$RC" "установка: $OUT"
+	mkdir -p "$WORK/opt/bin"
+	cp "$WORK/bin/curl" "$WORK/opt/bin/"
+	resub "s/:2083?/:8443?/; $RND1"
+	RC=0
+	OUT=$(cd "$WORK" && VPNK_PREFIX=$WORK VPNK_PROC=$FAKE/proc VPNK_MODDIRS=$FAKE/nomods VPNK_WAIT=0 VPNK_LOGGER=$WORK/bin/logger PATH=/usr/bin:/bin $SH "$SCRIPT" --update 2>&1 < /dev/null) || RC=$?
+	t_eq 0 "$RC" "обновление с коротким PATH: $OUT"
+	t_eq 8443 "$(port)" "подписка прочитана своим curl из Entware"
 }
 test_status_and_switch() {
 	router
