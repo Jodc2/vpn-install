@@ -1896,6 +1896,69 @@ test_tunnel_check_takes_own_client() {  # проверка туннеля — п
 	S_INBOUND_ID=3; t_eq subforeign "$(check_sub_id)" "база без таблицы связей — как раньше"
 }
 
+# Копия базы чужого 3x-ui (пункт 7).
+rows() {  # rows ФАЙЛ → сколько подключений в базе (или почему её не прочитать)
+	python3 -I -c 'import sqlite3, sys
+try:
+    print(sqlite3.connect(sys.argv[1]).execute("select count(*) from inbounds").fetchone()[0])
+except sqlite3.Error as e:
+    print("нет: %s" % e)' "$1"
+}
+live_wal_db() {  # live_wal_db ФАЙЛ — база в режиме WAL, которую держит открытой «панель»: две строки записаны, но лежат ещё в журнале
+	python3 -I - "$1" "$1.ready" <<'EOF' &
+import sqlite3, sys, time
+db = sqlite3.connect(sys.argv[1])
+db.execute("pragma journal_mode=wal")
+db.execute("pragma wal_autocheckpoint=0")
+db.execute("create table inbounds (id integer primary key, port integer)")
+db.execute("insert into inbounds (port) values (443), (8443)")
+db.commit()
+open(sys.argv[2], "w").close()
+time.sleep(30)
+EOF
+	LIVE_PID=$!
+	local n=0
+	until [ -e "$1.ready" ]; do n=$((n + 1)); [ "$n" -lt 100 ] || t_fail "«панель» не запустилась"; sleep 0.05; done
+}
+test_db_copy_of_live_database_is_whole() {  # «cp x-ui.db» у работающей панели даёт пустую базу: данные ещё в x-ui.db-wal
+	local how
+	eval "$(awk '/^(db_ok|db_copy)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	live_wal_db "$WORK/x-ui.db"
+	cp -a "$WORK/x-ui.db" "$WORK/naive.db"
+	[ "$(rows "$WORK/naive.db")" != 2 ] || { kill "$LIVE_PID"; t_fail "простая копия файла оказалась полной — тест не о том"; }
+	for how in все без-sqlite3 только-cp; do
+		(
+			case $how in
+				без-sqlite3) sqlite3() { return 127; } ;;
+				только-cp) sqlite3() { [ "$2" != "pragma integrity_check;" ] && return 127; command sqlite3 "$@"; }
+					python3() { [ "$1" = -I ] && [ "$2" = -c ] && [[ $3 == *backup* ]] && return 127; command python3 "$@"; } ;;
+			esac
+			db_copy "$WORK/x-ui.db" "$WORK/copy-$how.db"
+		) || { kill "$LIVE_PID"; t_fail "$how: копия не получилась"; }
+		t_eq 2 "$(rows "$WORK/copy-$how.db")" "$how: в копии все записи, и те, что ещё в журнале"
+	done
+	t_eq "$(stat -c %a "$WORK/x-ui.db")" "$(stat -c %a "$WORK/copy-все.db")" "права копии — как у базы"
+	kill "$LIVE_PID" 2> /dev/null || true
+}
+test_db_copy_failure_stops_install() {  # копии нет или она не база — код 1 и никакого файла, а установка на этом останавливается
+	eval "$(awk '/^(db_ok|db_copy|foreign_db_copy)\(\) \{/,/^}/' "$ROOT/src/install-vpn.sh.in")"
+	die() { echo "DIE $*" >> "$WORK/out"; exit 1; }
+	ok() { echo "OK $*" >> "$WORK/out"; }
+	: > "$WORK/out"
+	echo "это не база данных, а просто текст" > "$WORK/broken.db"
+	! db_copy "$WORK/broken.db" "$WORK/c1.db" || t_fail "испорченный файл принят за базу"
+	[ ! -e "$WORK/c1.db" ] || t_fail "после неудачи остался файл копии"
+	! db_copy "$WORK/нет-такой.db" "$WORK/c2.db" || t_fail "копия несуществующей базы «получилась»"
+	[ ! -e "$WORK/c2.db" ] && [ ! -e "$WORK/нет-такой.db" ] || t_fail "после неудачи остались файлы"
+	DB=$WORK/broken.db
+	! ( foreign_db_copy ) || t_fail "установка пошла дальше без копии базы"
+	t_has "DIE не получилась копия базы" "$(cat "$WORK/out")" "остановка с причиной"
+	[ -z "$(ls "$WORK"/broken.db.before-install-* 2> /dev/null)" ] || t_fail "негодная копия оставлена"
+	DB=$WORK/x-ui.db; mkdb '443||vless|{}|{}|1'; : > "$WORK/out"
+	foreign_db_copy
+	t_eq 1 "$(rows "$(ls "$WORK"/x-ui.db.before-install-*)")" "копия целой базы сделана"
+	t_has "OK копия прежней базы" "$(cat "$WORK/out")" "сказано, где копия"
+}
 
 # ——— SSH к старому серверу: повтор, если соединение не установилось (живая проверка 10.11) ———
 # Функции берутся из шаблона установщика; ssh/scp/sshpass — заглушки, ответы — по строкам $WORK/ssh.plan

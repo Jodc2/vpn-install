@@ -1202,6 +1202,46 @@ local_checks() {
 	fi
 }
 
+db_ok() {  # db_ok ФАЙЛ — это целая база SQLite? (открывается на запись: заодно дочитывает журнал -wal, если копия с ним)
+	[ -s "$1" ] || return 1
+	[ "$(sqlite3 "$1" 'pragma integrity_check;' 2>/dev/null || true)" = ok ] ||
+		python3 -I -c 'import sqlite3, sys
+sys.exit(0 if sqlite3.connect(sys.argv[1]).execute("pragma integrity_check").fetchone()[0] == "ok" else 1)' "$1" 2>/dev/null
+}
+db_copy() {  # db_copy БАЗА КОПИЯ — согласованная копия базы, в которую прямо сейчас может писать x-ui; 1 — копии нет
+	# 3x-ui держит базу в режиме WAL: свежие изменения лежат в x-ui.db-wal, и «cp x-ui.db» их не захватывает — у недавно
+	# запущенной панели в самом x-ui.db нет ещё ничего. Поэтому копия — средствами SQLite (sqlite3, нет его — python3),
+	# и только если не вышло — cp вместе с журналом. Каждая попытка проверяется: копия должна быть целой базой.
+	local src=$1 dst=$2 how
+	[ -f "$src" ] || return 1   # sqlite3 несуществующую базу молча создал бы пустой — и «скопировал»
+	for how in sqlite3 python3 cp; do
+		rm -f "$dst" "$dst-wal" "$dst-shm" "$dst-journal"
+		case $how in
+			sqlite3) sqlite3 "$src" ".backup '$dst'" >/dev/null 2>&1 || continue ;;
+			python3)
+				python3 -I -c 'import sqlite3, sys
+src = sqlite3.connect(sys.argv[1])
+dst = sqlite3.connect(sys.argv[2])
+src.backup(dst)
+dst.close()' "$src" "$dst" 2>/dev/null || continue ;;
+			cp)
+				cp -a "$src" "$dst" 2>/dev/null || continue
+				[ ! -f "$src-wal" ] || cp -a "$src-wal" "$dst-wal" 2>/dev/null || true ;;
+		esac
+		if db_ok "$dst"; then
+			chmod --reference="$src" "$dst" 2>/dev/null || true
+			return 0
+		fi
+	done
+	rm -f "$dst" "$dst-wal" "$dst-shm" "$dst-journal"
+	return 1
+}
+foreign_db_copy() {  # копия базы чужого 3x-ui рядом с ней. Панель ещё работает и пишет в базу; другой копии не будет —
+	# не получилась эта, дальше не идём.
+	db_copy "$DB" "$DB.before-install-$(date +%Y%m%d-%H%M%S)" ||
+		die "не получилась копия базы прежнего 3x-ui ($DB), а другой копии не будет — 3x-ui и его базу не трогаю. Проверьте базу (sqlite3 $DB 'pragma integrity_check;') и запустите скрипт ещё раз"
+	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
+}
 xui_stop() {  # остановить x-ui на время правки базы; вотчдог цепочки — тоже, чтобы не перезапустил x-ui посреди правки
 	systemctl stop vpn-exit-watchdog 2>/dev/null || true
 	systemctl stop x-ui 2>/dev/null || true
@@ -2417,8 +2457,7 @@ if [ -f "$STATE" ]; then
 	. "$STATE"
 	ok "найдены настройки прошлой установки ($STATE): ключи, пароли и клиенты остаются прежними"
 elif [ "$FOREIGN_XUI" = 1 ]; then   # чужой 3x-ui (согласие — в самом начале, foreign_xui_check): копия базы до первых изменений
-	cp -a "$DB" "$DB.before-install-$(date +%Y%m%d-%H%M%S)"
-	ok "копия прежней базы 3x-ui — рядом с ней: $DB.before-install-…"
+	foreign_db_copy
 fi
 : "${PANEL_USER:=$(rnd "$LOWER$DIGITS" 10)}"
 : "${PANEL_PASS:=$(rnd "$LOWER${LOWER^^}$DIGITS" 22)}"
