@@ -1532,6 +1532,78 @@ test_fw_unknown_state_opens_no_extra_and_closes_nothing() {  # пункт 5: с�
 		! grep -q 'включён, открыто' "$WORK/out" || t_fail "сказано «включён»: $(cat "$WORK/out")"
 	done
 }
+# Строки правил — как их пишет настоящий ufw 0.36.1 (сняты в контейнере Ubuntu 22.04).
+RULES_FIXTURE='### tuple ### allow tcp 2222 0.0.0.0/0 any 203.0.113.5 in
+### tuple ### allow tcp 2200 0.0.0.0/0 any 203.0.113.6 OpenSSH - in
+### tuple ### limit tcp 2022 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow any any 0.0.0.0/0 any 203.0.113.7 in
+### tuple ### allow tcp 80,443 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow tcp 6000:6007 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow any 8080 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow tcp 9000 0.0.0.0/0 any 0.0.0.0/0 in_eth1
+### tuple ### allow tcp 9001 198.51.100.2 any 0.0.0.0/0 in
+### tuple ### allow_log tcp 7001 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow tcp 2083 0.0.0.0/0 any 0.0.0.0/0 in comment=76706e20706f7274
+### tuple ### allow tcp 3000:3010 0.0.0.0/0 any 203.0.113.0/24 in
+### tuple ### allow tcp 4000,4001 0.0.0.0/0 any 203.0.113.9 in'
+test_ufw_allows_tcp_reads_real_rules() {  # пункт 9а: есть ли для порта разрешающее входящее правило — любое, и только с одного адреса тоже
+	local p
+	fw_env
+	printf '%s\n' "$RULES_FIXTURE" > "$UFW_RULES"
+	cat >> "$UFW_RULES" <<'EOF'
+### tuple ### deny tcp 25 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### reject any 26 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow any 53 0.0.0.0/0 any 0.0.0.0/0 out
+### tuple ### allow udp 5000 0.0.0.0/0 any 203.0.113.44 in
+### tuple ### allow udp 60000:61000 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### route:allow tcp 7000 0.0.0.0/0 any 0.0.0.0/0 in_lo!out_lo
+### tuple ### allow tcp 9100 0.0.0.0/0 any 0.0.0.0/0 in_lo
+-A ufw-user-input -p tcp --dport 9200 -j ACCEPT
+EOF
+	sed -i '/203.0.113.7 in$/d' "$UFW_RULES"   # правило «с этого адреса — на любой порт» проверяется отдельно, ниже
+	for p in 2222 2200 2022 80 443 6000 6003 6007 8080 9000 9001 7001 2083 3000 3010 4000 4001; do
+		ufw_allows_tcp "$p" || t_fail "порт $p: разрешающее правило есть, а функция его не видит"
+	done
+	for p in 22 25 26 53 5000 60500 7000 9100 9200 6008 5999 44 3011 20 220 22222; do
+		! ufw_allows_tcp "$p" || t_fail "порт $p: разрешающего входящего правила TCP нет, а функция его нашла"
+	done
+	echo '### tuple ### allow any any 0.0.0.0/0 any 203.0.113.7 in' >> "$UFW_RULES"
+	ufw_allows_tcp 22 || t_fail "правило «с адреса 203.0.113.7 на любой порт» разрешает и порт 22"
+	UFW_RULES="$WORK/нет-такого $WORK/и-такого"
+	! ufw_allows_tcp 22 || t_fail "файлов правил нет — правил нет"
+}
+test_fw_ssh_limited_by_source_is_not_reopened_to_all() {  # пункт 9а: ufw включён, SSH разрешён только с адреса админа — общее разрешение не добавлять
+	local rule
+	for rule in '### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 in' \
+		'### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 OpenSSH - in' \
+		'### tuple ### limit tcp 22 0.0.0.0/0 any 0.0.0.0/0 in' \
+		'### tuple ### allow any any 0.0.0.0/0 any 203.0.113.5 in'; do
+		fw_env; UFW_SAYS=$ACTIVE SSH_PORTS="22 2222"
+		echo "$rule" > "$UFW_RULES"
+		fw_step
+		! fw_called "allow 22/tcp" || t_fail "SSH открыт всем поверх правила «$rule»: $(fw_calls)"
+		case $rule in
+			*"any any"*) ! fw_called "allow 2222/tcp" || t_fail "правило на любой порт покрывает и 2222: $(fw_calls)" ;;
+			*) fw_called "allow 2222/tcp" || t_fail "для порта SSH 2222 правила нет — его надо разрешить: $(fw_calls)" ;;
+		esac
+		fw_called "allow 2083/tcp" || t_fail "порт VPN не разрешён: $(fw_calls)"
+		grep -q '^OK SSH :22.* уже разрешён правилами ufw' "$WORK/out" || t_fail "не сказано, что правила SSH оставлены: $(cat "$WORK/out")"
+		! grep -q 'открыто:.* 22/tcp' "$WORK/out" || t_fail "порт 22 назван открытым скриптом: $(cat "$WORK/out")"
+	done
+}
+test_fw_ssh_always_allowed_when_script_enables_ufw() {  # пункт 9а: ufw выключен и включаем его мы — SSH разрешается обязательно, какие бы правила ни лежали в файлах
+	fw_env; SSH_PORTS="22 2222"
+	echo '### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 in' > "$UFW_RULES"
+	fw_step
+	t_eq "allow 22/tcp;allow 2083/tcp;allow 2222/tcp;delete allow 2096/tcp;delete allow 80/tcp;delete allow 54321/tcp;--force enable;" "$(fw_calls)" "что попросили у ufw"
+}
+test_fw_ssh_allow_failure_leaves_ufw_off() {  # пункт 9б: порт SSH разрешить не удалось — ufw не включать, иначе человек останется без входа
+	fw_env; UFW_FAIL="allow 22/tcp"
+	fw_step
+	! fw_called "--force enable" || t_fail "ufw включён, хотя порт SSH в нём не разрешён: $(fw_calls)"
+	grep -q '^BAD ufw не включал.*SSH' "$WORK/out" || t_fail "не сказано, почему ufw не включён: $(cat "$WORK/out")"
+	! grep -q 'включён, открыто' "$WORK/out" || t_fail "сказано «включён»: $(cat "$WORK/out")"
+}
 test_fw_inbound_allow_failure_leaves_ufw_off() {  # пункт 3 («ни иначе»): порт чужого подключения не разрешился — включение ufw его закрыло бы
 	fw_env; UFW_FAIL="allow 8443/tcp"
 	mkdb '2083||vless|{}|{"network":"xhttp","security":"reality"}|1' '8443||vmess|{}|{"network":"ws"}|1'
@@ -1539,6 +1611,17 @@ test_fw_inbound_allow_failure_leaves_ufw_off() {  # пункт 3 («ни ина�
 	! fw_called "--force enable" || t_fail "ufw включён, хотя порт подключения панели в нём не разрешён: $(fw_calls)"
 	grep -q '^BAD ufw не включал.*8443' "$WORK/out" || t_fail "не сказано, почему ufw не включён: $(cat "$WORK/out")"
 	! grep -q 'доступны, как раньше.*8443' "$WORK/out" || t_fail "порт 8443 назван доступным: $(cat "$WORK/out")"
+}
+test_fw_failed_port_is_not_reported_open() {  # пункт 9б: порт, который ufw не принял, в «открыто» не попадает
+	fw_env; UFW_SAYS=$ACTIVE SSH_PORTS=2222 UFW_FAIL="allow 2222/tcp"
+	fw_step
+	grep -q '^BAD ufw allow 2222/tcp не прошёл' "$WORK/out" || t_fail "о сбое не сказано: $(cat "$WORK/out")"
+	grep -q '^OK включён, открыто: 2083/tcp$' "$WORK/out" || t_fail "в «открыто» не только то, что открыто: $(cat "$WORK/out")"
+	# Другой порт (не SSH и не подключение панели) не разрешился при выключенном ufw — как раньше: сказать и включить.
+	fw_env; PANEL_PUBLIC=1 UFW_FAIL="allow 54321/tcp"
+	fw_step
+	fw_called "--force enable" || t_fail "ufw не включён из-за порта панели: $(fw_calls)"
+	grep -q '^OK включён, открыто: 22/tcp 2083/tcp$' "$WORK/out" || t_fail "итог: $(cat "$WORK/out")"
 }
 
 test_language_env_is_dropped_at_start() {  # пункт 5: LANGUAGE из окружения (sudo её сохраняет) переводит ответы ufw — в начале скрипта она снимается

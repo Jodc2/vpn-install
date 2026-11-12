@@ -80,6 +80,7 @@ LOG=/root/vpn-install.log
 DB=/etc/x-ui/x-ui.db
 XUI=/usr/local/x-ui/x-ui
 F2B_JAIL=/etc/fail2ban/jail.d/vpn-sshd.local
+UFW_RULES="/etc/ufw/user.rules /etc/ufw/user6.rules"   # правила ufw, как он сам их хранит (IPv4 и IPv6)
 WARP_ENDPOINT=162.159.192.8:2408   # engage.cloudflareclient.com по IP: имя через DNS дало бы петлю
 # Без домена Reality маскируется под один из этих сайтов: берётся самый быстрый с этого сервера из тех,
 # что держат TLS 1.3 + X25519 + HTTP/2 с верным сертификатом и не стоят за Cloudflare.
@@ -531,6 +532,25 @@ ufw_state() {  # → active | inactive | unknown. «Выключен» — то�
 }
 ufw_active() {  # ufw включён?
 	[ "$(ufw_state)" = active ]
+}
+ufw_allows_tcp() {  # ufw_allows_tcp ПОРТ — в правилах ufw уже есть разрешение (allow или limit) входящего TCP на этот порт,
+	# пусть и только с одного адреса. Правила — из файлов ufw: «ufw status» у правила по имени приложения (OpenSSH) порт
+	# не называет, а в файле он есть всегда. Строка правила (ufw 0.36, проверено на настоящем):
+	#   ### tuple ### allow tcp 22 0.0.0.0/0 any 203.0.113.5 in
+	# — действие, протокол, порты («22», «80,443», «6000:6007», «any»), куда, порты источника, откуда, [приложения,] направление.
+	# Файлов нет или они другого вида — «правила нет», и скрипт разрешит порт сам, как делал всегда.
+	# shellcheck disable=SC2086  # файлов два — по словам
+	{ cat $UFW_RULES 2>/dev/null || true; } | awk -v p="$1" '
+		$1 == "###" && $2 == "tuple" && $4 ~ /^(allow|limit)/ && ($5 == "tcp" || $5 == "any") {
+			dir = ($NF ~ /^comment=/) ? $(NF - 1) : $NF
+			if (dir != "in" && (dir !~ /^in_/ || dir == "in_lo")) next   # исходящие, пересылка и «только на lo» — не про вход снаружи
+			n = split($6, a, ",")
+			for (i = 1; i <= n; i++) {
+				m = split(a[i], r, ":")
+				if (a[i] == "any" || (m == 1 && r[1] == p) || (m == 2 && p + 0 >= r[1] + 0 && p + 0 <= r[2] + 0)) found = 1
+			}
+		}
+		END { exit !found }'
 }
 in_container() {
 	if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -cq 2>/dev/null; then return 0; fi
@@ -3122,12 +3142,18 @@ fw_close() {  # fw_close ПОРТ/tcp — убрать разрешение в u
 	ufw delete allow "$1" >/dev/null 2>&1 || true
 }
 fw_step() {  # шаг «Фаервол ufw»: что открыть, что закрыть, включить
-	local KEEP OPEN KEPT CLOSING p pp state lost=""
+	local KEEP OPEN KEPT CLOSING p pp state lost="" lost_ssh="" ssh_as_is="" opened=""
 	state=$(ufw_state)
 	# Порты включённых подключений панели, слушающих не только localhost. Скрипт их не закрывает никогда, был ufw включён
 	# или нет: ни удалением разрешения (fw_close), ни включением ufw, в котором для них нет разрешения.
 	FW_INBOUND=$(xui_inbound_ports | tr '\n' ' ')
 	KEEP=$(fw_kept_ports | tr '\n' ' ')
+	# SSH. Когда ufw включает скрипт, разрешение для портов SSH обязательно. Когда ufw уже включён (или его состояние не
+	# понять) и для порта есть разрешающее правило — пусть только с адреса админа, — общее не добавляется: оно открыло бы
+	# SSH всем, кому админ его закрыл. Нынешний вход от этого не страдает: его пускают правила, которые есть.
+	if [ "$state" != inactive ]; then
+		for p in $SSH_PORTS; do ! ufw_allows_tcp "$p" || ssh_as_is="$ssh_as_is $p/tcp"; done
+	fi
 	OPEN=$( {
 		for p in $SSH_PORTS; do echo "$p/tcp"; done   # среди них и порт нынешнего входа (ssh_ports)
 		if [ "$MODE" = domain ]; then echo 80/tcp; echo 443/tcp; fi
@@ -3137,20 +3163,24 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		for pp in $OTHER_VPN_PORTS $KEEP; do echo "$pp"; done
 	} | sort -u | sort -t/ -k1,1n -k2,2)
 	for p in $OPEN; do
-		ufw allow "$p" >/dev/null && continue
+		case " $ssh_as_is " in *" $p "*) continue ;; esac
+		if ufw allow "$p" >/dev/null; then opened="$opened $p"; continue; fi
 		bad "ufw allow $p не прошёл"
 		case " $KEEP " in *" $p "*) lost="$lost $p" ;; esac
+		for pp in $SSH_PORTS; do [ "$pp/tcp" != "$p" ] || lost_ssh="$lost_ssh $pp"; done
 	done
+	[ -z "$ssh_as_is" ] || ok "SSH :$(echo $ssh_as_is | sed 's#/tcp##g; s/ /,/g') уже разрешён правилами ufw — их не менял (общего разрешения не добавлял)"
 	KEPT=$(for pp in $KEEP; do [ "$pp" = "$REALITY_PORT/tcp" ] || [[ " $lost " == *" $pp "* ]] || printf '%s ' "$pp"; done)
 	[ -z "$KEPT" ] || ok "подключения панели на других портах доступны, как раньше: ${KEPT% }"
 	[ -z "$OTHER_VPN_PORTS" ] || warn "рядом работает ${OTHER_VPN:-другой VPN} — открыл его порты в ufw ($OTHER_VPN_PORTS), чтобы фаервол его не отрубил"
 	if [ "$state" = unknown ]; then
 		# Включён ufw или нет — неизвестно: включение закрыло бы порты, о которых скрипт не знает, а убирать правила вслепую нельзя.
-		bad "состояние ufw понять не удалось («ufw status» не ответил ни «active», ни «inactive») — нужные порты в нём разрешил, но включать его и убирать лишние правила не стал. Проверьте: ufw status"
+		bad "состояние ufw понять не удалось («ufw status» не ответил ни «active», ни «inactive») — включать его и убирать в нём правила не стал${opened:+; разрешения добавил:$opened}. Проверьте: ufw status"
 		return 0
 	fi
-	if [ "$state" = inactive ] && [ -n "$lost" ]; then
-		bad "ufw не включал: не удалось разрешить в нём$lost, а включённый фаервол закрыл бы подключения панели на этих портах. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
+	if [ "$state" = inactive ] && [ -n "$lost_ssh$lost" ]; then
+		[ -z "$lost_ssh" ] || bad "ufw не включал: не удалось разрешить в нём порт SSH$lost_ssh — с включённым фаерволом вы остались бы без входа на сервер. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
+		[ -z "$lost" ] || bad "ufw не включал: не удалось разрешить в нём$lost, а включённый фаервол закрыл бы подключения панели на этих портах. Разберитесь с ufw (ufw status) и запустите скрипт ещё раз"
 		return 0
 	fi
 	if [ -n "${MOVED_FROM:-}" ] && ! grep -qx "$MOVED_FROM/tcp" <<<"$OPEN" && [ -z "$(port_users "$MOVED_FROM")" ] && fw_close "$MOVED_FROM/tcp"; then
@@ -3172,7 +3202,7 @@ fw_step() {  # шаг «Фаервол ufw»: что открыть, что за
 		done | sort -u | { grep -vxF -f <(printf '%s\n' 68/udp 546/udp $OPEN) || true; } | sort -t/ -k1,1n | tr '\n' ' ')
 		[ -z "$CLOSING" ] || warn "фаервол закроет и порты, которые сейчас слушает этот сервер: ${CLOSING}— если там нужная служба, откройте: ufw allow ПОРТ/tcp (или /udp)"
 	fi
-	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $OPEN)"; else bad "ufw не включился (ufw status)"; fi
+	if ufw --force enable >/dev/null 2>&1; then ok "включён, открыто: $(echo $opened)"; else bad "ufw не включился (ufw status)"; fi
 }
 say "Фаервол ufw"
 if [ "$DO_UFW" = 1 ]; then
